@@ -7,22 +7,368 @@ pub mod deployment;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CommandQueueMode, EntityHandle,
-    EntityId, EventQueueError, EventQueueLimits, EventQueues, HandoffTransfer, HotspotDecision,
-    HotspotPlanner, HotspotSeverity, HotspotThresholds, OwnerEpoch, PushOutcome, RuntimeBarrier,
-    SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
-    StationLoadSample, StationSnapshot, Tick,
+    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, ClientId, CommandId,
+    CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues, EntityHandle, EntityId,
+    EventQueueError, EventQueueLimits, EventQueues, GatewayError, GatewaySessionTable,
+    HandoffTransfer, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotThresholds,
+    OwnerEpoch, PushOutcome, RuntimeBarrier, SnapshotVersion, SplitProposal, Station, StationError,
+    StationEvent, StationId, StationLoadSample, StationSnapshot, Tick,
 };
 use sectorsync_transport::{StationOutboundPacket, StationTransportReceiver, StationTransportSink};
 use sectorsync_wire::{
-    BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, FrameDecoder,
-    FrameEncoder, RuntimeFrame, StationEventFrame,
+    BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
+    FrameDecoder, FrameEncoder, RuntimeFrame, StationEventFrame,
 };
 
 pub use deployment::{
     DeploymentConfig, DeploymentError, DeploymentNodeRoute, DeploymentNodeState,
     DeploymentRouteTable, DeploymentStationMove, DeploymentStationRoute, DeploymentStats,
 };
+
+/// Accepted command ACK reason code.
+pub const GATEWAY_COMMAND_ACK_ACCEPTED: u16 = 0;
+/// Command was rejected by generic gateway/session state.
+pub const GATEWAY_COMMAND_ACK_GATEWAY_REJECTED: u16 = 1;
+/// Command was rejected by gateway rate limiting.
+pub const GATEWAY_COMMAND_ACK_RATE_LIMITED: u16 = 2;
+/// Command was rejected as stale or replayed.
+pub const GATEWAY_COMMAND_ACK_REPLAY_OR_STALE: u16 = 3;
+/// Command could not be queued because a target station queue was full.
+pub const GATEWAY_COMMAND_ACK_QUEUE_FULL: u16 = 4;
+/// Command was rejected by the station barrier ingress policy.
+pub const GATEWAY_COMMAND_ACK_BARRIER_REJECTED: u16 = 5;
+/// Command route pointed at a station queue that was not registered.
+pub const GATEWAY_COMMAND_ACK_MISSING_QUEUE: u16 = 6;
+
+/// Gateway command pipeline configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayCommandPipelineConfig {
+    /// Encode negative ACKs for gateway/queue rejections.
+    pub ack_rejections: bool,
+}
+
+impl Default for GatewayCommandPipelineConfig {
+    fn default() -> Self {
+        Self {
+            ack_rejections: true,
+        }
+    }
+}
+
+/// Gateway command pipeline statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GatewayCommandPipelineStats {
+    /// Command frames decoded.
+    pub command_frames_decoded: usize,
+    /// Frames rejected by the binary decoder.
+    pub frames_rejected_decode: usize,
+    /// Non-command frames rejected by this pipeline.
+    pub frames_rejected_non_command: usize,
+    /// Commands admitted by gateway/session metadata.
+    pub commands_admitted: usize,
+    /// Commands enqueued into target station queues.
+    pub commands_enqueued: usize,
+    /// Commands rejected by gateway/session metadata.
+    pub commands_rejected_gateway: usize,
+    /// Commands rejected by station queue or station queue lookup.
+    pub commands_rejected_queue: usize,
+    /// ACK frames encoded.
+    pub acks_encoded: usize,
+}
+
+/// Gateway command pipeline error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GatewayCommandPipelineError {
+    /// Wire decode failed.
+    Decode(BinaryDecodeError),
+    /// Frame decoded correctly but was not a command frame.
+    NonCommandFrame,
+    /// Gateway/session metadata rejected the command.
+    Gateway(GatewayError),
+    /// Gateway route pointed at a missing station queue.
+    MissingQueue(StationId),
+    /// Target station queue rejected the command.
+    Queue(CommandQueueError),
+    /// ACK encode failed.
+    Encode(BinaryEncodeError),
+}
+
+impl core::fmt::Display for GatewayCommandPipelineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::NonCommandFrame => f.write_str("gateway command pipeline expected command frame"),
+            Self::Gateway(error) => write!(f, "{error}"),
+            Self::MissingQueue(station_id) => write!(
+                f,
+                "gateway command route target station {} has no queue",
+                station_id.get()
+            ),
+            Self::Queue(error) => write!(f, "{error}"),
+            Self::Encode(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for GatewayCommandPipelineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::Gateway(error) => Some(error),
+            Self::Queue(error) => Some(error),
+            Self::Encode(error) => Some(error),
+            Self::NonCommandFrame | Self::MissingQueue(_) => None,
+        }
+    }
+}
+
+/// Gateway command pipeline result.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayCommandPipelineReport {
+    /// Client id when a command frame was decoded.
+    pub client_id: Option<ClientId>,
+    /// Command id when a command frame was decoded.
+    pub command_id: Option<CommandId>,
+    /// Target station when gateway routing succeeded.
+    pub station_id: Option<StationId>,
+    /// Whether the command was queued for station application.
+    pub accepted: bool,
+    /// ACK reason code. Zero means accepted.
+    pub reason_code: u16,
+    /// Encoded ACK bytes, when an ACK was produced.
+    pub ack_bytes: Option<Vec<u8>>,
+    /// Decode, gateway, queue, or encode error detail.
+    pub error: Option<GatewayCommandPipelineError>,
+}
+
+/// Business-agnostic gateway command frame pipeline.
+#[derive(Clone, Debug)]
+pub struct GatewayCommandPipeline {
+    config: GatewayCommandPipelineConfig,
+    decoder: BinaryFrameDecoder,
+    encoder: BinaryFrameEncoder,
+    stats: GatewayCommandPipelineStats,
+}
+
+impl GatewayCommandPipeline {
+    /// Creates a pipeline.
+    pub fn new(config: GatewayCommandPipelineConfig) -> Self {
+        Self {
+            config,
+            decoder: BinaryFrameDecoder,
+            encoder: BinaryFrameEncoder,
+            stats: GatewayCommandPipelineStats::default(),
+        }
+    }
+
+    /// Returns configuration.
+    pub const fn config(&self) -> GatewayCommandPipelineConfig {
+        self.config
+    }
+
+    /// Returns statistics.
+    pub const fn stats(&self) -> GatewayCommandPipelineStats {
+        self.stats
+    }
+
+    /// Processes one decoded-transport command packet and optionally produces
+    /// an encoded command ACK.
+    pub fn process(
+        &mut self,
+        gateway: &mut GatewaySessionTable,
+        station_queues: &mut BTreeMap<StationId, CommandQueues>,
+        input: &[u8],
+        now: Tick,
+        ingress: CommandIngress,
+    ) -> GatewayCommandPipelineReport {
+        let frame = match self.decoder.decode(input) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.stats.frames_rejected_decode =
+                    self.stats.frames_rejected_decode.saturating_add(1);
+                return GatewayCommandPipelineReport {
+                    error: Some(GatewayCommandPipelineError::Decode(error)),
+                    ..GatewayCommandPipelineReport::default()
+                };
+            }
+        };
+
+        let RuntimeFrame::Command(command_frame) = frame else {
+            self.stats.frames_rejected_non_command =
+                self.stats.frames_rejected_non_command.saturating_add(1);
+            return GatewayCommandPipelineReport {
+                error: Some(GatewayCommandPipelineError::NonCommandFrame),
+                ..GatewayCommandPipelineReport::default()
+            };
+        };
+        self.stats.command_frames_decoded = self.stats.command_frames_decoded.saturating_add(1);
+
+        let client_id = command_frame.client_id;
+        let command_id = command_frame.command_id;
+        let command = command_frame.into_envelope(now);
+        let admission = match gateway.admit_command(&command) {
+            Ok(admission) => {
+                self.stats.commands_admitted = self.stats.commands_admitted.saturating_add(1);
+                admission
+            }
+            Err(error) => {
+                self.stats.commands_rejected_gateway =
+                    self.stats.commands_rejected_gateway.saturating_add(1);
+                return self.rejected_report(
+                    client_id,
+                    command_id,
+                    None,
+                    now,
+                    gateway_reject_reason_code(error),
+                    GatewayCommandPipelineError::Gateway(error),
+                );
+            }
+        };
+
+        let station_id = admission.route.station_id;
+        let Some(queue) = station_queues.get_mut(&station_id) else {
+            self.stats.commands_rejected_queue =
+                self.stats.commands_rejected_queue.saturating_add(1);
+            return self.rejected_report(
+                client_id,
+                command_id,
+                Some(station_id),
+                now,
+                GATEWAY_COMMAND_ACK_MISSING_QUEUE,
+                GatewayCommandPipelineError::MissingQueue(station_id),
+            );
+        };
+
+        if let Err(error) = queue.push(command, ingress) {
+            self.stats.commands_rejected_queue =
+                self.stats.commands_rejected_queue.saturating_add(1);
+            return self.rejected_report(
+                client_id,
+                command_id,
+                Some(station_id),
+                now,
+                queue_reject_reason_code(error),
+                GatewayCommandPipelineError::Queue(error),
+            );
+        }
+
+        self.stats.commands_enqueued = self.stats.commands_enqueued.saturating_add(1);
+        self.accepted_report(client_id, command_id, station_id, now)
+    }
+
+    fn accepted_report(
+        &mut self,
+        client_id: ClientId,
+        command_id: CommandId,
+        station_id: StationId,
+        now: Tick,
+    ) -> GatewayCommandPipelineReport {
+        let ack = CommandAckFrame {
+            client_id,
+            command_id,
+            server_tick: now,
+            accepted: true,
+            reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+        };
+        match self.encode_ack(&ack) {
+            Ok(ack_bytes) => GatewayCommandPipelineReport {
+                client_id: Some(client_id),
+                command_id: Some(command_id),
+                station_id: Some(station_id),
+                accepted: true,
+                reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+                ack_bytes: Some(ack_bytes),
+                error: None,
+            },
+            Err(error) => GatewayCommandPipelineReport {
+                client_id: Some(client_id),
+                command_id: Some(command_id),
+                station_id: Some(station_id),
+                accepted: false,
+                reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+                ack_bytes: None,
+                error: Some(GatewayCommandPipelineError::Encode(error)),
+            },
+        }
+    }
+
+    fn rejected_report(
+        &mut self,
+        client_id: ClientId,
+        command_id: CommandId,
+        station_id: Option<StationId>,
+        now: Tick,
+        reason_code: u16,
+        error: GatewayCommandPipelineError,
+    ) -> GatewayCommandPipelineReport {
+        let ack_bytes = if self.config.ack_rejections {
+            let ack = CommandAckFrame {
+                client_id,
+                command_id,
+                server_tick: now,
+                accepted: false,
+                reason_code,
+            };
+            match self.encode_ack(&ack) {
+                Ok(bytes) => Some(bytes),
+                Err(encode_error) => {
+                    return GatewayCommandPipelineReport {
+                        client_id: Some(client_id),
+                        command_id: Some(command_id),
+                        station_id,
+                        accepted: false,
+                        reason_code,
+                        ack_bytes: None,
+                        error: Some(GatewayCommandPipelineError::Encode(encode_error)),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
+        GatewayCommandPipelineReport {
+            client_id: Some(client_id),
+            command_id: Some(command_id),
+            station_id,
+            accepted: false,
+            reason_code,
+            ack_bytes,
+            error: Some(error),
+        }
+    }
+
+    fn encode_ack(&mut self, ack: &CommandAckFrame) -> Result<Vec<u8>, BinaryEncodeError> {
+        let mut out = Vec::new();
+        self.encoder.encode_command_ack(ack, &mut out)?;
+        self.stats.acks_encoded = self.stats.acks_encoded.saturating_add(1);
+        Ok(out)
+    }
+}
+
+impl Default for GatewayCommandPipeline {
+    fn default() -> Self {
+        Self::new(GatewayCommandPipelineConfig::default())
+    }
+}
+
+const fn gateway_reject_reason_code(error: GatewayError) -> u16 {
+    match error {
+        GatewayError::ReplayOrStale { .. } => GATEWAY_COMMAND_ACK_REPLAY_OR_STALE,
+        GatewayError::RateLimited { .. } => GATEWAY_COMMAND_ACK_RATE_LIMITED,
+        GatewayError::MissingSession(_)
+        | GatewayError::SessionDisconnected { .. }
+        | GatewayError::BadGeneration { .. }
+        | GatewayError::CapacityFull { .. } => GATEWAY_COMMAND_ACK_GATEWAY_REJECTED,
+    }
+}
+
+const fn queue_reject_reason_code(error: CommandQueueError) -> u16 {
+    match error {
+        CommandQueueError::QueueFull(_) => GATEWAY_COMMAND_ACK_QUEUE_FULL,
+        CommandQueueError::RejectedByBarrier(_) => GATEWAY_COMMAND_ACK_BARRIER_REJECTED,
+    }
+}
 
 /// Small in-process station collection for simulations and embedders.
 #[derive(Clone, Debug, Default)]
@@ -1468,11 +1814,14 @@ impl BarrierController {
 mod tests {
     use super::*;
     use sectorsync_core::prelude::{
-        Bounds, CellCoord3, CellLoadSample, EventId, EventKind, EventPriority, GridSpec,
-        HotspotThresholds, InstanceId, NodeId, PolicyId, Position3, StationConfig,
-        StationLoadSample,
+        Bounds, CellCoord3, CellLoadSample, CommandPriority, CommandQueueLimits, EventId,
+        EventKind, EventPriority, GatewayConfig, GridSpec, HotspotThresholds, InstanceId, NodeId,
+        PolicyId, Position3, StationConfig, StationLoadSample,
     };
     use sectorsync_transport::InMemoryStationTransport;
+    use sectorsync_wire::{
+        BinaryFrameDecoder, BinaryFrameEncoder, CommandFrame, FrameDecoder, FrameEncoder,
+    };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
         Station::new(StationConfig {
@@ -1480,6 +1829,39 @@ mod tests {
             node_id: NodeId::new(0),
             instance_id: InstanceId::new(instance_id),
             tick_rate_hz: 20,
+        })
+    }
+
+    fn encode_command_frame(sequence: u64) -> Vec<u8> {
+        let frame = CommandFrame {
+            client_id: ClientId::new(7),
+            command_id: CommandId::new(sequence),
+            entity_id: EntityId::new(100),
+            sequence,
+            kind: 1,
+            priority: CommandPriority::High,
+            payload: b"move:north".to_vec(),
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_command(&frame, &mut bytes)
+            .expect("command should encode");
+        bytes
+    }
+
+    fn command_queues() -> CommandQueues {
+        CommandQueues::new(CommandQueueLimits {
+            high: 4,
+            normal: 4,
+            low: 4,
+        })
+    }
+
+    fn gateway(max_commands_per_tick: usize) -> GatewaySessionTable {
+        GatewaySessionTable::new(GatewayConfig {
+            max_sessions: 8,
+            reconnect_grace_ticks: 10,
+            max_commands_per_tick,
         })
     }
 
@@ -1519,6 +1901,162 @@ mod tests {
         assert_eq!(metrics.station_count, 2);
         assert_eq!(metrics.snapshots_exported, 2);
         assert_eq!(controller.progress().state, BarrierState::Running);
+    }
+
+    #[test]
+    fn gateway_command_pipeline_queues_command_and_encodes_ack() {
+        let client_id = ClientId::new(7);
+        let station_id = StationId::new(1);
+        let mut gateway = gateway(4);
+        gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let mut station_queues = BTreeMap::from([(station_id, command_queues())]);
+        let mut pipeline = GatewayCommandPipeline::default();
+
+        let report = pipeline.process(
+            &mut gateway,
+            &mut station_queues,
+            &encode_command_frame(1),
+            Tick::new(10),
+            CommandIngress::RUNNING,
+        );
+
+        assert!(report.accepted);
+        assert_eq!(report.reason_code, GATEWAY_COMMAND_ACK_ACCEPTED);
+        assert_eq!(report.station_id, Some(station_id));
+        assert!(report.error.is_none());
+        let ack_bytes = report.ack_bytes.expect("ACK should encode");
+        let RuntimeFrame::CommandAck(ack) = BinaryFrameDecoder
+            .decode(&ack_bytes)
+            .expect("ACK should decode")
+        else {
+            panic!("expected command ACK");
+        };
+        assert!(ack.accepted);
+        assert_eq!(ack.command_id, CommandId::new(1));
+        let queued = station_queues
+            .get_mut(&station_id)
+            .expect("queue should exist")
+            .pop_next()
+            .expect("command should queue");
+        assert_eq!(queued.id, CommandId::new(1));
+        assert_eq!(pipeline.stats().commands_admitted, 1);
+        assert_eq!(pipeline.stats().commands_enqueued, 1);
+        assert_eq!(pipeline.stats().acks_encoded, 1);
+    }
+
+    #[test]
+    fn gateway_command_pipeline_negative_acks_rate_limit() {
+        let client_id = ClientId::new(7);
+        let station_id = StationId::new(1);
+        let mut gateway = gateway(1);
+        gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let mut station_queues = BTreeMap::from([(station_id, command_queues())]);
+        let mut pipeline = GatewayCommandPipeline::default();
+
+        assert!(
+            pipeline
+                .process(
+                    &mut gateway,
+                    &mut station_queues,
+                    &encode_command_frame(1),
+                    Tick::new(10),
+                    CommandIngress::RUNNING,
+                )
+                .accepted
+        );
+        let rejected = pipeline.process(
+            &mut gateway,
+            &mut station_queues,
+            &encode_command_frame(2),
+            Tick::new(10),
+            CommandIngress::RUNNING,
+        );
+
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.reason_code, GATEWAY_COMMAND_ACK_RATE_LIMITED);
+        assert!(matches!(
+            rejected.error,
+            Some(GatewayCommandPipelineError::Gateway(
+                GatewayError::RateLimited { .. }
+            ))
+        ));
+        let RuntimeFrame::CommandAck(ack) = BinaryFrameDecoder
+            .decode(&rejected.ack_bytes.expect("rejection ACK should encode"))
+            .expect("ACK should decode")
+        else {
+            panic!("expected command ACK");
+        };
+        assert!(!ack.accepted);
+        assert_eq!(ack.reason_code, GATEWAY_COMMAND_ACK_RATE_LIMITED);
+        assert_eq!(pipeline.stats().commands_rejected_gateway, 1);
+    }
+
+    #[test]
+    fn gateway_command_pipeline_rejects_missing_station_queue() {
+        let client_id = ClientId::new(7);
+        let station_id = StationId::new(1);
+        let mut gateway = gateway(4);
+        gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let mut station_queues = BTreeMap::new();
+        let mut pipeline = GatewayCommandPipeline::default();
+
+        let report = pipeline.process(
+            &mut gateway,
+            &mut station_queues,
+            &encode_command_frame(1),
+            Tick::new(10),
+            CommandIngress::RUNNING,
+        );
+
+        assert!(!report.accepted);
+        assert_eq!(report.station_id, Some(station_id));
+        assert_eq!(report.reason_code, GATEWAY_COMMAND_ACK_MISSING_QUEUE);
+        assert!(matches!(
+            report.error,
+            Some(GatewayCommandPipelineError::MissingQueue(id)) if id == station_id
+        ));
+        assert_eq!(pipeline.stats().commands_admitted, 1);
+        assert_eq!(pipeline.stats().commands_rejected_queue, 1);
+    }
+
+    #[test]
+    fn gateway_command_pipeline_rejects_non_command_frame() {
+        let ack = CommandAckFrame {
+            client_id: ClientId::new(7),
+            command_id: CommandId::new(1),
+            server_tick: Tick::new(10),
+            accepted: true,
+            reason_code: 0,
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_command_ack(&ack, &mut bytes)
+            .expect("ACK should encode");
+        let mut gateway = gateway(4);
+        let mut station_queues = BTreeMap::new();
+        let mut pipeline = GatewayCommandPipeline::default();
+
+        let report = pipeline.process(
+            &mut gateway,
+            &mut station_queues,
+            &bytes,
+            Tick::new(10),
+            CommandIngress::RUNNING,
+        );
+
+        assert!(!report.accepted);
+        assert!(report.ack_bytes.is_none());
+        assert_eq!(
+            report.error,
+            Some(GatewayCommandPipelineError::NonCommandFrame)
+        );
+        assert_eq!(pipeline.stats().frames_rejected_non_command, 1);
     }
 
     #[test]

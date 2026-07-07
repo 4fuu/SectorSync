@@ -16,6 +16,9 @@
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
+- Use `cargo run -p sectorsync-bench --example gateway_command_pipeline` when
+  changing runtime gateway command frame decoding, gateway admission to station
+  queue routing, or command ACK generation.
 - Use `cargo run -p sectorsync-bench --example deployment_routing` when changing
   deployment node/station route tables, node heartbeat/stale checks, draining
   behavior, route moves, or placement capacity rules.
@@ -97,6 +100,11 @@ The core library does not own:
   and per-client command admission limits are allowed; sockets, auth providers,
   NAT traversal, deployment discovery, durable account state, and production
   process orchestration stay outside core.
+- Runtime gateway command pipelines may decode command frames, call gateway
+  metadata admission, enqueue into bounded station command queues, and encode
+  ACKs. They must not perform game-rule validation, anti-cheat decisions,
+  account auth, reconnect loops, NAT traversal, blocking network IO, or
+  unbounded buffering.
 - Deployment routing primitives must remain metadata-only and bounded: node
   registration, heartbeat ticks, station placement routes, route epochs,
   draining/offline state, stale checks, and capacity guards are allowed;

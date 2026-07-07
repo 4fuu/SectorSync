@@ -86,8 +86,8 @@ Current crates:
   includes dynamic cell ownership tables, conservative automatic split
   scheduling with cooldown/capacity/improvement guards, cell-level migration
   execution, a low-level deployment node/station route table, a station event
-  router, a bounded station event transport bridge, and a simple station
-  scheduler.
+  router, a bounded station event transport bridge, a business-agnostic gateway
+  command pipeline, and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -100,6 +100,7 @@ cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example gateway_session
+cargo run -p sectorsync-bench --example gateway_command_pipeline
 cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
@@ -174,6 +175,10 @@ Initial status:
   routes, route epochs, reconnect generations, reconnect grace windows,
   disconnected-session expiry, replay/stale sequence rejection, and per-client
   per-tick command admission limits.
+- Runtime gateway command pipeline decodes command frames, applies
+  gateway/session metadata admission, queues accepted commands into target
+  station queues, and encodes command ACKs for accepted or rejected commands
+  without interpreting game payloads.
 - Wire codec supports client command ingress frames that convert into
   `CommandEnvelope` after the server stamps `received_at`, plus command ACK
   frames for the return path. Command payloads remain opaque to SectorSync.
@@ -249,6 +254,10 @@ Initial status:
   low-level gateway session table connecting a client, routing commands into
   station command queues, rerouting to another station, rate-limiting a command,
   and reconnecting inside a grace window.
+- `cargo run -p sectorsync-bench --example gateway_command_pipeline`
+  demonstrates a reusable gateway command frame pipeline that turns command
+  bytes into station queue entries and ACK bytes while preserving gateway
+  rate-limit rejection.
 - `cargo run -p sectorsync-bench --example deployment_routing` demonstrates a
   low-level deployment route table registering nodes, assigning station routes,
   marking a node draining, moving a station route to another node, and marking a
