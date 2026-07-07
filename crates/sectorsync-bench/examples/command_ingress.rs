@@ -65,7 +65,10 @@ fn main() {
         low: 4,
     });
     queues
-        .push(command.clone().into_envelope(Tick::new(10)), CommandIngress::RUNNING)
+        .push(
+            command.clone().into_envelope(Tick::new(10)),
+            CommandIngress::RUNNING,
+        )
         .expect("command should enqueue");
     let applied = queues.pop_next().expect("command should be ready");
     assert_eq!(applied.id, command.command_id);
