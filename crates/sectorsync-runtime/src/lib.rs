@@ -21,9 +21,10 @@ use sectorsync_transport::{
     TransportReceiver, TransportSink,
 };
 use sectorsync_wire::{
-    BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
-    CommandDispatchFrame, ComponentSelection, FrameDecoder, FrameEncoder, ReplicationFrame,
-    ReplicationFrameBuildStats, ReplicationFrameBuilder, RuntimeFrame, StationEventFrame,
+    BarrierFrame, BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder,
+    CommandAckFrame, CommandDispatchFrame, CommandFrame, ComponentSelection, FrameDecoder,
+    FrameEncoder, ReplicationFrame, ReplicationFrameBuildStats, ReplicationFrameBuilder,
+    RuntimeFrame, StationEventFrame,
 };
 
 pub use deployment::{
@@ -531,6 +532,414 @@ impl ReplicationReceiveBridge {
             pump.frames.push(frame);
         }
         Ok(pump)
+    }
+}
+
+/// Low-level client transport bridge configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientTransportConfig {
+    /// Local client id expected inside client-bound frames.
+    pub client_id: ClientId,
+    /// Remote server/gateway id used as the transport packet target for commands.
+    pub server_id: ClientId,
+    /// Expected remote sender identity when the transport can identify it.
+    pub expected_source: Option<ClientId>,
+}
+
+impl ClientTransportConfig {
+    /// Creates client transport configuration for a server/gateway target.
+    pub const fn new(client_id: ClientId, server_id: ClientId) -> Self {
+        Self {
+            client_id,
+            server_id,
+            expected_source: None,
+        }
+    }
+
+    /// Returns a copy that expects inbound packets from `source`.
+    pub const fn with_expected_source(mut self, source: ClientId) -> Self {
+        self.expected_source = Some(source);
+        self
+    }
+}
+
+/// Low-level client transport bridge statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientTransportStats {
+    /// Command frames encoded and submitted to transport.
+    pub commands_sent: usize,
+    /// Command bytes submitted to transport.
+    pub command_bytes_sent: usize,
+    /// Packets consumed from transport.
+    pub packets_received: usize,
+    /// Bytes consumed from transport.
+    pub bytes_received: usize,
+    /// Command ACK frames decoded and accepted.
+    pub command_acks_received: usize,
+    /// Replication frames decoded and accepted.
+    pub replication_frames_received: usize,
+    /// Barrier frames decoded and accepted.
+    pub barrier_frames_received: usize,
+    /// Packets rejected by wire decoding.
+    pub frames_rejected_decode: usize,
+    /// Packets rejected because they were not client-bound frames.
+    pub frames_rejected_unexpected: usize,
+    /// Packets rejected because the transport source did not match.
+    pub frames_rejected_source: usize,
+    /// Packets rejected because the frame target did not match this client.
+    pub frames_rejected_target: usize,
+    /// Entity deltas received in replication frames.
+    pub entities_received: usize,
+    /// Component deltas received in replication frames.
+    pub components_received: usize,
+}
+
+/// Result of sending one command frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientCommandSendReport {
+    /// Submitted command id.
+    pub command_id: CommandId,
+    /// Encoded command bytes submitted to transport.
+    pub bytes_sent: usize,
+}
+
+/// Client-bound frame categories accepted by `ClientTransportBridge`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientInboundFrameKind {
+    /// Command acknowledgement.
+    CommandAck,
+    /// Replication update.
+    Replication,
+    /// Runtime barrier notification.
+    Barrier,
+}
+
+/// Result of pumping client-bound frames.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientTransportPump {
+    /// Packets consumed from transport.
+    pub packets_received: usize,
+    /// Bytes consumed from transport.
+    pub bytes_received: usize,
+    /// Command acknowledgements decoded and accepted.
+    pub command_acks: Vec<CommandAckFrame>,
+    /// Replication frames decoded and accepted.
+    pub replication_frames: Vec<ReplicationFrame>,
+    /// Barrier frames decoded and accepted.
+    pub barriers: Vec<BarrierFrame>,
+}
+
+impl ClientTransportPump {
+    /// Returns received command ACK count.
+    pub fn command_acks_received(&self) -> usize {
+        self.command_acks.len()
+    }
+
+    /// Returns accepted replication frame count.
+    pub fn replication_frames_received(&self) -> usize {
+        self.replication_frames.len()
+    }
+
+    /// Returns accepted barrier frame count.
+    pub fn barrier_frames_received(&self) -> usize {
+        self.barriers.len()
+    }
+
+    /// Returns received entity delta count.
+    pub fn entities_received(&self) -> usize {
+        self.replication_frames
+            .iter()
+            .map(|frame| frame.entities.len())
+            .sum()
+    }
+
+    /// Returns received component delta count.
+    pub fn components_received(&self) -> usize {
+        self.replication_frames
+            .iter()
+            .flat_map(|frame| &frame.entities)
+            .map(|entity| entity.components.len())
+            .sum()
+    }
+}
+
+/// Error produced by the low-level client transport bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientTransportBridgeError<E> {
+    /// Outbound command used a different client id than the bridge config.
+    CommandClientMismatch {
+        /// Expected local client id.
+        expected: ClientId,
+        /// Actual command client id.
+        actual: ClientId,
+    },
+    /// Wire encoding failed.
+    Encode(BinaryEncodeError),
+    /// Underlying client transport failed.
+    Transport(E),
+    /// Wire decoding failed.
+    Decode(BinaryDecodeError),
+    /// Packet decoded as a frame that is not client-bound.
+    UnexpectedFrame,
+    /// Packet source did not match expected remote.
+    SourceMismatch {
+        /// Expected source.
+        expected: ClientId,
+        /// Actual source if transport identified one.
+        actual: Option<ClientId>,
+    },
+    /// Client-bound frame targeted another client.
+    TargetMismatch {
+        /// Frame category.
+        kind: ClientInboundFrameKind,
+        /// Expected local client id.
+        expected: ClientId,
+        /// Actual frame target.
+        actual: ClientId,
+    },
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for ClientTransportBridgeError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::CommandClientMismatch { expected, actual } => write!(
+                f,
+                "command client mismatch: expected {}, actual {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::Encode(error) => write!(f, "{error}"),
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::UnexpectedFrame => f.write_str("packet was not a client-bound frame"),
+            Self::SourceMismatch { expected, actual } => write!(
+                f,
+                "client packet source mismatch: expected {}, actual {:?}",
+                expected.get(),
+                actual.map(ClientId::get)
+            ),
+            Self::TargetMismatch {
+                kind,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "client {:?} frame target mismatch: expected {}, actual {}",
+                kind,
+                expected.get(),
+                actual.get()
+            ),
+        }
+    }
+}
+
+impl<E> std::error::Error for ClientTransportBridgeError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::Transport(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::CommandClientMismatch { .. }
+            | Self::UnexpectedFrame
+            | Self::SourceMismatch { .. }
+            | Self::TargetMismatch { .. } => None,
+        }
+    }
+}
+
+impl<E> From<BinaryEncodeError> for ClientTransportBridgeError<E> {
+    fn from(value: BinaryEncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
+
+impl<E> From<BinaryDecodeError> for ClientTransportBridgeError<E> {
+    fn from(value: BinaryDecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+/// Low-level bridge for client command send and client-bound frame receive.
+#[derive(Clone, Debug)]
+pub struct ClientTransportBridge {
+    config: ClientTransportConfig,
+    stats: ClientTransportStats,
+}
+
+impl ClientTransportBridge {
+    /// Creates a client transport bridge.
+    pub const fn new(config: ClientTransportConfig) -> Self {
+        Self {
+            config,
+            stats: ClientTransportStats {
+                commands_sent: 0,
+                command_bytes_sent: 0,
+                packets_received: 0,
+                bytes_received: 0,
+                command_acks_received: 0,
+                replication_frames_received: 0,
+                barrier_frames_received: 0,
+                frames_rejected_decode: 0,
+                frames_rejected_unexpected: 0,
+                frames_rejected_source: 0,
+                frames_rejected_target: 0,
+                entities_received: 0,
+                components_received: 0,
+            },
+        }
+    }
+
+    /// Returns configuration.
+    pub const fn config(&self) -> ClientTransportConfig {
+        self.config
+    }
+
+    /// Returns accumulated statistics.
+    pub const fn stats(&self) -> ClientTransportStats {
+        self.stats
+    }
+
+    /// Encodes and sends a client command frame to the configured server id.
+    pub fn send_command_frame<T>(
+        &mut self,
+        transport: &mut T,
+        frame: &CommandFrame,
+    ) -> Result<ClientCommandSendReport, ClientTransportBridgeError<T::Error>>
+    where
+        T: TransportSink,
+    {
+        if frame.client_id != self.config.client_id {
+            return Err(ClientTransportBridgeError::CommandClientMismatch {
+                expected: self.config.client_id,
+                actual: frame.client_id,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder.encode_command(frame, &mut bytes)?;
+        let bytes_sent = bytes.len();
+        transport
+            .send(OutboundPacket {
+                client_id: self.config.server_id,
+                bytes,
+            })
+            .map_err(ClientTransportBridgeError::Transport)?;
+        self.stats.commands_sent = self.stats.commands_sent.saturating_add(1);
+        self.stats.command_bytes_sent = self.stats.command_bytes_sent.saturating_add(bytes_sent);
+
+        Ok(ClientCommandSendReport {
+            command_id: frame.command_id,
+            bytes_sent,
+        })
+    }
+
+    /// Receives and decodes up to `max_packets` client-bound frames.
+    pub fn pump<T>(
+        &mut self,
+        transport: &mut T,
+        max_packets: usize,
+    ) -> Result<ClientTransportPump, ClientTransportBridgeError<T::Error>>
+    where
+        T: TransportReceiver,
+    {
+        let mut pump = ClientTransportPump::default();
+        for _ in 0..max_packets {
+            let Some(packet) = transport
+                .try_recv()
+                .map_err(ClientTransportBridgeError::Transport)?
+            else {
+                break;
+            };
+            self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+            self.stats.bytes_received =
+                self.stats.bytes_received.saturating_add(packet.bytes.len());
+            pump.packets_received = pump.packets_received.saturating_add(1);
+            pump.bytes_received = pump.bytes_received.saturating_add(packet.bytes.len());
+
+            if let Some(expected) = self.config.expected_source {
+                if packet.client_id != Some(expected) {
+                    self.stats.frames_rejected_source =
+                        self.stats.frames_rejected_source.saturating_add(1);
+                    return Err(ClientTransportBridgeError::SourceMismatch {
+                        expected,
+                        actual: packet.client_id,
+                    });
+                }
+            }
+
+            let decoded = match BinaryFrameDecoder.decode(&packet.bytes) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.stats.frames_rejected_decode =
+                        self.stats.frames_rejected_decode.saturating_add(1);
+                    return Err(ClientTransportBridgeError::Decode(error));
+                }
+            };
+            match decoded {
+                RuntimeFrame::CommandAck(frame) => {
+                    self.validate_client_target(
+                        ClientInboundFrameKind::CommandAck,
+                        frame.client_id,
+                    )?;
+                    self.stats.command_acks_received =
+                        self.stats.command_acks_received.saturating_add(1);
+                    pump.command_acks.push(frame);
+                }
+                RuntimeFrame::Replication(frame) => {
+                    self.validate_client_target(
+                        ClientInboundFrameKind::Replication,
+                        frame.client_id,
+                    )?;
+                    self.stats.replication_frames_received =
+                        self.stats.replication_frames_received.saturating_add(1);
+                    self.stats.entities_received = self
+                        .stats
+                        .entities_received
+                        .saturating_add(frame.entities.len());
+                    let components = frame
+                        .entities
+                        .iter()
+                        .map(|entity| entity.components.len())
+                        .sum::<usize>();
+                    self.stats.components_received =
+                        self.stats.components_received.saturating_add(components);
+                    pump.replication_frames.push(frame);
+                }
+                RuntimeFrame::Barrier(frame) => {
+                    self.validate_client_target(ClientInboundFrameKind::Barrier, frame.client_id)?;
+                    self.stats.barrier_frames_received =
+                        self.stats.barrier_frames_received.saturating_add(1);
+                    pump.barriers.push(frame);
+                }
+                RuntimeFrame::Command(_)
+                | RuntimeFrame::CommandDispatch(_)
+                | RuntimeFrame::StationEvent(_) => {
+                    self.stats.frames_rejected_unexpected =
+                        self.stats.frames_rejected_unexpected.saturating_add(1);
+                    return Err(ClientTransportBridgeError::UnexpectedFrame);
+                }
+            }
+        }
+        Ok(pump)
+    }
+
+    fn validate_client_target<E>(
+        &mut self,
+        kind: ClientInboundFrameKind,
+        actual: ClientId,
+    ) -> Result<(), ClientTransportBridgeError<E>> {
+        if actual == self.config.client_id {
+            return Ok(());
+        }
+        self.stats.frames_rejected_target = self.stats.frames_rejected_target.saturating_add(1);
+        Err(ClientTransportBridgeError::TargetMismatch {
+            kind,
+            expected: self.config.client_id,
+            actual,
+        })
     }
 }
 
@@ -2719,11 +3128,13 @@ mod tests {
     };
     use sectorsync_transport::{
         ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportHub,
-        OutboundPacket, StationOutboundPacket, StationTransportSink, TransportSink,
+        OutboundPacket, StationOutboundPacket, StationTransportSink, TransportReceiver,
+        TransportSink,
     };
     use sectorsync_wire::{
-        BinaryFrameDecoder, BinaryFrameEncoder, CommandDispatchFrame, CommandFrame, ComponentDelta,
-        EntityDelta, FrameDecoder, FrameEncoder, ReplicationFrame,
+        BarrierFrame, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
+        CommandDispatchFrame, CommandFrame, ComponentDelta, EntityDelta, FrameDecoder,
+        FrameEncoder, ReplicationFrame,
     };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
@@ -3030,6 +3441,189 @@ mod tests {
         assert_eq!(receive.stats().packets_received, 1);
         assert_eq!(receive.stats().frames_received, 0);
         assert_eq!(receive.stats().frames_rejected_target, 1);
+    }
+
+    #[test]
+    fn client_transport_bridge_sends_command_and_receives_client_frames() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 8,
+            max_packet_bytes: 512,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, "127.0.0.1:23207".parse().expect("client addr"))
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23200".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let mut bridge = ClientTransportBridge::new(
+            ClientTransportConfig::new(client_id, server_id).with_expected_source(server_id),
+        );
+        let command = CommandFrame {
+            client_id,
+            command_id: CommandId::new(42),
+            entity_id: EntityId::new(100),
+            sequence: 9,
+            kind: 1,
+            priority: CommandPriority::High,
+            payload: b"move:north".to_vec(),
+        };
+
+        let send = bridge
+            .send_command_frame(&mut client_transport, &command)
+            .expect("command should send");
+        assert_eq!(send.command_id, command.command_id);
+        assert!(send.bytes_sent > 0);
+        assert_eq!(bridge.stats().commands_sent, 1);
+        assert_eq!(bridge.stats().command_bytes_sent, send.bytes_sent);
+        let inbound = server_transport
+            .try_recv()
+            .expect("server receive should work")
+            .expect("command packet should arrive");
+        assert_eq!(inbound.client_id, Some(client_id));
+        let RuntimeFrame::Command(decoded) = BinaryFrameDecoder
+            .decode(&inbound.bytes)
+            .expect("command should decode")
+        else {
+            panic!("expected command frame");
+        };
+        assert_eq!(decoded, command);
+
+        let ack = CommandAckFrame {
+            client_id,
+            command_id: command.command_id,
+            server_tick: Tick::new(12),
+            accepted: true,
+            reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+        };
+        let mut ack_bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_command_ack(&ack, &mut ack_bytes)
+            .expect("ACK should encode");
+        server_transport
+            .send(OutboundPacket {
+                client_id,
+                bytes: ack_bytes,
+            })
+            .expect("ACK should send");
+
+        let replication = ReplicationFrame {
+            client_id,
+            server_tick: Tick::new(12),
+            entity_count: 1,
+            estimated_payload_bytes: 4,
+            entities: vec![EntityDelta {
+                entity_id: EntityId::new(100),
+                owner_epoch: OwnerEpoch::new(1),
+                components: vec![ComponentDelta {
+                    component_id: ComponentId::new(1),
+                    version: 1,
+                    flags: 0,
+                    bytes: 100_u32.to_le_bytes().to_vec(),
+                }],
+            }],
+        };
+        let mut replication_bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_replication(&replication, &mut replication_bytes)
+            .expect("replication should encode");
+        server_transport
+            .send(OutboundPacket {
+                client_id,
+                bytes: replication_bytes,
+            })
+            .expect("replication should send");
+
+        let barrier = BarrierFrame {
+            client_id,
+            barrier_id: BarrierId::new(5),
+            server_tick: Tick::new(12),
+            state: BarrierState::Frozen,
+        };
+        let mut barrier_bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_barrier(&barrier, &mut barrier_bytes)
+            .expect("barrier should encode");
+        server_transport
+            .send(OutboundPacket {
+                client_id,
+                bytes: barrier_bytes,
+            })
+            .expect("barrier should send");
+
+        let pump = bridge
+            .pump(&mut client_transport, 8)
+            .expect("client frames should receive");
+
+        assert_eq!(pump.packets_received, 3);
+        assert_eq!(pump.command_acks_received(), 1);
+        assert_eq!(pump.replication_frames_received(), 1);
+        assert_eq!(pump.barrier_frames_received(), 1);
+        assert_eq!(pump.entities_received(), 1);
+        assert_eq!(pump.components_received(), 1);
+        assert_eq!(pump.command_acks[0], ack);
+        assert_eq!(pump.replication_frames[0], replication);
+        assert_eq!(pump.barriers[0], barrier);
+        assert_eq!(bridge.stats().packets_received, 3);
+        assert_eq!(bridge.stats().command_acks_received, 1);
+        assert_eq!(bridge.stats().replication_frames_received, 1);
+        assert_eq!(bridge.stats().barrier_frames_received, 1);
+        assert_eq!(bridge.stats().entities_received, 1);
+        assert_eq!(bridge.stats().components_received, 1);
+    }
+
+    #[test]
+    fn client_transport_bridge_rejects_wrong_ack_target() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let wrong_client_id = ClientId::new(99);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 4,
+            max_packet_bytes: 512,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, "127.0.0.1:23307".parse().expect("client addr"))
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23300".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let mut bridge = ClientTransportBridge::new(
+            ClientTransportConfig::new(client_id, server_id).with_expected_source(server_id),
+        );
+        let ack = CommandAckFrame {
+            client_id: wrong_client_id,
+            command_id: CommandId::new(42),
+            server_tick: Tick::new(12),
+            accepted: true,
+            reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+        };
+        let mut ack_bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_command_ack(&ack, &mut ack_bytes)
+            .expect("ACK should encode");
+        server_transport
+            .send(OutboundPacket {
+                client_id,
+                bytes: ack_bytes,
+            })
+            .expect("ACK should send");
+
+        let error = bridge
+            .pump(&mut client_transport, 4)
+            .expect_err("wrong target should be rejected");
+
+        assert!(matches!(
+            error,
+            ClientTransportBridgeError::TargetMismatch {
+                kind: ClientInboundFrameKind::CommandAck,
+                expected,
+                actual,
+            } if expected == client_id && actual == wrong_client_id
+        ));
+        assert_eq!(bridge.stats().packets_received, 1);
+        assert_eq!(bridge.stats().command_acks_received, 0);
+        assert_eq!(bridge.stats().frames_rejected_target, 1);
     }
 
     #[test]

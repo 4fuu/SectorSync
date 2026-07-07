@@ -17,6 +17,9 @@
 - Use `cargo run -p sectorsync-bench --example replication_bridge` when changing
   runtime replication transport send/receive bridges, AOI-to-frame downlink
   flow, or client replication transport integration.
+- Use `cargo run -p sectorsync-bench --example client_bridge` when changing
+  low-level client command send, ACK/replication/barrier receive pumping, or
+  client-bound frame validation.
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
@@ -85,7 +88,7 @@ The core library does not own:
 - Durable persistence, crash recovery, failover, or backups.
 - Process management, service discovery, deployment, or cluster scheduling.
 - Mandatory GPU execution.
-- Production gateway or client SDK in the first phase.
+- Production gateway process or full-featured client SDK in the first phase.
 
 ## Architecture Rules
 
@@ -192,6 +195,11 @@ The core library does not own:
   validate source/target metadata, and decode replication frames. They must not
   add hidden persistence, blocking client IO, unbounded per-client buffers,
   client state storage, or game payload interpretation.
+- Client transport bridges may encode command frames to a configured
+  server/gateway target and pump client-bound ACK, replication, and barrier
+  frames. They must not own reconnect loops, production authentication,
+  blocking waits, hidden retries, client world state, or game payload
+  interpretation.
 - SDK-level changes should include or update an example/integration test when
   they affect the expected external usage flow.
 - Split/migration changes should keep `cargo run -p sectorsync-bench --example
