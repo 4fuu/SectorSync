@@ -74,6 +74,9 @@
 - Use `cargo run -p sectorsync-bench --example adaptive_cadence` when changing
   policy min/max update rates, replication cadence helpers, cadence-aware
   planning, or distance-based synchronization downgrade.
+- Use `cargo run -p sectorsync-bench --example priority_budget` when changing
+  replication priority scoring, policy `priority_weight` behavior, or
+  budget-aware replication selection.
 - Use `cargo run -p sectorsync-bench --example replication_tracker` when
   changing replication send/ACK tracking, last-sent lookup helpers, or explicit
   dirty cleanup APIs.
@@ -205,6 +208,10 @@ The core library does not own:
   station tick rate, distance, and caller-provided `last_sent` lookups. Core
   code must not hide unbounded per-client cadence maps, sleeps, timers, or
   client-world state inside replication planning.
+- Budget-aware replication priority may use compiled policy weights and viewer
+  distance for stateless hot-path selection. It must not encode gameplay
+  threat rules, inventory/combat semantics, or client-specific business
+  priority systems inside the core planner.
 - Replication trackers must stay bounded and explicit. They may record
   per-client/entity sent and ACK ticks, but they must not invent a wire ACK
   protocol, clear global dirty flags implicitly, own client world state, or keep

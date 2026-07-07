@@ -353,6 +353,35 @@ impl ReplicationCadence {
     }
 }
 
+/// Stateless replication priority scoring helper.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReplicationPriority;
+
+impl ReplicationPriority {
+    /// Returns a deterministic priority score for budgeted selection.
+    pub fn score(policy: &CompiledSyncPolicy, distance_squared: f32) -> u64 {
+        let weight = u64::from(policy.priority_weight.max(1));
+        let radius_squared = policy.interest_radius * policy.interest_radius;
+        let distance_score =
+            if radius_squared.is_finite() && radius_squared > 0.0 && distance_squared.is_finite() {
+                let closeness = 1.0 - (distance_squared / radius_squared).clamp(0.0, 1.0);
+                (closeness * 1_000_000.0).round() as u64
+            } else {
+                1_000_000
+            };
+        weight
+            .saturating_mul(1_000_000)
+            .saturating_add(distance_score)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PrioritizedReplicationCandidate {
+    handle: EntityHandle,
+    score: u64,
+    distance_squared: f32,
+}
+
 /// Simple range/visibility-based replication planner.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReplicationPlanner;
@@ -395,6 +424,61 @@ impl ReplicationPlanner {
         let tick_rate_hz = station.config().tick_rate_hz;
         let now = station.tick();
         Self::plan_for_viewer_inner(
+            station,
+            index,
+            policies,
+            viewer,
+            filter,
+            budget,
+            |handle, policy, distance_squared| {
+                ReplicationCadence::should_send(
+                    policy,
+                    tick_rate_hz,
+                    distance_squared,
+                    now,
+                    last_sent(handle),
+                )
+            },
+        )
+    }
+
+    /// Plans a frame and selects the highest-priority entities when budgeted.
+    pub fn plan_for_viewer_prioritized<F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+    ) -> ReplicationPlan {
+        Self::plan_for_viewer_prioritized_inner(
+            station,
+            index,
+            policies,
+            viewer,
+            filter,
+            budget,
+            |_, _, _| true,
+        )
+    }
+
+    /// Plans a budgeted priority frame with distance-based cadence checks.
+    pub fn plan_for_viewer_prioritized_with_cadence<F, L>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        last_sent: L,
+    ) -> ReplicationPlan
+    where
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
+        let tick_rate_hz = station.config().tick_rate_hz;
+        let now = station.tick();
+        Self::plan_for_viewer_prioritized_inner(
             station,
             index,
             policies,
@@ -469,6 +553,81 @@ impl ReplicationPlanner {
             plan.entities.push(handle);
         }
 
+        plan.stats.selected = plan.entities.len();
+        plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
+        plan
+    }
+
+    fn plan_for_viewer_prioritized_inner<F, C>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        cadence_allows: C,
+    ) -> ReplicationPlan
+    where
+        F: VisibilityFilter,
+        C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
+    {
+        let candidates = index.query_sphere(viewer.position, viewer.radius);
+        let max_entities = viewer.max_entities.min(budget.max_entities);
+        let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
+        let hard_limit = max_entities.min(max_by_bytes);
+        let mut plan = ReplicationPlan {
+            entities: Vec::with_capacity(hard_limit),
+            stats: ReplicationStats {
+                candidates: candidates.len(),
+                ..ReplicationStats::default()
+            },
+        };
+        let mut eligible = Vec::new();
+
+        for handle in candidates {
+            let Some(entity) = station.get(handle) else {
+                continue;
+            };
+            plan.stats.considered += 1;
+
+            let Some(policy) = policies.get(entity.policy_id) else {
+                continue;
+            };
+            let distance_squared = entity.position.distance_squared(viewer.position);
+            let policy_radius_sq = policy.interest_radius * policy.interest_radius;
+            if distance_squared > policy_radius_sq {
+                continue;
+            }
+            if !filter.is_visible(viewer, entity) {
+                continue;
+            }
+            if !cadence_allows(handle, policy, distance_squared) {
+                plan.stats.skipped_by_cadence += 1;
+                continue;
+            }
+
+            eligible.push(PrioritizedReplicationCandidate {
+                handle,
+                score: ReplicationPriority::score(policy, distance_squared),
+                distance_squared,
+            });
+        }
+
+        eligible.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.distance_squared.total_cmp(&right.distance_squared))
+                .then_with(|| left.handle.cmp(&right.handle))
+        });
+
+        plan.stats.skipped_by_budget = eligible.len().saturating_sub(hard_limit);
+        plan.entities.extend(
+            eligible
+                .into_iter()
+                .take(hard_limit)
+                .map(|candidate| candidate.handle),
+        );
         plan.stats.selected = plan.entities.len();
         plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
         plan
@@ -628,6 +787,21 @@ mod tests {
     }
 
     #[test]
+    fn priority_score_prefers_weight_then_distance() {
+        let mut low = CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 100.0);
+        low.priority_weight = 1;
+        let mut high = CompiledSyncPolicy::new(PolicyId::new(2), 1, 20, 100.0);
+        high.priority_weight = 10;
+
+        assert!(
+            ReplicationPriority::score(&high, 90.0 * 90.0) > ReplicationPriority::score(&low, 0.0)
+        );
+        assert!(
+            ReplicationPriority::score(&low, 0.0) > ReplicationPriority::score(&low, 90.0 * 90.0)
+        );
+    }
+
+    #[test]
     fn planner_with_cadence_skips_recent_far_entities() {
         let mut station = Station::new(StationConfig {
             station_id: StationId::new(1),
@@ -681,6 +855,67 @@ mod tests {
         assert_eq!(plan.entities, vec![near]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.skipped_by_cadence, 1);
+    }
+
+    #[test]
+    fn prioritized_planner_uses_policy_weight_under_budget() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let grid = GridSpec::new(16.0).expect("grid is valid");
+        let mut index = CellIndex::new(grid);
+        let mut policies = PolicyTable::default();
+        let mut low = CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 128.0);
+        low.priority_weight = 1;
+        let mut high = CompiledSyncPolicy::new(PolicyId::new(2), 1, 20, 128.0);
+        high.priority_weight = 10;
+        policies.set(low);
+        policies.set(high);
+
+        let near_low = station
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(0.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn near low priority");
+        let far_high = station
+            .spawn_owned(
+                EntityId::new(2),
+                Position3::new(96.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(2),
+            )
+            .expect("spawn far high priority");
+        index.upsert(near_low, Position3::new(0.0, 0.0, 0.0), Bounds::Point);
+        index.upsert(far_high, Position3::new(96.0, 0.0, 0.0), Bounds::Point);
+
+        let viewer = ViewerQuery {
+            client_id: ClientId::new(7),
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: 128.0,
+            max_entities: 1,
+        };
+        let plan = ReplicationPlanner::plan_for_viewer_prioritized(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &RangeOnlyVisibility,
+            ReplicationBudget {
+                max_entities: 1,
+                max_bytes: 32,
+                estimated_entity_bytes: 32,
+            },
+        );
+
+        assert_eq!(plan.entities, vec![far_high]);
+        assert_eq!(plan.stats.selected, 1);
+        assert_eq!(plan.stats.skipped_by_budget, 1);
     }
 
     #[test]
