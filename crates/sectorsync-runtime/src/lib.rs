@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sectorsync_core::prelude::{
     BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CommandQueueMode, EntityHandle,
-    EntityId, EventQueueError, EventQueueLimits, EventQueues, HandoffTransfer, OwnerEpoch,
-    PushOutcome, RuntimeBarrier, SnapshotVersion, SplitProposal, Station, StationError,
-    StationEvent, StationId, StationSnapshot, Tick,
+    EntityId, EventQueueError, EventQueueLimits, EventQueues, HandoffTransfer, HotspotDecision,
+    HotspotPlanner, HotspotSeverity, HotspotThresholds, OwnerEpoch, PushOutcome, RuntimeBarrier,
+    SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
+    StationLoadSample, StationSnapshot, Tick,
 };
 
 /// Small in-process station collection for simulations and embedders.
@@ -95,6 +96,71 @@ impl StationSet {
     /// Returns whether no stations are registered.
     pub fn is_empty(&self) -> bool {
         self.stations.is_empty()
+    }
+}
+
+/// Station-local spatial indexes keyed by station id.
+#[derive(Clone, Debug, Default)]
+pub struct StationIndexSet {
+    indexes: Vec<(StationId, CellIndex)>,
+}
+
+impl StationIndexSet {
+    /// Adds or replaces one station index.
+    pub fn insert(&mut self, station_id: StationId, index: CellIndex) {
+        if let Some((_, existing)) = self.indexes.iter_mut().find(|(id, _)| *id == station_id) {
+            *existing = index;
+        } else {
+            self.indexes.push((station_id, index));
+        }
+    }
+
+    /// Gets one station index.
+    pub fn get(&self, station_id: StationId) -> Option<&CellIndex> {
+        self.indexes
+            .iter()
+            .find(|(id, _)| *id == station_id)
+            .map(|(_, index)| index)
+    }
+
+    /// Gets one mutable station index.
+    pub fn get_mut(&mut self, station_id: StationId) -> Option<&mut CellIndex> {
+        self.indexes
+            .iter_mut()
+            .find(|(id, _)| *id == station_id)
+            .map(|(_, index)| index)
+    }
+
+    /// Gets two distinct mutable station indexes.
+    pub fn get_pair_mut(
+        &mut self,
+        left_id: StationId,
+        right_id: StationId,
+    ) -> Option<(&mut CellIndex, &mut CellIndex)> {
+        if left_id == right_id {
+            return None;
+        }
+
+        let left_index = self.indexes.iter().position(|(id, _)| *id == left_id)?;
+        let right_index = self.indexes.iter().position(|(id, _)| *id == right_id)?;
+
+        if left_index < right_index {
+            let (left, right) = self.indexes.split_at_mut(right_index);
+            Some((&mut left[left_index].1, &mut right[0].1))
+        } else {
+            let (left, right) = self.indexes.split_at_mut(left_index);
+            Some((&mut right[0].1, &mut left[right_index].1))
+        }
+    }
+
+    /// Number of indexes.
+    pub fn len(&self) -> usize {
+        self.indexes.len()
+    }
+
+    /// Returns whether no indexes are registered.
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
     }
 }
 
@@ -400,6 +466,234 @@ impl CellMigrationExecutor {
 
         Ok(report)
     }
+}
+
+/// Automatic split scheduler configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitSchedulerConfig {
+    /// Hotspot thresholds.
+    pub thresholds: HotspotThresholds,
+    /// Maximum split actions to create per scheduling pass.
+    pub max_actions_per_pass: usize,
+    /// Maximum cells to move in each split action.
+    pub max_cells_per_action: usize,
+    /// Source ghost TTL used during migration execution.
+    pub ghost_ttl_ticks: u64,
+}
+
+impl Default for SplitSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            thresholds: HotspotThresholds::default(),
+            max_actions_per_pass: 4,
+            max_cells_per_action: 4,
+            ghost_ttl_ticks: 4,
+        }
+    }
+}
+
+/// One scheduled split action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitAction {
+    /// Source station selected for split.
+    pub source_station: StationId,
+    /// Target station selected to receive cells.
+    pub target_station: StationId,
+    /// Cell split proposal.
+    pub proposal: SplitProposal,
+}
+
+/// Split schedule produced from a load snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitSchedule {
+    /// Hotspot decisions produced for every input station.
+    pub decisions: Vec<HotspotDecision>,
+    /// Actions selected for execution.
+    pub actions: Vec<SplitAction>,
+    /// Hot stations skipped because no distinct target existed.
+    pub skipped_no_target: usize,
+    /// Hot stations skipped because no cells were proposed.
+    pub skipped_no_cells: usize,
+}
+
+/// Result of executing a split schedule.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SplitScheduleExecutionReport {
+    /// Ownership changes applied.
+    pub ownership_updates: Vec<CellOwnershipUpdate>,
+    /// Cell migration reports.
+    pub cell_migrations: Vec<CellMigrationReport>,
+}
+
+/// Split schedule execution error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitScheduleExecutionError {
+    /// Source index is missing.
+    MissingSourceIndex(StationId),
+    /// Target index is missing.
+    MissingTargetIndex(StationId),
+    /// Cell migration failed.
+    CellMigration(CellMigrationError),
+}
+
+impl core::fmt::Display for SplitScheduleExecutionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingSourceIndex(id) => write!(f, "source index {} is missing", id.get()),
+            Self::MissingTargetIndex(id) => write!(f, "target index {} is missing", id.get()),
+            Self::CellMigration(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SplitScheduleExecutionError {}
+
+impl From<CellMigrationError> for SplitScheduleExecutionError {
+    fn from(value: CellMigrationError) -> Self {
+        Self::CellMigration(value)
+    }
+}
+
+/// Conservative automatic split scheduler.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitScheduler {
+    /// Scheduler configuration.
+    pub config: SplitSchedulerConfig,
+}
+
+impl SplitScheduler {
+    /// Creates a split scheduler.
+    pub const fn new(config: SplitSchedulerConfig) -> Self {
+        Self { config }
+    }
+
+    /// Plans split actions from station load samples.
+    pub fn plan(&self, samples: &[StationLoadSample]) -> SplitSchedule {
+        let decisions = samples
+            .iter()
+            .map(|sample| HotspotPlanner::evaluate(sample, self.config.thresholds))
+            .collect::<Vec<_>>();
+        let mut schedule = SplitSchedule {
+            decisions,
+            ..SplitSchedule::default()
+        };
+
+        for source in samples {
+            if schedule.actions.len() >= self.config.max_actions_per_pass {
+                break;
+            }
+            let Some(source_decision) = schedule
+                .decisions
+                .iter()
+                .find(|decision| decision.station_id == source.station_id)
+            else {
+                continue;
+            };
+            if source_decision.severity != HotspotSeverity::Hot {
+                continue;
+            }
+
+            let Some(target) = select_split_target(source.station_id, samples, &schedule.decisions)
+            else {
+                schedule.skipped_no_target += 1;
+                continue;
+            };
+            let proposal =
+                HotspotPlanner::propose_cell_split(source, self.config.max_cells_per_action);
+            if proposal.cells_to_move.is_empty() {
+                schedule.skipped_no_cells += 1;
+                continue;
+            }
+            schedule.actions.push(SplitAction {
+                source_station: source.station_id,
+                target_station: target.station_id,
+                proposal,
+            });
+        }
+
+        schedule
+    }
+
+    /// Executes a split schedule by applying ownership updates and migrating entities.
+    pub fn execute(
+        &self,
+        schedule: &SplitSchedule,
+        stations: &mut StationSet,
+        indexes: &mut StationIndexSet,
+        ownership: &mut CellOwnershipTable,
+    ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
+        let mut report = SplitScheduleExecutionReport::default();
+
+        for action in &schedule.actions {
+            if indexes.get(action.source_station).is_none() {
+                return Err(SplitScheduleExecutionError::MissingSourceIndex(
+                    action.source_station,
+                ));
+            }
+            if indexes.get(action.target_station).is_none() {
+                return Err(SplitScheduleExecutionError::MissingTargetIndex(
+                    action.target_station,
+                ));
+            }
+
+            let update = ownership.apply_split(&action.proposal, action.target_station);
+            let (source_index, target_index) = indexes
+                .get_pair_mut(action.source_station, action.target_station)
+                .expect("indexes were checked above");
+            let migration = CellMigrationExecutor::migrate_cells(
+                stations,
+                source_index,
+                target_index,
+                action.source_station,
+                action.target_station,
+                &update.moved_cells,
+                self.config.ghost_ttl_ticks,
+            )?;
+            report.ownership_updates.push(update);
+            report.cell_migrations.push(migration);
+        }
+
+        Ok(report)
+    }
+}
+
+impl Default for SplitScheduler {
+    fn default() -> Self {
+        Self::new(SplitSchedulerConfig::default())
+    }
+}
+
+fn select_split_target<'a>(
+    source_station: StationId,
+    samples: &'a [StationLoadSample],
+    decisions: &[HotspotDecision],
+) -> Option<&'a StationLoadSample> {
+    let normal_target = samples
+        .iter()
+        .filter(|sample| sample.station_id != source_station)
+        .filter(|sample| {
+            decisions
+                .iter()
+                .find(|decision| decision.station_id == sample.station_id)
+                .is_some_and(|decision| decision.severity == HotspotSeverity::Normal)
+        })
+        .min_by_key(|sample| station_load_score(sample));
+
+    normal_target.or_else(|| {
+        samples
+            .iter()
+            .filter(|sample| sample.station_id != source_station)
+            .min_by_key(|sample| station_load_score(sample))
+    })
+}
+
+fn station_load_score(sample: &StationLoadSample) -> u64 {
+    (sample.total_entities() as u64)
+        .saturating_mul(8)
+        .saturating_add((sample.subscribers as u64).saturating_mul(4))
+        .saturating_add(sample.queued_events as u64)
+        .saturating_add((sample.estimated_bytes / 256) as u64)
+        .saturating_add(sample.tick_cost_units)
 }
 
 /// Event router statistics.
@@ -793,8 +1087,9 @@ impl BarrierController {
 mod tests {
     use super::*;
     use sectorsync_core::prelude::{
-        Bounds, CellCoord3, EventId, EventKind, EventPriority, GridSpec, InstanceId, NodeId,
-        PolicyId, Position3, StationConfig,
+        Bounds, CellCoord3, CellLoadSample, EventId, EventKind, EventPriority, GridSpec,
+        HotspotThresholds, InstanceId, NodeId, PolicyId, Position3, StationConfig,
+        StationLoadSample,
     };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
@@ -994,6 +1289,88 @@ mod tests {
                 .get_by_id(EntityId::new(1))
                 .expect("target owner")
                 .is_owned()
+        );
+    }
+
+    #[test]
+    fn split_scheduler_plans_and_executes_hot_cell_move() {
+        let grid = GridSpec::new(16.0).expect("valid grid");
+        let hot_cell = CellCoord3::new(0, 0, 0);
+        let mut stations = StationSet::default();
+        let mut source = station(1, 10);
+        let handle = source
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(1.0, 1.0, 1.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+        stations.push(source);
+        stations.push(station(2, 10));
+
+        let mut source_index = CellIndex::new(grid);
+        source_index.upsert(handle, Position3::new(1.0, 1.0, 1.0), Bounds::Point);
+        let mut indexes = StationIndexSet::default();
+        indexes.insert(StationId::new(1), source_index);
+        indexes.insert(StationId::new(2), CellIndex::new(grid));
+
+        let samples = vec![
+            StationLoadSample {
+                station_id: StationId::new(1),
+                owned_entities: 100,
+                subscribers: 100,
+                tick_cost_units: 1000,
+                cells: vec![CellLoadSample {
+                    cell: hot_cell,
+                    owned_entities: 100,
+                    subscribers: 100,
+                    event_pressure: 10,
+                    ..CellLoadSample::default()
+                }],
+                ..StationLoadSample::default()
+            },
+            StationLoadSample {
+                station_id: StationId::new(2),
+                owned_entities: 1,
+                cells: vec![CellLoadSample {
+                    cell: CellCoord3::new(10, 0, 0),
+                    owned_entities: 1,
+                    ..CellLoadSample::default()
+                }],
+                ..StationLoadSample::default()
+            },
+        ];
+        let scheduler = SplitScheduler::new(SplitSchedulerConfig {
+            thresholds: HotspotThresholds {
+                max_station_entities: 10,
+                max_station_subscribers: 10,
+                max_cell_pressure: 10,
+                ..HotspotThresholds::default()
+            },
+            max_actions_per_pass: 1,
+            max_cells_per_action: 1,
+            ghost_ttl_ticks: 4,
+        });
+        let schedule = scheduler.plan(&samples);
+        assert_eq!(schedule.actions.len(), 1);
+        assert_eq!(schedule.actions[0].target_station, StationId::new(2));
+
+        let mut ownership = CellOwnershipTable::default();
+        ownership.assign(hot_cell, StationId::new(1));
+        let report = scheduler
+            .execute(&schedule, &mut stations, &mut indexes, &mut ownership)
+            .expect("execute should work");
+
+        assert_eq!(ownership.owner_of(hot_cell), Some(StationId::new(2)));
+        assert_eq!(report.cell_migrations.len(), 1);
+        assert_eq!(report.cell_migrations[0].entity_migrations.len(), 1);
+        assert_eq!(
+            indexes
+                .get(StationId::new(2))
+                .expect("target index")
+                .entity_count(),
+            1
         );
     }
 }
