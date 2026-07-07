@@ -62,7 +62,9 @@ Current crates:
   metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, command
-  acknowledgements, and barrier notifications.
+  acknowledgements, and barrier notifications. It also provides a replication
+  frame builder that materializes dirty component deltas from a core replication
+  plan.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
   byte-budget transport wrapper, and fake transport for tests/benchmarks.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
@@ -77,6 +79,7 @@ Useful commands:
 cargo test --workspace
 cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
+cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
@@ -140,6 +143,8 @@ Initial status:
   component encoding without forcing a serialization framework.
 - Wire codec supports binary encode/decode for replication, command ACK, and
   barrier frames. Replication frames can carry concrete entity/component deltas.
+- Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
+  concrete wire payloads with bounded entity/component materialization.
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
 - Runtime event router queues cross-station events by target station and drains
   events once their target tick is ready.
@@ -150,6 +155,9 @@ Initial status:
   command latency in ticks, max queue depth, payload entity/component delta
   counts, tick timing estimates, threshold checks, and an aggregate
   `benchmark_ok` verdict.
+- `cargo run -p sectorsync-bench --example sdk_flow` demonstrates an
+  end-to-end embeddable SDK path: station, cell index, component store,
+  replication plan, frame builder, binary codec, and fake transport.
 
 Not complete yet:
 

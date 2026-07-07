@@ -69,6 +69,8 @@ The core library does not own:
   Avoid per-entity transport abstraction on hot paths.
 - Replication frame changes must preserve entity/component delta payload support
   and maintain binary encode/decode roundtrip tests.
+- SDK-level changes should include or update an example/integration test when
+  they affect the expected external usage flow.
 - Runtime-configurable sync policies must compile into compact hot-path data.
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.
