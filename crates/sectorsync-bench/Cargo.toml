@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sectorsync-core = { path = "../sectorsync-core" }
+sectorsync-runtime = { path = "../sectorsync-runtime" }
 sectorsync-transport = { path = "../sectorsync-transport" }
 sectorsync-wire = { path = "../sectorsync-wire" }
 
