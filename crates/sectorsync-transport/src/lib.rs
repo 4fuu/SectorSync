@@ -2,13 +2,31 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+
 use sectorsync_core::prelude::ClientId;
+
+/// Default maximum UDP datagram bytes read by `UdpTransport`.
+pub const DEFAULT_UDP_RECV_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Outbound packet after wire encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboundPacket {
     /// Target client.
     pub client_id: ClientId,
+    /// Encoded bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Inbound packet before wire decoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundPacket {
+    /// Known client id for `remote_addr`, if the transport has one registered.
+    pub client_id: Option<ClientId>,
+    /// Address the datagram came from.
+    pub remote_addr: SocketAddr,
     /// Encoded bytes.
     pub bytes: Vec<u8>,
 }
@@ -64,6 +82,186 @@ pub trait TransportSink {
             self.send(packet)?;
         }
         Ok(())
+    }
+}
+
+/// Non-blocking packet receive abstraction.
+pub trait TransportReceiver {
+    /// Transport error type.
+    type Error;
+
+    /// Attempts to receive one encoded packet.
+    ///
+    /// Implementations should return `Ok(None)` when no packet is currently
+    /// available instead of blocking the caller's station tick.
+    fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error>;
+}
+
+/// Error produced by the standard UDP transport adapter.
+#[derive(Debug)]
+pub enum UdpTransportError {
+    /// No address has been registered for the target client.
+    UnknownClient(ClientId),
+    /// Underlying socket error.
+    Io(io::Error),
+}
+
+impl core::fmt::Display for UdpTransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownClient(client_id) => {
+                write!(f, "udp target client {} is not registered", client_id.get())
+            }
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for UdpTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnknownClient(_) => None,
+            Self::Io(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for UdpTransportError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Lightweight `std::net::UdpSocket` transport adapter.
+///
+/// This adapter intentionally operates at packet boundaries. Reliability,
+/// encryption, authentication, reconnects, and gateway/session semantics are
+/// expected to live outside the core SectorSync hot path.
+#[derive(Debug)]
+pub struct UdpTransport {
+    socket: UdpSocket,
+    clients: HashMap<ClientId, SocketAddr>,
+    addr_to_client: HashMap<SocketAddr, ClientId>,
+    recv_buffer: Vec<u8>,
+}
+
+impl UdpTransport {
+    /// Binds a non-blocking UDP socket.
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let socket = UdpSocket::bind(addr)?;
+        Self::from_socket(socket)
+    }
+
+    /// Wraps an existing UDP socket and configures it as non-blocking.
+    pub fn from_socket(socket: UdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            clients: HashMap::new(),
+            addr_to_client: HashMap::new(),
+            recv_buffer: vec![0; DEFAULT_UDP_RECV_BUFFER_SIZE],
+        })
+    }
+
+    /// Returns the local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Borrows the underlying socket.
+    pub const fn socket(&self) -> &UdpSocket {
+        &self.socket
+    }
+
+    /// Mutably borrows the underlying socket.
+    pub fn socket_mut(&mut self) -> &mut UdpSocket {
+        &mut self.socket
+    }
+
+    /// Registers or replaces the address for a client.
+    pub fn register_client(
+        &mut self,
+        client_id: ClientId,
+        addr: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let old_addr = self.clients.insert(client_id, addr);
+        if let Some(old_addr) = old_addr {
+            self.addr_to_client.remove(&old_addr);
+        }
+        if let Some(old_client) = self.addr_to_client.insert(addr, client_id) {
+            if old_client != client_id {
+                self.clients.remove(&old_client);
+            }
+        }
+        old_addr
+    }
+
+    /// Removes a registered client address.
+    pub fn unregister_client(&mut self, client_id: ClientId) -> Option<SocketAddr> {
+        let addr = self.clients.remove(&client_id)?;
+        self.addr_to_client.remove(&addr);
+        Some(addr)
+    }
+
+    /// Returns a registered address for a client.
+    pub fn client_addr(&self, client_id: ClientId) -> Option<SocketAddr> {
+        self.clients.get(&client_id).copied()
+    }
+
+    /// Returns the registered client id for a remote address.
+    pub fn client_for_addr(&self, addr: SocketAddr) -> Option<ClientId> {
+        self.addr_to_client.get(&addr).copied()
+    }
+
+    /// Sets the reusable receive buffer size.
+    ///
+    /// Datagram payloads larger than this buffer may be truncated by the OS.
+    /// Keep replication frames under the transport MTU/budget in normal use.
+    pub fn set_recv_buffer_size(&mut self, bytes: usize) {
+        self.recv_buffer.resize(bytes.max(1), 0);
+    }
+
+    /// Returns the reusable receive buffer size.
+    pub fn recv_buffer_size(&self) -> usize {
+        self.recv_buffer.len()
+    }
+}
+
+impl TransportSink for UdpTransport {
+    type Error = UdpTransportError;
+
+    fn send(&mut self, packet: OutboundPacket) -> Result<(), Self::Error> {
+        let addr = self
+            .clients
+            .get(&packet.client_id)
+            .copied()
+            .ok_or(UdpTransportError::UnknownClient(packet.client_id))?;
+        let sent = self.socket.send_to(&packet.bytes, addr)?;
+        if sent == packet.bytes.len() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "udp socket reported a partial datagram send",
+            )
+            .into())
+        }
+    }
+}
+
+impl TransportReceiver for UdpTransport {
+    type Error = UdpTransportError;
+
+    fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error> {
+        match self.socket.recv_from(&mut self.recv_buffer) {
+            Ok((len, remote_addr)) => Ok(Some(InboundPacket {
+                client_id: self.addr_to_client.get(&remote_addr).copied(),
+                remote_addr,
+                bytes: self.recv_buffer[..len].to_vec(),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -205,12 +403,24 @@ impl TransportSink for FakeTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::Duration;
 
     fn packet(bytes: usize) -> OutboundPacket {
         OutboundPacket {
             client_id: ClientId::new(1),
             bytes: vec![0; bytes],
         }
+    }
+
+    fn recv_with_retry(transport: &mut UdpTransport) -> InboundPacket {
+        for _ in 0..50 {
+            if let Some(packet) = transport.try_recv().expect("udp receive should work") {
+                return packet;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("udp packet was not received");
     }
 
     #[test]
@@ -247,5 +457,58 @@ mod tests {
             }
         );
         assert_eq!(transport.inner().packets_sent(), 0);
+    }
+
+    #[test]
+    fn udp_transport_sends_and_receives_registered_client() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let mut server = UdpTransport::bind("127.0.0.1:0").expect("server should bind");
+        let mut client = UdpTransport::bind("127.0.0.1:0").expect("client should bind");
+        let server_addr = server.local_addr().expect("server addr should exist");
+        let client_addr = client.local_addr().expect("client addr should exist");
+
+        server.register_client(client_id, client_addr);
+        client.register_client(server_id, server_addr);
+
+        client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: b"command".to_vec(),
+            })
+            .expect("client should send");
+        let inbound = recv_with_retry(&mut server);
+        assert_eq!(inbound.client_id, Some(client_id));
+        assert_eq!(inbound.remote_addr, client_addr);
+        assert_eq!(inbound.bytes, b"command");
+
+        server
+            .send(OutboundPacket {
+                client_id,
+                bytes: b"replication".to_vec(),
+            })
+            .expect("server should send");
+        let inbound = recv_with_retry(&mut client);
+        assert_eq!(inbound.client_id, Some(server_id));
+        assert_eq!(inbound.remote_addr, server_addr);
+        assert_eq!(inbound.bytes, b"replication");
+    }
+
+    #[test]
+    fn udp_transport_rejects_unknown_client() {
+        let mut transport = UdpTransport::bind("127.0.0.1:0").expect("transport should bind");
+        let error = transport
+            .send(OutboundPacket {
+                client_id: ClientId::new(99),
+                bytes: Vec::new(),
+            })
+            .expect_err("unknown client should fail");
+
+        match error {
+            UdpTransportError::UnknownClient(client_id) => {
+                assert_eq!(client_id, ClientId::new(99));
+            }
+            UdpTransportError::Io(error) => panic!("unexpected io error: {error}"),
+        }
     }
 }
