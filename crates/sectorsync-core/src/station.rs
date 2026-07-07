@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::entity::{DirtyMask, EntityRecord, EntityRole};
+use crate::handoff::HandoffTransfer;
 use crate::ids::{
     EntityHandle, EntityId, InstanceId, NodeId, OwnerEpoch, PolicyId, StationId, Tick,
 };
@@ -60,6 +61,12 @@ impl Station {
 
     /// Current owner epoch.
     pub const fn owner_epoch(&self) -> OwnerEpoch {
+        self.owner_epoch
+    }
+
+    /// Reserves and returns the next owner epoch for this station.
+    pub fn next_owner_epoch(&mut self) -> OwnerEpoch {
+        self.owner_epoch = OwnerEpoch::new(self.owner_epoch.get().saturating_add(1));
         self.owner_epoch
     }
 
@@ -163,6 +170,17 @@ impl Station {
         self.get(handle)
     }
 
+    /// Gets a mutable entity record by stable id.
+    pub fn get_by_id_mut(&mut self, id: EntityId) -> Option<&mut EntityRecord> {
+        let handle = self.by_id.get(&id).copied()?;
+        self.get_mut(handle)
+    }
+
+    /// Gets a station-local handle by stable id.
+    pub fn handle_by_id(&self, id: EntityId) -> Option<EntityHandle> {
+        self.by_id.get(&id).copied()
+    }
+
     /// Moves an authoritative entity and marks transform dirty.
     pub fn move_owned(
         &mut self,
@@ -183,6 +201,165 @@ impl Station {
     /// Iterates over live records.
     pub fn iter(&self) -> impl Iterator<Item = &EntityRecord> {
         self.records.iter().filter_map(Option::as_ref)
+    }
+
+    /// Removes an entity record by handle.
+    pub fn remove(&mut self, handle: EntityHandle) -> Result<EntityRecord, StationError> {
+        let index = usize::try_from(handle.index())
+            .map_err(|_| StationError::MissingEntityHandle(handle))?;
+        let generation = self
+            .generations
+            .get(index)
+            .copied()
+            .ok_or(StationError::MissingEntityHandle(handle))?;
+        if generation != handle.generation() {
+            return Err(StationError::MissingEntityHandle(handle));
+        }
+
+        let record = self.records[index]
+            .take()
+            .ok_or(StationError::MissingEntityHandle(handle))?;
+        self.by_id.remove(&record.id);
+        self.generations[index] = self.generations[index].saturating_add(1);
+        self.free.push(handle.index());
+        Ok(record)
+    }
+
+    /// Removes an entity record by stable id.
+    pub fn remove_by_id(&mut self, id: EntityId) -> Result<EntityRecord, StationError> {
+        let handle = self
+            .by_id
+            .get(&id)
+            .copied()
+            .ok_or(StationError::MissingEntity(id))?;
+        self.remove(handle)
+    }
+
+    /// Prepares an outgoing handoff transfer without mutating ownership yet.
+    pub fn prepare_outgoing_handoff(
+        &self,
+        entity_id: EntityId,
+        target_station: StationId,
+        target_owner_epoch: OwnerEpoch,
+        source_ghost_expires_at: Tick,
+    ) -> Result<HandoffTransfer, StationError> {
+        if target_station == self.config.station_id {
+            return Err(StationError::HandoffTargetIsSource(target_station));
+        }
+
+        let entity = self
+            .get_by_id(entity_id)
+            .ok_or(StationError::MissingEntity(entity_id))?;
+        if !entity.is_owned() {
+            return Err(StationError::NotOwner(entity_id));
+        }
+
+        Ok(HandoffTransfer {
+            entity_id,
+            source_station: self.config.station_id,
+            target_station,
+            source_owner_epoch: entity.role.owner_epoch(),
+            target_owner_epoch,
+            prepared_at: self.tick,
+            source_ghost_expires_at,
+            entity: entity.clone(),
+        })
+    }
+
+    /// Prewarms or refreshes a target-side ghost before owner commit.
+    pub fn prewarm_handoff_ghost(
+        &mut self,
+        transfer: &HandoffTransfer,
+    ) -> Result<EntityHandle, StationError> {
+        if transfer.target_station != self.config.station_id {
+            return Err(StationError::WrongHandoffTarget {
+                expected: self.config.station_id,
+                actual: transfer.target_station,
+            });
+        }
+
+        Ok(self.upsert_ghost(
+            transfer.entity_id,
+            transfer.entity.position,
+            transfer.entity.bounds,
+            transfer.entity.policy_id,
+            transfer.source_station,
+            transfer.source_owner_epoch,
+            transfer.source_ghost_expires_at,
+        ))
+    }
+
+    /// Commits the target side of an incoming handoff and becomes authoritative.
+    pub fn commit_incoming_handoff(
+        &mut self,
+        transfer: HandoffTransfer,
+    ) -> Result<EntityHandle, StationError> {
+        if transfer.target_station != self.config.station_id {
+            return Err(StationError::WrongHandoffTarget {
+                expected: self.config.station_id,
+                actual: transfer.target_station,
+            });
+        }
+
+        if let Some(handle) = self.handle_by_id(transfer.entity_id) {
+            let record = self
+                .get_mut(handle)
+                .ok_or(StationError::MissingEntityHandle(handle))?;
+            if record.is_owned() {
+                return Err(StationError::AlreadyOwner(transfer.entity_id));
+            }
+
+            *record = transfer.entity;
+            record.handle = handle;
+            record.role = EntityRole::Owned {
+                owner_epoch: transfer.target_owner_epoch,
+            };
+            record.dirty.insert(DirtyMask::TRANSFORM);
+            self.owner_epoch = transfer.target_owner_epoch;
+            return Ok(handle);
+        }
+
+        let handle = self.allocate_handle();
+        let mut record = transfer.entity;
+        record.handle = handle;
+        record.role = EntityRole::Owned {
+            owner_epoch: transfer.target_owner_epoch,
+        };
+        record.dirty.insert(DirtyMask::TRANSFORM);
+        self.owner_epoch = transfer.target_owner_epoch;
+        self.insert_allocated(handle, record);
+        Ok(handle)
+    }
+
+    /// Commits the source side of an outgoing handoff and keeps a short-lived ghost.
+    pub fn commit_outgoing_handoff(
+        &mut self,
+        transfer: &HandoffTransfer,
+    ) -> Result<EntityHandle, StationError> {
+        if transfer.source_station != self.config.station_id {
+            return Err(StationError::WrongHandoffSource {
+                expected: self.config.station_id,
+                actual: transfer.source_station,
+            });
+        }
+
+        let handle = self
+            .handle_by_id(transfer.entity_id)
+            .ok_or(StationError::MissingEntity(transfer.entity_id))?;
+        let record = self
+            .get_mut(handle)
+            .ok_or(StationError::MissingEntityHandle(handle))?;
+        if !record.is_owned() {
+            return Err(StationError::NotOwner(transfer.entity_id));
+        }
+
+        record.role = EntityRole::Ghost {
+            owner_station: transfer.target_station,
+            owner_epoch: transfer.target_owner_epoch,
+            expires_at: transfer.source_ghost_expires_at,
+        };
+        record.dirty.insert(DirtyMask::TRANSFORM);
+        Ok(handle)
     }
 
     /// Exports an in-memory station snapshot.
@@ -251,10 +428,30 @@ impl Station {
 pub enum StationError {
     /// Entity id already exists in this station.
     DuplicateEntity(EntityId),
+    /// Entity id does not exist in this station.
+    MissingEntity(EntityId),
     /// Entity handle is missing or stale.
     MissingEntityHandle(EntityHandle),
     /// Operation requires an authoritative entity.
     NotOwner(EntityId),
+    /// This station is already authoritative for the entity.
+    AlreadyOwner(EntityId),
+    /// Handoff target cannot be the source station.
+    HandoffTargetIsSource(StationId),
+    /// Incoming transfer was addressed to a different target station.
+    WrongHandoffTarget {
+        /// Expected target station id.
+        expected: StationId,
+        /// Actual target station id in transfer.
+        actual: StationId,
+    },
+    /// Outgoing transfer was addressed from a different source station.
+    WrongHandoffSource {
+        /// Expected source station id.
+        expected: StationId,
+        /// Actual source station id in transfer.
+        actual: StationId,
+    },
     /// Snapshot was captured from a different station.
     SnapshotStationMismatch {
         /// Expected station id.
@@ -268,6 +465,7 @@ impl core::fmt::Display for StationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::DuplicateEntity(id) => write!(f, "duplicate entity id {}", id.get()),
+            Self::MissingEntity(id) => write!(f, "missing entity id {}", id.get()),
             Self::MissingEntityHandle(handle) => {
                 write!(
                     f,
@@ -277,6 +475,28 @@ impl core::fmt::Display for StationError {
                 )
             }
             Self::NotOwner(id) => write!(f, "entity {} is not authoritative here", id.get()),
+            Self::AlreadyOwner(id) => {
+                write!(f, "entity {} is already authoritative here", id.get())
+            }
+            Self::HandoffTargetIsSource(station_id) => {
+                write!(
+                    f,
+                    "handoff target {} is the source station",
+                    station_id.get()
+                )
+            }
+            Self::WrongHandoffTarget { expected, actual } => write!(
+                f,
+                "wrong handoff target: expected {}, got {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::WrongHandoffSource { expected, actual } => write!(
+                f,
+                "wrong handoff source: expected {}, got {}",
+                expected.get(),
+                actual.get()
+            ),
             Self::SnapshotStationMismatch { expected, actual } => write!(
                 f,
                 "snapshot station mismatch: expected {}, got {}",
@@ -296,6 +516,15 @@ mod tests {
     fn config() -> StationConfig {
         StationConfig {
             station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(7),
+            tick_rate_hz: 20,
+        }
+    }
+
+    fn config_with_station(station_id: u32) -> StationConfig {
+        StationConfig {
+            station_id: StationId::new(station_id),
             node_id: NodeId::new(1),
             instance_id: InstanceId::new(7),
             tick_rate_hz: 20,
@@ -350,5 +579,48 @@ mod tests {
             .move_owned(handle, Position3::new(1.0, 0.0, 0.0))
             .expect_err("ghost move should fail");
         assert_eq!(error, StationError::NotOwner(EntityId::new(5)));
+    }
+
+    #[test]
+    fn two_phase_handoff_prewarms_target_and_commits_owner_switch() {
+        let mut source = Station::new(config_with_station(1));
+        let mut target = Station::new(config_with_station(2));
+
+        source
+            .spawn_owned(
+                EntityId::new(9),
+                Position3::new(10.0, 20.0, 30.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+        source.advance_tick();
+
+        let target_epoch = target.next_owner_epoch();
+        let transfer = source
+            .prepare_outgoing_handoff(
+                EntityId::new(9),
+                StationId::new(2),
+                target_epoch,
+                Tick::new(8),
+            )
+            .expect("prepare should work");
+
+        let ghost_handle = target
+            .prewarm_handoff_ghost(&transfer)
+            .expect("prewarm should work");
+        assert!(!target.get(ghost_handle).expect("ghost exists").is_owned());
+
+        let owner_handle = target
+            .commit_incoming_handoff(transfer.clone())
+            .expect("incoming commit should work");
+        assert!(target.get(owner_handle).expect("owner exists").is_owned());
+
+        let source_handle = source
+            .commit_outgoing_handoff(&transfer)
+            .expect("outgoing commit should work");
+        let source_record = source.get(source_handle).expect("source ghost exists");
+        assert!(!source_record.is_owned());
+        assert_eq!(source_record.role.owner_epoch(), target_epoch);
     }
 }

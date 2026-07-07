@@ -6,6 +6,7 @@ pub use crate::entity::{DirtyMask, EntityRecord, EntityRole, EntityTags};
 pub use crate::event::{
     EventKind, EventPriority, EventQueueLimits, EventQueues, PushOutcome, StationEvent,
 };
+pub use crate::handoff::{HandoffCommitHandles, HandoffTransfer};
 pub use crate::ids::{
     BarrierId, ClientId, CommandId, ComponentId, EntityHandle, EntityId, EventId, InstanceId,
     NodeId, OwnerEpoch, PolicyId, StationId, Tick,
