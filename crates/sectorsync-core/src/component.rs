@@ -224,6 +224,249 @@ impl ComponentSchema {
     }
 }
 
+/// Fixed field type used by generated component schema helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentFieldType {
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Unsigned 16-bit little-endian integer.
+    U16,
+    /// Unsigned 32-bit little-endian integer.
+    U32,
+    /// Unsigned 64-bit little-endian integer.
+    U64,
+    /// Signed 32-bit little-endian integer.
+    I32,
+    /// 32-bit little-endian floating point value.
+    F32,
+    /// Three little-endian `f32` values.
+    Vec3,
+    /// Opaque bytes with a maximum generated layout size.
+    Bytes {
+        /// Maximum byte count reserved in the generated layout.
+        max_len: usize,
+    },
+}
+
+impl ComponentFieldType {
+    /// Maximum encoded size in bytes.
+    pub const fn max_size(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::U64 => 8,
+            Self::Vec3 => 12,
+            Self::Bytes { max_len } => max_len,
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+            Self::U32 => 3,
+            Self::U64 => 4,
+            Self::I32 => 5,
+            Self::F32 => 6,
+            Self::Vec3 => 7,
+            Self::Bytes { .. } => 8,
+        }
+    }
+}
+
+/// Field descriptor emitted by external schema generators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentFieldDescriptor {
+    /// Stable field name.
+    pub name: &'static str,
+    /// Encoded field type.
+    pub ty: ComponentFieldType,
+    /// Byte offset inside the generated component blob.
+    pub offset: usize,
+}
+
+impl ComponentFieldDescriptor {
+    /// Creates a generated field descriptor.
+    pub const fn new(name: &'static str, ty: ComponentFieldType, offset: usize) -> Self {
+        Self { name, ty, offset }
+    }
+
+    /// Returns the exclusive end offset.
+    pub const fn end_offset(self) -> usize {
+        self.offset.saturating_add(self.ty.max_size())
+    }
+}
+
+/// Component schema shape emitted by an external generator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratedComponentSchema {
+    /// Component id used in hot-path records.
+    pub id: ComponentId,
+    /// Stable debug name.
+    pub name: &'static str,
+    /// Storage strategy.
+    pub storage: ComponentStorageKind,
+    /// Synchronization strategy.
+    pub sync: ComponentSyncMode,
+    /// Migration strategy.
+    pub migration: ComponentMigrationMode,
+    /// Maximum accepted blob size in bytes.
+    pub max_bytes: usize,
+    /// Generated field layout.
+    pub fields: &'static [ComponentFieldDescriptor],
+}
+
+impl GeneratedComponentSchema {
+    /// Creates a generated component schema.
+    pub const fn new(
+        id: ComponentId,
+        name: &'static str,
+        storage: ComponentStorageKind,
+        sync: ComponentSyncMode,
+        migration: ComponentMigrationMode,
+        max_bytes: usize,
+        fields: &'static [ComponentFieldDescriptor],
+    ) -> Self {
+        Self {
+            id,
+            name,
+            storage,
+            sync,
+            migration,
+            max_bytes,
+            fields,
+        }
+    }
+
+    /// Validates generated layout invariants.
+    pub fn validate(&self) -> Result<(), ComponentSchemaError> {
+        for (index, field) in self.fields.iter().enumerate() {
+            if field.end_offset() > self.max_bytes {
+                return Err(ComponentSchemaError::FieldOutOfBounds {
+                    name: field.name,
+                    offset: field.offset,
+                    size: field.ty.max_size(),
+                    max_bytes: self.max_bytes,
+                });
+            }
+
+            for earlier in &self.fields[..index] {
+                if earlier.name == field.name {
+                    return Err(ComponentSchemaError::DuplicateFieldName(field.name));
+                }
+                if ranges_overlap(
+                    earlier.offset,
+                    earlier.end_offset(),
+                    field.offset,
+                    field.end_offset(),
+                ) {
+                    return Err(ComponentSchemaError::FieldOverlap {
+                        left: earlier.name,
+                        right: field.name,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the generated schema hash.
+    pub fn schema_hash(&self) -> u64 {
+        let mut hash = FNV_OFFSET;
+        hash = hash_u64(hash, self.id.get().into());
+        hash = hash_str(hash, self.name);
+        hash = hash_u8(hash, storage_tag(self.storage));
+        hash = hash_u8(hash, sync_tag(self.sync));
+        hash = hash_u8(hash, migration_tag(self.migration));
+        hash = hash_u64(hash, self.max_bytes as u64);
+        for field in self.fields {
+            hash = hash_str(hash, field.name);
+            hash = hash_u8(hash, field.ty.tag());
+            hash = hash_u64(hash, field.ty.max_size() as u64);
+            hash = hash_u64(hash, field.offset as u64);
+        }
+        hash
+    }
+
+    /// Returns the maximum generated fixed size.
+    pub fn fixed_size(&self) -> Option<usize> {
+        self.fields
+            .iter()
+            .map(|field| field.end_offset())
+            .max()
+            .or(Some(0))
+    }
+
+    /// Builds a component descriptor with the generated schema hash attached.
+    pub fn descriptor(&self) -> ComponentDescriptor {
+        ComponentDescriptor {
+            id: self.id,
+            name: self.name,
+            storage: self.storage,
+            sync: self.sync,
+            migration: self.migration,
+            max_bytes: self.max_bytes,
+            schema_hash: self.schema_hash(),
+        }
+    }
+
+    /// Builds a typed component schema wrapper.
+    pub fn component_schema(&self) -> ComponentSchema {
+        ComponentSchema {
+            descriptor: self.descriptor(),
+            fixed_size: self.fixed_size(),
+        }
+    }
+}
+
+/// Generated component schema validation error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentSchemaError {
+    /// Field name was repeated.
+    DuplicateFieldName(&'static str),
+    /// Field range exceeded `max_bytes`.
+    FieldOutOfBounds {
+        /// Field name.
+        name: &'static str,
+        /// Field offset.
+        offset: usize,
+        /// Field size.
+        size: usize,
+        /// Maximum component bytes.
+        max_bytes: usize,
+    },
+    /// Two field byte ranges overlap.
+    FieldOverlap {
+        /// Earlier field.
+        left: &'static str,
+        /// Later field.
+        right: &'static str,
+    },
+}
+
+impl core::fmt::Display for ComponentSchemaError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DuplicateFieldName(name) => write!(f, "duplicate component field {name}"),
+            Self::FieldOutOfBounds {
+                name,
+                offset,
+                size,
+                max_bytes,
+            } => write!(
+                f,
+                "component field {name} at {offset} with size {size} exceeds max bytes {max_bytes}"
+            ),
+            Self::FieldOverlap { left, right } => {
+                write!(f, "component fields {left} and {right} overlap")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ComponentSchemaError {}
+
 /// Component registry error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComponentRegistryError {
@@ -243,6 +486,33 @@ impl core::fmt::Display for ComponentRegistryError {
 }
 
 impl std::error::Error for ComponentRegistryError {}
+
+/// Error produced while registering a generated schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GeneratedSchemaRegistrationError {
+    /// Generated schema validation failed.
+    Schema(ComponentSchemaError),
+    /// Component registry rejected the generated descriptor.
+    Registry(ComponentRegistryError),
+}
+
+impl core::fmt::Display for GeneratedSchemaRegistrationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Schema(error) => write!(f, "{error}"),
+            Self::Registry(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for GeneratedSchemaRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Schema(error) => Some(error),
+            Self::Registry(error) => Some(error),
+        }
+    }
+}
 
 /// Dense component descriptor registry.
 #[derive(Clone, Debug, Default)]
@@ -271,6 +541,20 @@ impl ComponentRegistry {
         Ok(())
     }
 
+    /// Validates and registers a generated component schema.
+    pub fn register_generated_schema(
+        &mut self,
+        schema: &GeneratedComponentSchema,
+    ) -> Result<ComponentSchema, GeneratedSchemaRegistrationError> {
+        schema
+            .validate()
+            .map_err(GeneratedSchemaRegistrationError::Schema)?;
+        let component_schema = schema.component_schema();
+        self.register(component_schema.descriptor.clone())
+            .map_err(GeneratedSchemaRegistrationError::Registry)?;
+        Ok(component_schema)
+    }
+
     /// Gets a descriptor by component id.
     pub fn get(&self, id: ComponentId) -> Option<&ComponentDescriptor> {
         self.descriptors
@@ -292,6 +576,60 @@ impl ComponentRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn hash_u8(hash: u64, value: u8) -> u64 {
+    (hash ^ u64::from(value)).wrapping_mul(FNV_PRIME)
+}
+
+fn hash_u64(mut hash: u64, value: u64) -> u64 {
+    for byte in value.to_le_bytes() {
+        hash = hash_u8(hash, byte);
+    }
+    hash
+}
+
+fn hash_str(mut hash: u64, value: &str) -> u64 {
+    for byte in value.bytes() {
+        hash = hash_u8(hash, byte);
+    }
+    hash_u8(hash, 0)
+}
+
+fn storage_tag(storage: ComponentStorageKind) -> u8 {
+    match storage {
+        ComponentStorageKind::SparseBlob => 1,
+        ComponentStorageKind::External => 2,
+    }
+}
+
+fn sync_tag(sync: ComponentSyncMode) -> u8 {
+    match sync {
+        ComponentSyncMode::NotReplicated => 0,
+        ComponentSyncMode::Delta => 1,
+        ComponentSyncMode::Snapshot => 2,
+        ComponentSyncMode::EventOnly => 3,
+    }
+}
+
+fn migration_tag(migration: ComponentMigrationMode) -> u8 {
+    match migration {
+        ComponentMigrationMode::Copy => 1,
+        ComponentMigrationMode::Drop => 2,
+        ComponentMigrationMode::External => 3,
+    }
+}
+
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    left_start < right_end && right_start < left_end
 }
 
 /// Opaque component blob stored in a station-local component column.
@@ -622,5 +960,111 @@ mod tests {
             .get_typed(ComponentId::new(3), entity, &Vec3LeCodec)
             .expect("typed get should work");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn generated_schema_builds_descriptor_and_registers() {
+        const FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor::new("position", ComponentFieldType::Vec3, 0),
+            ComponentFieldDescriptor::new("health", ComponentFieldType::U32, 12),
+        ];
+        let generated = GeneratedComponentSchema::new(
+            ComponentId::new(8),
+            "unit_state",
+            ComponentStorageKind::SparseBlob,
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            16,
+            FIELDS,
+        );
+
+        generated.validate().expect("schema should be valid");
+        assert_eq!(generated.fixed_size(), Some(16));
+        assert_ne!(generated.schema_hash(), 0);
+
+        let descriptor = generated.descriptor();
+        assert_eq!(descriptor.id, ComponentId::new(8));
+        assert_eq!(descriptor.schema_hash, generated.schema_hash());
+
+        let mut registry = ComponentRegistry::default();
+        let schema = registry
+            .register_generated_schema(&generated)
+            .expect("generated schema should register");
+        assert_eq!(schema.fixed_size, Some(16));
+        assert_eq!(
+            registry
+                .get(ComponentId::new(8))
+                .expect("registered descriptor")
+                .schema_hash,
+            generated.schema_hash()
+        );
+    }
+
+    #[test]
+    fn generated_schema_validation_rejects_bad_layouts() {
+        const DUP_FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor::new("x", ComponentFieldType::U32, 0),
+            ComponentFieldDescriptor::new("x", ComponentFieldType::U32, 4),
+        ];
+        let duplicate = GeneratedComponentSchema::new(
+            ComponentId::new(1),
+            "duplicate",
+            ComponentStorageKind::SparseBlob,
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            8,
+            DUP_FIELDS,
+        );
+        assert_eq!(
+            duplicate.validate().expect_err("duplicate should fail"),
+            ComponentSchemaError::DuplicateFieldName("x")
+        );
+
+        const OVERLAP_FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor::new("left", ComponentFieldType::U32, 0),
+            ComponentFieldDescriptor::new("right", ComponentFieldType::U32, 2),
+        ];
+        let overlap = GeneratedComponentSchema::new(
+            ComponentId::new(2),
+            "overlap",
+            ComponentStorageKind::SparseBlob,
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            8,
+            OVERLAP_FIELDS,
+        );
+        assert_eq!(
+            overlap.validate().expect_err("overlap should fail"),
+            ComponentSchemaError::FieldOverlap {
+                left: "left",
+                right: "right"
+            }
+        );
+
+        const OOB_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor::new(
+            "wide",
+            ComponentFieldType::U64,
+            4,
+        )];
+        let out_of_bounds = GeneratedComponentSchema::new(
+            ComponentId::new(3),
+            "oob",
+            ComponentStorageKind::SparseBlob,
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            8,
+            OOB_FIELDS,
+        );
+        assert_eq!(
+            out_of_bounds
+                .validate()
+                .expect_err("out of bounds should fail"),
+            ComponentSchemaError::FieldOutOfBounds {
+                name: "wide",
+                offset: 4,
+                size: 8,
+                max_bytes: 8
+            }
+        );
     }
 }
