@@ -5,8 +5,9 @@
 use std::collections::BTreeMap;
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierScope, BarrierState, CommandQueueMode, RuntimeBarrier, SnapshotVersion,
-    Station, StationId, StationSnapshot, Tick,
+    BarrierId, BarrierScope, BarrierState, CommandQueueMode, EntityHandle, EntityId,
+    HandoffTransfer, OwnerEpoch, RuntimeBarrier, SnapshotVersion, Station, StationError, StationId,
+    StationSnapshot, Tick,
 };
 
 /// Small in-process station collection for simulations and embedders.
@@ -33,6 +34,34 @@ impl StationSet {
         self.stations
             .iter_mut()
             .find(|station| station.config().station_id == station_id)
+    }
+
+    /// Gets two distinct mutable stations by id.
+    pub fn get_pair_mut(
+        &mut self,
+        left_id: StationId,
+        right_id: StationId,
+    ) -> Option<(&mut Station, &mut Station)> {
+        if left_id == right_id {
+            return None;
+        }
+
+        let left_index = self
+            .stations
+            .iter()
+            .position(|station| station.config().station_id == left_id)?;
+        let right_index = self
+            .stations
+            .iter()
+            .position(|station| station.config().station_id == right_id)?;
+
+        if left_index < right_index {
+            let (left, right) = self.stations.split_at_mut(right_index);
+            Some((&mut left[left_index], &mut right[0]))
+        } else {
+            let (left, right) = self.stations.split_at_mut(left_index);
+            Some((&mut right[0], &mut left[right_index]))
+        }
     }
 
     /// Iterates over stations.
@@ -66,6 +95,103 @@ impl StationSet {
     pub fn is_empty(&self) -> bool {
         self.stations.is_empty()
     }
+}
+
+/// Result of an in-process entity owner migration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityMigrationReport {
+    /// Transfer payload used for the migration.
+    pub transfer: HandoffTransfer,
+    /// Source-side ghost handle after commit.
+    pub source_ghost: EntityHandle,
+    /// Target-side authoritative handle after commit.
+    pub target_owner: EntityHandle,
+}
+
+/// Entity migration error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityMigrationError {
+    /// Source and target station ids must differ.
+    SameSourceAndTarget(StationId),
+    /// Source station was not found.
+    MissingSource(StationId),
+    /// Target station was not found.
+    MissingTarget(StationId),
+    /// Station-level operation failed.
+    Station(StationError),
+}
+
+impl core::fmt::Display for EntityMigrationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SameSourceAndTarget(id) => {
+                write!(f, "source and target station are both {}", id.get())
+            }
+            Self::MissingSource(id) => write!(f, "source station {} is missing", id.get()),
+            Self::MissingTarget(id) => write!(f, "target station {} is missing", id.get()),
+            Self::Station(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for EntityMigrationError {}
+
+impl From<StationError> for EntityMigrationError {
+    fn from(value: StationError) -> Self {
+        Self::Station(value)
+    }
+}
+
+/// Runtime helper for in-process station-to-station owner migration.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EntityMigrationExecutor;
+
+impl EntityMigrationExecutor {
+    /// Migrates one authoritative entity from source station to target station.
+    pub fn migrate_entity(
+        stations: &mut StationSet,
+        entity_id: EntityId,
+        source_station: StationId,
+        target_station: StationId,
+        ghost_ttl_ticks: u64,
+    ) -> Result<EntityMigrationReport, EntityMigrationError> {
+        if source_station == target_station {
+            return Err(EntityMigrationError::SameSourceAndTarget(source_station));
+        }
+
+        if stations.get(source_station).is_none() {
+            return Err(EntityMigrationError::MissingSource(source_station));
+        }
+        if stations.get(target_station).is_none() {
+            return Err(EntityMigrationError::MissingTarget(target_station));
+        }
+
+        let (source, target) = stations
+            .get_pair_mut(source_station, target_station)
+            .expect("stations were checked above");
+        let target_epoch = next_target_epoch(target);
+        let source_ghost_expires_at =
+            Tick::new(source.tick().get().saturating_add(ghost_ttl_ticks));
+        let transfer = source.prepare_outgoing_handoff(
+            entity_id,
+            target_station,
+            target_epoch,
+            source_ghost_expires_at,
+        )?;
+        target.prewarm_handoff_ghost(&transfer)?;
+        let target_owner = target.commit_incoming_handoff(transfer.clone())?;
+        let source_ghost = source.commit_outgoing_handoff(&transfer)?;
+
+        Ok(EntityMigrationReport {
+            transfer,
+            source_ghost,
+            target_owner,
+        })
+    }
+}
+
+fn next_target_epoch(station: &mut Station) -> OwnerEpoch {
+    station.next_owner_epoch()
 }
 
 /// Per-station progress inside a full runtime barrier.
@@ -300,7 +426,9 @@ impl BarrierController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sectorsync_core::prelude::{InstanceId, NodeId, StationConfig};
+    use sectorsync_core::prelude::{
+        Bounds, InstanceId, NodeId, PolicyId, Position3, StationConfig,
+    };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
         Station::new(StationConfig {
@@ -347,5 +475,48 @@ mod tests {
         assert_eq!(metrics.station_count, 2);
         assert_eq!(metrics.snapshots_exported, 2);
         assert_eq!(controller.progress().state, BarrierState::Running);
+    }
+
+    #[test]
+    fn migration_executor_moves_owner_and_leaves_source_ghost() {
+        let mut stations = StationSet::default();
+        let mut source = station(1, 10);
+        source
+            .spawn_owned(
+                EntityId::new(99),
+                Position3::new(1.0, 2.0, 3.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+        stations.push(source);
+        stations.push(station(2, 10));
+
+        let report = EntityMigrationExecutor::migrate_entity(
+            &mut stations,
+            EntityId::new(99),
+            StationId::new(1),
+            StationId::new(2),
+            4,
+        )
+        .expect("migration should work");
+
+        assert_eq!(report.transfer.target_station, StationId::new(2));
+        assert!(
+            !stations
+                .get(StationId::new(1))
+                .expect("source")
+                .get_by_id(EntityId::new(99))
+                .expect("source ghost")
+                .is_owned()
+        );
+        assert!(
+            stations
+                .get(StationId::new(2))
+                .expect("target")
+                .get_by_id(EntityId::new(99))
+                .expect("target owner")
+                .is_owned()
+        );
     }
 }
