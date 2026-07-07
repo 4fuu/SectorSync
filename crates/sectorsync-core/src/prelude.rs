@@ -17,6 +17,11 @@ pub use crate::event::{
     EventKind, EventPriority, EventQueueError, EventQueueLimits, EventQueues, PushOutcome,
     StationEvent,
 };
+pub use crate::gateway::{
+    GatewayCommandAdmission, GatewayConfig, GatewayConnectOutcome, GatewayConnectReport,
+    GatewayError, GatewayRoute, GatewaySession, GatewaySessionState, GatewaySessionTable,
+    GatewayStats,
+};
 pub use crate::handoff::{HandoffCommitHandles, HandoffTransfer};
 pub use crate::hotspot::{
     CellLoadSample, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotThresholds,
