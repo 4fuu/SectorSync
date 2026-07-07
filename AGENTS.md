@@ -74,6 +74,9 @@
 - Use `cargo run -p sectorsync-bench --example adaptive_cadence` when changing
   policy min/max update rates, replication cadence helpers, cadence-aware
   planning, or distance-based synchronization downgrade.
+- Use `cargo run -p sectorsync-bench --example replication_tracker` when
+  changing replication send/ACK tracking, last-sent lookup helpers, or explicit
+  dirty cleanup APIs.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -202,6 +205,10 @@ The core library does not own:
   station tick rate, distance, and caller-provided `last_sent` lookups. Core
   code must not hide unbounded per-client cadence maps, sleeps, timers, or
   client-world state inside replication planning.
+- Replication trackers must stay bounded and explicit. They may record
+  per-client/entity sent and ACK ticks, but they must not invent a wire ACK
+  protocol, clear global dirty flags implicitly, own client world state, or keep
+  unbounded history.
 - Station internals should favor single-owner, lock-minimal execution.
 - Multiple stations may run in parallel and communicate by bounded messages.
 - Cross-station events should be tick-boundary ordered and idempotent where

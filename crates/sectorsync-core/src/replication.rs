@@ -1,6 +1,8 @@
 //! Replication planning helpers.
 
-use crate::ids::{EntityHandle, Tick};
+use std::collections::BTreeMap;
+
+use crate::ids::{ClientId, EntityHandle, Tick};
 use crate::interest::{ViewerQuery, VisibilityFilter};
 use crate::policy::{CompiledSyncPolicy, PolicyTable};
 use crate::spatial_index::CellIndex;
@@ -34,6 +36,256 @@ pub struct ReplicationPlan {
     pub entities: Vec<EntityHandle>,
     /// Planner statistics.
     pub stats: ReplicationStats,
+}
+
+/// Bounded per-client replication tracking configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationTrackerConfig {
+    /// Maximum tracked client/entity entries.
+    pub max_entries: usize,
+}
+
+impl Default for ReplicationTrackerConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 65_536,
+        }
+    }
+}
+
+/// Per-client/entity replication tracking key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplicationTrackKey {
+    /// Client that received the entity update.
+    pub client_id: ClientId,
+    /// Station-local entity handle selected by the planner.
+    pub entity: EntityHandle,
+}
+
+/// Per-client/entity replication tracking record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationTrackRecord {
+    /// Client that received the entity update.
+    pub client_id: ClientId,
+    /// Station-local entity handle selected by the planner.
+    pub entity: EntityHandle,
+    /// Last tick where this entity was sent to the client.
+    pub last_sent: Tick,
+    /// Last tick where the caller confirmed delivery.
+    pub last_acked: Option<Tick>,
+}
+
+/// Replication tracker statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationTrackerStats {
+    /// Currently tracked entries.
+    pub entries: usize,
+    /// Total record insertions or updates.
+    pub sent_records: usize,
+    /// Total ACK updates applied.
+    pub acked_records: usize,
+    /// Records pruned by explicit cleanup.
+    pub pruned_records: usize,
+}
+
+/// Replication tracking error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicationTrackerError {
+    /// Recording would exceed the configured entry capacity.
+    CapacityExceeded {
+        /// Entries currently tracked.
+        current: usize,
+        /// New entries needed for this operation.
+        needed: usize,
+        /// Maximum tracked entries.
+        max: usize,
+    },
+}
+
+impl core::fmt::Display for ReplicationTrackerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::CapacityExceeded {
+                current,
+                needed,
+                max,
+            } => write!(
+                f,
+                "replication tracker capacity exceeded: current {current}, needed {needed}, max {max}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplicationTrackerError {}
+
+/// Bounded per-client replication send/ACK tracker.
+#[derive(Clone, Debug)]
+pub struct ReplicationTracker {
+    config: ReplicationTrackerConfig,
+    records: BTreeMap<ReplicationTrackKey, ReplicationTrackRecord>,
+    stats: ReplicationTrackerStats,
+}
+
+impl Default for ReplicationTracker {
+    fn default() -> Self {
+        Self::new(ReplicationTrackerConfig::default())
+    }
+}
+
+impl ReplicationTracker {
+    /// Creates an empty tracker.
+    pub fn new(config: ReplicationTrackerConfig) -> Self {
+        Self {
+            config,
+            records: BTreeMap::new(),
+            stats: ReplicationTrackerStats::default(),
+        }
+    }
+
+    /// Returns tracker configuration.
+    pub const fn config(&self) -> ReplicationTrackerConfig {
+        self.config
+    }
+
+    /// Returns tracker statistics.
+    pub const fn stats(&self) -> ReplicationTrackerStats {
+        self.stats
+    }
+
+    /// Returns tracked entry count.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns whether no entries are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Returns the last sent tick for a client/entity pair.
+    pub fn last_sent(&self, client_id: ClientId, entity: EntityHandle) -> Option<Tick> {
+        self.records
+            .get(&ReplicationTrackKey { client_id, entity })
+            .map(|record| record.last_sent)
+    }
+
+    /// Returns a tracked record for a client/entity pair.
+    pub fn get(&self, client_id: ClientId, entity: EntityHandle) -> Option<ReplicationTrackRecord> {
+        self.records
+            .get(&ReplicationTrackKey { client_id, entity })
+            .copied()
+    }
+
+    /// Records that a planned set of entities was sent to a client.
+    pub fn record_plan_sent(
+        &mut self,
+        client_id: ClientId,
+        plan: &ReplicationPlan,
+        sent_at: Tick,
+    ) -> Result<usize, ReplicationTrackerError> {
+        self.ensure_capacity_for(client_id, &plan.entities)?;
+        let mut recorded = 0;
+        for entity in &plan.entities {
+            let key = ReplicationTrackKey {
+                client_id,
+                entity: *entity,
+            };
+            self.records.insert(
+                key,
+                ReplicationTrackRecord {
+                    client_id,
+                    entity: *entity,
+                    last_sent: sent_at,
+                    last_acked: None,
+                },
+            );
+            recorded += 1;
+        }
+        self.refresh_entry_count();
+        self.stats.sent_records = self.stats.sent_records.saturating_add(recorded);
+        Ok(recorded)
+    }
+
+    /// Records delivery acknowledgement for one client/entity pair.
+    pub fn acknowledge(
+        &mut self,
+        client_id: ClientId,
+        entity: EntityHandle,
+        acked_at: Tick,
+    ) -> bool {
+        let Some(record) = self
+            .records
+            .get_mut(&ReplicationTrackKey { client_id, entity })
+        else {
+            return false;
+        };
+        record.last_acked = Some(acked_at);
+        self.stats.acked_records = self.stats.acked_records.saturating_add(1);
+        true
+    }
+
+    /// Records delivery acknowledgement for every entity in a plan.
+    pub fn acknowledge_plan(
+        &mut self,
+        client_id: ClientId,
+        plan: &ReplicationPlan,
+        acked_at: Tick,
+    ) -> usize {
+        plan.entities
+            .iter()
+            .filter(|entity| self.acknowledge(client_id, **entity, acked_at))
+            .count()
+    }
+
+    /// Removes all entries for one client.
+    pub fn clear_client(&mut self, client_id: ClientId) -> usize {
+        let before = self.records.len();
+        self.records.retain(|key, _| key.client_id != client_id);
+        let pruned = before.saturating_sub(self.records.len());
+        self.stats.pruned_records = self.stats.pruned_records.saturating_add(pruned);
+        self.refresh_entry_count();
+        pruned
+    }
+
+    /// Removes entries last sent before `older_than`.
+    pub fn prune_sent_before(&mut self, older_than: Tick) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|_, record| record.last_sent.get() >= older_than.get());
+        let pruned = before.saturating_sub(self.records.len());
+        self.stats.pruned_records = self.stats.pruned_records.saturating_add(pruned);
+        self.refresh_entry_count();
+        pruned
+    }
+
+    fn ensure_capacity_for(
+        &self,
+        client_id: ClientId,
+        entities: &[EntityHandle],
+    ) -> Result<(), ReplicationTrackerError> {
+        let mut needed = 0_usize;
+        for entity in entities {
+            if !self.records.contains_key(&ReplicationTrackKey {
+                client_id,
+                entity: *entity,
+            }) {
+                needed = needed.saturating_add(1);
+            }
+        }
+        if self.records.len().saturating_add(needed) > self.config.max_entries {
+            return Err(ReplicationTrackerError::CapacityExceeded {
+                current: self.records.len(),
+                needed,
+                max: self.config.max_entries,
+            });
+        }
+        Ok(())
+    }
+
+    fn refresh_entry_count(&mut self) {
+        self.stats.entries = self.records.len();
+    }
 }
 
 /// Replication planner statistics.
@@ -429,5 +681,64 @@ mod tests {
         assert_eq!(plan.entities, vec![near]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.skipped_by_cadence, 1);
+    }
+
+    #[test]
+    fn replication_tracker_records_sent_ack_and_prune() {
+        let client_id = ClientId::new(7);
+        let first = EntityHandle::new(1, 0);
+        let second = EntityHandle::new(2, 0);
+        let plan = ReplicationPlan {
+            entities: vec![first, second],
+            stats: ReplicationStats::default(),
+        };
+        let mut tracker = ReplicationTracker::new(ReplicationTrackerConfig { max_entries: 4 });
+
+        let recorded = tracker
+            .record_plan_sent(client_id, &plan, Tick::new(10))
+            .expect("recording should fit");
+        assert_eq!(recorded, 2);
+        assert_eq!(tracker.last_sent(client_id, first), Some(Tick::new(10)));
+        assert_eq!(tracker.stats().entries, 2);
+        assert_eq!(tracker.stats().sent_records, 2);
+
+        assert!(tracker.acknowledge(client_id, first, Tick::new(11)));
+        assert_eq!(
+            tracker
+                .get(client_id, first)
+                .expect("tracked record")
+                .last_acked,
+            Some(Tick::new(11))
+        );
+        assert_eq!(tracker.stats().acked_records, 1);
+
+        assert_eq!(tracker.prune_sent_before(Tick::new(11)), 2);
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.stats().pruned_records, 2);
+    }
+
+    #[test]
+    fn replication_tracker_rejects_capacity_without_partial_insert() {
+        let client_id = ClientId::new(7);
+        let plan = ReplicationPlan {
+            entities: vec![EntityHandle::new(1, 0), EntityHandle::new(2, 0)],
+            stats: ReplicationStats::default(),
+        };
+        let mut tracker = ReplicationTracker::new(ReplicationTrackerConfig { max_entries: 1 });
+
+        let error = tracker
+            .record_plan_sent(client_id, &plan, Tick::new(10))
+            .expect_err("recording should exceed capacity");
+
+        assert_eq!(
+            error,
+            ReplicationTrackerError::CapacityExceeded {
+                current: 0,
+                needed: 2,
+                max: 1,
+            }
+        );
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.stats().sent_records, 0);
     }
 }

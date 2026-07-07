@@ -73,6 +73,11 @@ impl DirtyMask {
         self.0 |= mask.0;
     }
 
+    /// Clears dirty bits present in `mask`.
+    pub fn remove(&mut self, mask: Self) {
+        self.0 &= !mask.0;
+    }
+
     /// Clears all dirty bits.
     pub fn clear(&mut self) {
         self.0 = 0;

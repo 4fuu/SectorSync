@@ -62,9 +62,9 @@ Current crates:
   policies, custom component registry/storage, typed component codecs, schema
   helpers, generated-schema-friendly layout descriptors, cell indexing,
   interest queries, range/frustum/tag visibility filters, adaptive replication
-  cadence helpers, replication planning, bounded command/event queues, handoff
-  transfer types, hotspot planning, gateway session/routing primitives, barrier
-  metadata, and snapshot metadata.
+  cadence helpers, bounded replication send/ACK trackers, replication planning,
+  bounded command/event queues, handoff transfer types, hotspot planning,
+  gateway session/routing primitives, barrier metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, client command
   ingress frames, internal gateway-to-station command dispatch frames, command
@@ -109,6 +109,7 @@ cargo run -p sectorsync-bench --example load_scheduler
 cargo run -p sectorsync-bench --example frustum_visibility
 cargo run -p sectorsync-bench --example tag_visibility
 cargo run -p sectorsync-bench --example adaptive_cadence
+cargo run -p sectorsync-bench --example replication_tracker
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example barrier_transport
@@ -179,8 +180,8 @@ Initial status:
 - Rust workspace scaffolded.
 - Core low-level SDK types exist for station ownership, 3D spatial indexing,
   interest queries, range/frustum/tag visibility filtering, policy tables,
-  adaptive replication cadence planning, event queues, barriers, snapshots,
-  commands, and fake transport integration.
+  adaptive replication cadence planning, bounded replication tracking, event
+  queues, barriers, snapshots, commands, and fake transport integration.
 - Runtime barrier controller can request scoped barriers, wait for station tick
   alignment, freeze, export snapshots, and resume.
 - Runtime barrier notification bridge encodes barrier states into bounded client
@@ -244,6 +245,11 @@ Initial status:
   and squared viewer distance into deterministic send intervals. The cadence
   planner accepts caller-owned `last_sent` lookups so SectorSync can support
   distance-based downgrade without owning per-client world state.
+- Bounded replication trackers record per-client/entity last-sent and ACK ticks
+  for caller-managed cadence and delivery bookkeeping. They do not define a
+  wire ACK protocol or automatically clear global dirty flags; explicit station
+  and component dirty cleanup helpers are available for integrations that know
+  all required recipients have received an update.
 - Runtime replication transport bridge plans AOI for a viewer, builds a concrete
   replication frame from component storage, skips empty frames by default,
   encodes the frame, and submits it to bounded client packet transport.
@@ -329,6 +335,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example adaptive_cadence` demonstrates
   distance-based update-rate downgrade from `min_hz`/`max_hz` while the caller
   owns per-viewer `last_sent` state.
+- `cargo run -p sectorsync-bench --example replication_tracker` demonstrates a
+  bounded low-level send/ACK tracker feeding cadence lookups and explicit dirty
+  cleanup after caller-confirmed delivery.
 - `cargo run -p sectorsync-bench --example replication_bridge` demonstrates a
   low-level downlink path: viewer AOI planning, replication frame building,
   bounded in-memory client transport send, receive, source/target validation,

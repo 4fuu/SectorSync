@@ -211,6 +211,19 @@ impl Station {
         Ok(())
     }
 
+    /// Clears selected dirty bits for a local entity record.
+    pub fn clear_dirty(
+        &mut self,
+        handle: EntityHandle,
+        mask: DirtyMask,
+    ) -> Result<(), StationError> {
+        let record = self
+            .get_mut(handle)
+            .ok_or(StationError::MissingEntityHandle(handle))?;
+        record.dirty.remove(mask);
+        Ok(())
+    }
+
     /// Iterates over live records.
     pub fn iter(&self) -> impl Iterator<Item = &EntityRecord> {
         self.records.iter().filter_map(Option::as_ref)
@@ -614,6 +627,30 @@ mod tests {
 
         assert_eq!(record.tags, tags);
         assert!(record.dirty.contains(DirtyMask::TAGS));
+    }
+
+    #[test]
+    fn selected_dirty_bits_can_be_cleared() {
+        let mut station = Station::new(config());
+        let handle = station
+            .spawn_owned(
+                EntityId::new(8),
+                Position3::new(0.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+        station
+            .set_tags(handle, EntityTags::from_bits(1))
+            .expect("set tags should work");
+
+        station
+            .clear_dirty(handle, DirtyMask::TAGS)
+            .expect("clear dirty should work");
+        let record = station.get(handle).expect("entity should exist");
+
+        assert!(!record.dirty.contains(DirtyMask::TAGS));
+        assert!(record.dirty.contains(DirtyMask::TRANSFORM));
     }
 
     #[test]

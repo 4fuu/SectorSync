@@ -38,6 +38,8 @@ pub use crate::interest::{
 pub use crate::policy::{CompiledSyncPolicy, PolicyTable};
 pub use crate::replication::{
     ReplicationBudget, ReplicationCadence, ReplicationPlan, ReplicationPlanner, ReplicationStats,
+    ReplicationTrackKey, ReplicationTrackRecord, ReplicationTracker, ReplicationTrackerConfig,
+    ReplicationTrackerError, ReplicationTrackerStats,
 };
 pub use crate::snapshot::{RuntimeUpgradeHook, SnapshotMeta, SnapshotVersion, StationSnapshot};
 pub use crate::spatial::{Aabb3, Bounds, CellCoord3, Frustum3, GridSpec, Plane3, Position3, Vec3};
