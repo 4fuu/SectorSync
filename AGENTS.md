@@ -13,6 +13,8 @@
 - Default Rust verification should start with `cargo test --workspace`.
 - Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
   benchmark smoke test.
+- Use `cargo run -p sectorsync-bench --example udp_loopback` when changing the
+  UDP transport adapter or wire/transport integration.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -72,6 +74,14 @@ The core library does not own:
   needed. Do not introduce distributed transactions in the core.
 - Wire and transport abstractions must stay at frame/packet/batch boundaries.
   Avoid per-entity transport abstraction on hot paths.
+- Transport implementations must be non-blocking or externally bounded at the
+  station tick boundary. Do not introduce blocking receives, unbounded packet
+  queues, or hidden per-entity network work in core transport adapters.
+- The standard UDP adapter is a low-level packet adapter only. Reliability,
+  encryption, authentication, reconnect, NAT traversal, and gateway/session
+  semantics belong in outer integration layers unless explicitly scoped later.
+- UDP examples/tests must stay localhost-only, use bounded retry loops, and
+  avoid long sleeps or external network dependencies.
 - Replication frame changes must preserve entity/component delta payload support
   and maintain binary encode/decode roundtrip tests.
 - SDK-level changes should include or update an example/integration test when

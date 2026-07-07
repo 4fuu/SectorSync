@@ -43,7 +43,8 @@ Phase 1 should produce a usable core library and a benchmark simulator:
 - `sectorsync-bench`: deterministic workloads, simulated clients, simulated
   stations, baseline modes, and performance reports.
 - `sectorsync-wire`: wire/frame traits and default frame types.
-- `sectorsync-transport`: transport traits and fake transport support.
+- `sectorsync-transport`: transport traits, fake transport support, byte-budget
+  guards, and a lightweight standard-library UDP adapter.
 - `sectorsync-runtime`: orchestration helpers for multi-station simulation.
 
 The first implementation should stay resource-aware. The development machine is
@@ -66,7 +67,9 @@ Current crates:
   frame builder that materializes dirty component deltas from a core replication
   plan.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
-  byte-budget transport wrapper, and fake transport for tests/benchmarks.
+  byte-budget transport wrapper, fake transport for tests/benchmarks, and a
+  non-blocking `std::net::UdpSocket` adapter with explicit client address
+  registration and inbound packet polling.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
@@ -83,6 +86,7 @@ cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
+cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
@@ -149,6 +153,9 @@ Initial status:
 - Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
   concrete wire payloads with bounded entity/component materialization.
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
+- Standard UDP transport adapter supports non-blocking localhost/network packet
+  send/receive, explicit client-to-address registration, and bounded reusable
+  receive buffers while keeping reliability/session concerns outside the core.
 - Runtime event router queues cross-station events by target station and drains
   events once their target tick is ready.
 - Hotspot planner evaluates station/cell load samples and proposes high-pressure
@@ -168,12 +175,15 @@ Initial status:
   replication plan, frame builder, binary codec, and fake transport.
 - `cargo run -p sectorsync-bench --example split_migration` demonstrates a
   load-sample-driven split scheduler producing and executing a cell migration.
+- `cargo run -p sectorsync-bench --example udp_loopback` demonstrates a
+  replication frame encoded by `sectorsync-wire`, sent through the UDP transport
+  adapter over localhost, received, and decoded back into a runtime frame.
 
 Not complete yet:
 
 - Production-grade tuning for automatic split scheduling policy.
 - Multi-station scheduler and bounded cross-station transport integration beyond
-  core queue primitives.
+  in-process queues and the low-level UDP packet adapter.
 - Generated schema helpers.
-- Real transport adapters.
+- Reliable transport/session/gateway layers for production client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.
