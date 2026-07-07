@@ -11,10 +11,7 @@ use sectorsync_core::prelude::{
     SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
     StationLoadSample, StationSnapshot, Tick,
 };
-use sectorsync_transport::{
-    InMemoryStationTransport, StationOutboundPacket, StationTransportError,
-    StationTransportReceiver, StationTransportSink,
-};
+use sectorsync_transport::{StationOutboundPacket, StationTransportReceiver, StationTransportSink};
 use sectorsync_wire::{
     BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, FrameDecoder,
     FrameEncoder, RuntimeFrame, StationEventFrame,
@@ -862,9 +859,9 @@ pub struct StationEventPumpReport {
 
 /// Error produced while bridging station events through packet transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StationEventTransportError {
+pub enum StationEventTransportError<E> {
     /// Underlying station transport failed.
-    Transport(StationTransportError),
+    Transport(E),
     /// Wire encoding failed.
     Encode(BinaryEncodeError),
     /// Wire decoding failed.
@@ -886,7 +883,7 @@ pub enum StationEventTransportError {
     Router(EventRouterError),
 }
 
-impl core::fmt::Display for StationEventTransportError {
+impl<E: core::fmt::Display> core::fmt::Display for StationEventTransportError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Transport(error) => write!(f, "{error}"),
@@ -911,7 +908,10 @@ impl core::fmt::Display for StationEventTransportError {
     }
 }
 
-impl std::error::Error for StationEventTransportError {
+impl<E> std::error::Error for StationEventTransportError<E>
+where
+    E: std::error::Error + 'static,
+{
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Transport(error) => Some(error),
@@ -923,25 +923,19 @@ impl std::error::Error for StationEventTransportError {
     }
 }
 
-impl From<StationTransportError> for StationEventTransportError {
-    fn from(value: StationTransportError) -> Self {
-        Self::Transport(value)
-    }
-}
-
-impl From<BinaryEncodeError> for StationEventTransportError {
+impl<E> From<BinaryEncodeError> for StationEventTransportError<E> {
     fn from(value: BinaryEncodeError) -> Self {
         Self::Encode(value)
     }
 }
 
-impl From<BinaryDecodeError> for StationEventTransportError {
+impl<E> From<BinaryDecodeError> for StationEventTransportError<E> {
     fn from(value: BinaryDecodeError) -> Self {
         Self::Decode(value)
     }
 }
 
-impl From<EventRouterError> for StationEventTransportError {
+impl<E> From<EventRouterError> for StationEventTransportError<E> {
     fn from(value: EventRouterError) -> Self {
         Self::Router(value)
     }
@@ -960,20 +954,25 @@ impl StationEventTransportBridge {
     }
 
     /// Encodes and sends one station event through the station transport.
-    pub fn send_event(
+    pub fn send_event<T>(
         &mut self,
-        transport: &mut InMemoryStationTransport,
+        transport: &mut T,
         event: &StationEvent,
-    ) -> Result<(), StationEventTransportError> {
+    ) -> Result<(), StationEventTransportError<T::Error>>
+    where
+        T: StationTransportSink,
+    {
         let frame = StationEventFrame::from_event(event);
         let mut bytes = Vec::with_capacity(64);
         BinaryFrameEncoder.encode_station_event(&frame, &mut bytes)?;
         let byte_len = bytes.len();
-        transport.send_station(StationOutboundPacket {
-            source_station: event.source,
-            target_station: event.target,
-            bytes,
-        })?;
+        transport
+            .send_station(StationOutboundPacket {
+                source_station: event.source,
+                target_station: event.target,
+                bytes,
+            })
+            .map_err(StationEventTransportError::Transport)?;
         self.stats.events_sent = self.stats.events_sent.saturating_add(1);
         self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(byte_len);
         Ok(())
@@ -981,19 +980,25 @@ impl StationEventTransportBridge {
 
     /// Receives up to `max_packets` for `target_station`, decodes station
     /// events, and routes them into `router`.
-    pub fn pump_target(
+    pub fn pump_target<T>(
         &mut self,
-        transport: &mut InMemoryStationTransport,
+        transport: &mut T,
         router: &mut EventRouter,
         target_station: StationId,
         max_packets: usize,
-    ) -> Result<StationEventPumpReport, StationEventTransportError> {
+    ) -> Result<StationEventPumpReport, StationEventTransportError<T::Error>>
+    where
+        T: StationTransportReceiver,
+    {
         let mut report = StationEventPumpReport {
             target_station,
             ..StationEventPumpReport::default()
         };
         for _ in 0..max_packets {
-            let Some(packet) = transport.try_recv_station(target_station)? else {
+            let Some(packet) = transport
+                .try_recv_station(target_station)
+                .map_err(StationEventTransportError::Transport)?
+            else {
                 break;
             };
             report.packets_received = report.packets_received.saturating_add(1);
@@ -1301,6 +1306,7 @@ mod tests {
         HotspotThresholds, InstanceId, NodeId, PolicyId, Position3, StationConfig,
         StationLoadSample,
     };
+    use sectorsync_transport::InMemoryStationTransport;
 
     fn station(station_id: u32, instance_id: u64) -> Station {
         Station::new(StationConfig {
