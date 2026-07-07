@@ -71,6 +71,9 @@
 - Use `cargo run -p sectorsync-bench --example tag_visibility` when changing
   entity tag primitives, authoritative tag update APIs, tag visibility filters,
   or tag-driven replication planning.
+- Use `cargo run -p sectorsync-bench --example adaptive_cadence` when changing
+  policy min/max update rates, replication cadence helpers, cadence-aware
+  planning, or distance-based synchronization downgrade.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -195,6 +198,10 @@ The core library does not own:
   runtime reflection to the core crate.
 - Station-local APIs may be low-level and high-performance, but they must not
   bypass owner, dirty, replication-budget, barrier, or event-ordering invariants.
+- Adaptive replication cadence may compute send intervals from policy rates,
+  station tick rate, distance, and caller-provided `last_sent` lookups. Core
+  code must not hide unbounded per-client cadence maps, sleeps, timers, or
+  client-world state inside replication planning.
 - Station internals should favor single-owner, lock-minimal execution.
 - Multiple stations may run in parallel and communicate by bounded messages.
 - Cross-station events should be tick-boundary ordered and idempotent where
