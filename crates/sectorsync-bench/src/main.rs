@@ -28,6 +28,17 @@ struct BenchConfig {
     stations: usize,
     ticks: usize,
     baseline: Baseline,
+    profile_name: &'static str,
+    heavy_profile_denied: bool,
+    thresholds: BenchThresholds,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BenchThresholds {
+    tick_ms_p99: f64,
+    command_latency_ticks_max: u64,
+    command_queue_max: usize,
+    estimated_payload_bytes: usize,
 }
 
 impl Default for BenchConfig {
@@ -38,6 +49,20 @@ impl Default for BenchConfig {
             stations: 4,
             ticks: 5,
             baseline: Baseline::SectorSync,
+            profile_name: "smoke",
+            heavy_profile_denied: false,
+            thresholds: BenchThresholds::default(),
+        }
+    }
+}
+
+impl Default for BenchThresholds {
+    fn default() -> Self {
+        Self {
+            tick_ms_p99: 25.0,
+            command_latency_ticks_max: 2,
+            command_queue_max: 1024,
+            estimated_payload_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -68,6 +93,8 @@ fn main() {
 
     println!("SectorSync benchmark");
     println!("baseline={:?}", config.baseline);
+    println!("profile={}", config.profile_name);
+    println!("heavy_profile_denied={}", config.heavy_profile_denied);
     println!("entities={}", config.entities);
     println!("clients={}", config.clients);
     println!("stations={}", config.stations);
@@ -91,9 +118,34 @@ fn main() {
     println!("warm_stations={}", stats.warm_stations);
     println!("hotspot_stations={}", stats.hotspot_stations);
     println!("split_candidate_cells={}", stats.split_candidate_cells);
-    println!("tick_ms_p50={:.3}", percentile_ms(&stats.tick_ms, 0.50));
-    println!("tick_ms_p99={:.3}", percentile_ms(&stats.tick_ms, 0.99));
-    println!("tick_ms_max={:.3}", percentile_ms(&stats.tick_ms, 1.00));
+    let tick_ms_p50 = percentile_ms(&stats.tick_ms, 0.50);
+    let tick_ms_p99 = percentile_ms(&stats.tick_ms, 0.99);
+    let tick_ms_max = percentile_ms(&stats.tick_ms, 1.00);
+    println!("tick_ms_p50={tick_ms_p50:.3}");
+    println!("tick_ms_p99={tick_ms_p99:.3}");
+    println!("tick_ms_max={tick_ms_max:.3}");
+    let verdict = BenchVerdict::evaluate(config.thresholds, &stats, tick_ms_p99);
+    println!("threshold_tick_ms_p99={:.3}", config.thresholds.tick_ms_p99);
+    println!(
+        "threshold_command_latency_ticks_max={}",
+        config.thresholds.command_latency_ticks_max
+    );
+    println!(
+        "threshold_command_queue_max={}",
+        config.thresholds.command_queue_max
+    );
+    println!(
+        "threshold_estimated_payload_bytes={}",
+        config.thresholds.estimated_payload_bytes
+    );
+    println!("threshold_tick_ok={}", verdict.tick_ok);
+    println!(
+        "threshold_command_latency_ok={}",
+        verdict.command_latency_ok
+    );
+    println!("threshold_command_queue_ok={}", verdict.command_queue_ok);
+    println!("threshold_payload_ok={}", verdict.payload_ok);
+    println!("benchmark_ok={}", verdict.is_ok());
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
 }
 
@@ -107,8 +159,34 @@ impl BenchStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BenchVerdict {
+    tick_ok: bool,
+    command_latency_ok: bool,
+    command_queue_ok: bool,
+    payload_ok: bool,
+}
+
+impl BenchVerdict {
+    fn evaluate(thresholds: BenchThresholds, stats: &BenchStats, tick_ms_p99: f64) -> Self {
+        Self {
+            tick_ok: tick_ms_p99 <= thresholds.tick_ms_p99,
+            command_latency_ok: stats.command_latency_ticks_max
+                <= thresholds.command_latency_ticks_max,
+            command_queue_ok: stats.command_queue_max <= thresholds.command_queue_max,
+            payload_ok: stats.estimated_payload_bytes <= thresholds.estimated_payload_bytes,
+        }
+    }
+
+    const fn is_ok(self) -> bool {
+        self.tick_ok && self.command_latency_ok && self.command_queue_ok && self.payload_ok
+    }
+}
+
 impl BenchConfig {
     fn from_args(args: impl Iterator<Item = String>) -> Self {
+        let args = args.collect::<Vec<_>>();
+        let allow_heavy = args.iter().any(|arg| arg == "--allow-heavy");
         let mut config = Self::default();
         for arg in args {
             if let Some(value) = arg.strip_prefix("--entities=") {
@@ -129,21 +207,53 @@ impl BenchConfig {
                 };
             } else if let Some(value) = arg.strip_prefix("--profile=") {
                 match value {
-                    "smoke" => config = Self::default(),
+                    "smoke" => {
+                        config = Self::default();
+                        config.profile_name = "smoke";
+                    }
                     "medium" => {
-                        config.entities = 50_000;
-                        config.clients = 1_000;
-                        config.stations = 16;
-                        config.ticks = 10;
+                        if allow_heavy {
+                            config.profile_name = "medium";
+                            config.entities = 50_000;
+                            config.clients = 1_000;
+                            config.stations = 16;
+                            config.ticks = 10;
+                            config.thresholds.tick_ms_p99 = 50.0;
+                            config.thresholds.estimated_payload_bytes = 512 * 1024 * 1024;
+                        } else {
+                            config.heavy_profile_denied = true;
+                        }
                     }
                     "large" => {
-                        config.entities = 1_000_000;
-                        config.clients = 10_000;
-                        config.stations = 64;
-                        config.ticks = 20;
+                        if allow_heavy {
+                            config.profile_name = "large";
+                            config.entities = 1_000_000;
+                            config.clients = 10_000;
+                            config.stations = 64;
+                            config.ticks = 20;
+                            config.thresholds.tick_ms_p99 = 100.0;
+                            config.thresholds.command_queue_max = 8192;
+                            config.thresholds.estimated_payload_bytes = 8 * 1024 * 1024 * 1024;
+                        } else {
+                            config.heavy_profile_denied = true;
+                        }
                     }
                     _ => {}
                 }
+            } else if let Some(value) = arg.strip_prefix("--tick-ms-p99-budget=") {
+                config.thresholds.tick_ms_p99 =
+                    value.parse().unwrap_or(config.thresholds.tick_ms_p99);
+            } else if let Some(value) = arg.strip_prefix("--command-latency-ticks-budget=") {
+                config.thresholds.command_latency_ticks_max = value
+                    .parse()
+                    .unwrap_or(config.thresholds.command_latency_ticks_max);
+            } else if let Some(value) = arg.strip_prefix("--command-queue-budget=") {
+                config.thresholds.command_queue_max =
+                    value.parse().unwrap_or(config.thresholds.command_queue_max);
+            } else if let Some(value) = arg.strip_prefix("--payload-bytes-budget=") {
+                config.thresholds.estimated_payload_bytes = value
+                    .parse()
+                    .unwrap_or(config.thresholds.estimated_payload_bytes);
             }
         }
         config
