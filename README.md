@@ -60,9 +60,9 @@ Current crates:
 - `crates/sectorsync-core`: IDs, command envelopes, 3D spatial primitives,
   station-local entity storage, ghost/owner roles, dirty masks, compiled sync
   policies, custom component registry/storage, typed component codecs, schema
-  helpers, cell indexing, interest queries, replication planning, bounded
-  command/event queues, handoff transfer types, hotspot planning, barrier
-  metadata, and snapshot metadata.
+  helpers, generated-schema-friendly layout descriptors, cell indexing,
+  interest queries, replication planning, bounded command/event queues, handoff
+  transfer types, hotspot planning, barrier metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, client command
   ingress frames, command acknowledgements, cross-station event frames, and
@@ -93,6 +93,7 @@ cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --example udp_station_event
+cargo run -p sectorsync-bench --example generated_schema
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
@@ -157,6 +158,9 @@ Initial status:
   register game-owned data without forcing a full ECS framework.
 - Typed component codecs and schema helpers support compact user-defined
   component encoding without forcing a serialization framework.
+- Generated component schema helpers support static field layout descriptors,
+  stable schema hashes, validation for duplicate/overlapping/out-of-bounds
+  fields, and registry integration for external code generators.
 - Wire codec supports binary encode/decode for replication, command ACK, and
   barrier frames. Replication frames can carry concrete entity/component deltas.
 - Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
@@ -205,6 +209,9 @@ Initial status:
   at the target tick.
 - `cargo run -p sectorsync-bench --example udp_station_event` demonstrates the
   same station event bridge over localhost UDP station transports.
+- `cargo run -p sectorsync-bench --example generated_schema` demonstrates an
+  externally generated component schema descriptor registering into the core
+  registry, writing a typed component, and materializing a replication frame.
 
 Not complete yet:
 
@@ -212,6 +219,5 @@ Not complete yet:
 - Reliable station transport policies, authentication/encryption, reconnects,
   deployment-level routing, and production cluster integration beyond the
   low-level in-memory and UDP packet adapters.
-- Generated schema helpers.
 - Reliable transport/session/gateway layers for production client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.

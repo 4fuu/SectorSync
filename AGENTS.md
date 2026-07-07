@@ -21,6 +21,8 @@
   changing station event frames, station transport, or event router bridging.
 - Use `cargo run -p sectorsync-bench --example udp_station_event` when changing
   UDP station transport or generic station event bridge behavior.
+- Use `cargo run -p sectorsync-bench --example generated_schema` when changing
+  component schema helpers, generated layout descriptors, or schema hashes.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -76,6 +78,9 @@ The core library does not own:
   it into a mandatory ECS framework; expose descriptors, storage, and hooks.
 - Component codecs should stay dependency-light by default. Prefer traits and
   explicit binary codecs over adding a mandatory serialization framework.
+- Generated schema helpers are for external code generators and hand-written
+  static descriptors. Do not add mandatory proc macros, build scripts, or
+  runtime reflection to the core crate.
 - Station-local APIs may be low-level and high-performance, but they must not
   bypass owner, dirty, replication-budget, barrier, or event-ordering invariants.
 - Station internals should favor single-owner, lock-minimal execution.
