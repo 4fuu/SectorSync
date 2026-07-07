@@ -3,7 +3,8 @@
 #![forbid(unsafe_code)]
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierState, ClientId, CommandId, ComponentId, EntityId, OwnerEpoch, Tick,
+    BarrierId, BarrierState, ClientId, CommandId, ComponentId, ComponentStore, EntityId,
+    OwnerEpoch, ReplicationPlan, Station, Tick,
 };
 
 /// Runtime frame kind.
@@ -66,6 +67,154 @@ pub struct ComponentDelta {
     pub flags: u8,
     /// Encoded component bytes.
     pub bytes: Vec<u8>,
+}
+
+/// Limits used by `ReplicationFrameBuilder`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationFrameLimits {
+    /// Maximum entity deltas to materialize in one frame.
+    pub max_entity_deltas: usize,
+    /// Maximum component deltas to include per entity.
+    pub max_components_per_entity: usize,
+    /// Maximum component payload bytes to include per component.
+    pub max_component_bytes: usize,
+}
+
+impl Default for ReplicationFrameLimits {
+    fn default() -> Self {
+        Self {
+            max_entity_deltas: 256,
+            max_components_per_entity: 16,
+            max_component_bytes: 1024,
+        }
+    }
+}
+
+/// Component selection for frame building.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComponentSelection {
+    /// Component ids to include when present and dirty.
+    pub component_ids: Vec<ComponentId>,
+}
+
+/// Frame builder statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationFrameBuildStats {
+    /// Entity handles selected by the replication plan.
+    pub planned_entities: usize,
+    /// Entity deltas materialized into the frame.
+    pub encoded_entities: usize,
+    /// Component deltas materialized into the frame.
+    pub encoded_components: usize,
+    /// Entity deltas skipped by builder limits.
+    pub skipped_entities_by_limit: usize,
+    /// Component deltas skipped by builder limits.
+    pub skipped_components_by_limit: usize,
+    /// Component payloads skipped because they exceed byte limits.
+    pub skipped_components_by_size: usize,
+}
+
+/// Result of building a replication frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicationFrameBuild {
+    /// Built frame.
+    pub frame: ReplicationFrame,
+    /// Build statistics.
+    pub stats: ReplicationFrameBuildStats,
+}
+
+/// Builds concrete replication frames from a core replication plan.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReplicationFrameBuilder {
+    /// Builder limits.
+    pub limits: ReplicationFrameLimits,
+}
+
+impl ReplicationFrameBuilder {
+    /// Creates a frame builder with explicit limits.
+    pub const fn new(limits: ReplicationFrameLimits) -> Self {
+        Self { limits }
+    }
+
+    /// Builds a frame from a station plan and component store.
+    pub fn build(
+        &self,
+        client_id: ClientId,
+        server_tick: Tick,
+        station: &Station,
+        plan: &ReplicationPlan,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+    ) -> ReplicationFrameBuild {
+        let mut stats = ReplicationFrameBuildStats {
+            planned_entities: plan.entities.len(),
+            ..ReplicationFrameBuildStats::default()
+        };
+        let mut entity_deltas =
+            Vec::with_capacity(plan.entities.len().min(self.limits.max_entity_deltas));
+        let mut estimated_payload_bytes = 0_usize;
+
+        for handle in &plan.entities {
+            if entity_deltas.len() >= self.limits.max_entity_deltas {
+                stats.skipped_entities_by_limit += 1;
+                continue;
+            }
+            let Some(entity) = station.get(*handle) else {
+                continue;
+            };
+
+            let mut component_deltas = Vec::new();
+            for component_id in &selection.component_ids {
+                if component_deltas.len() >= self.limits.max_components_per_entity {
+                    stats.skipped_components_by_limit += 1;
+                    continue;
+                }
+                let Some(blob) = components.get_blob(*component_id, *handle) else {
+                    continue;
+                };
+                if !blob.dirty {
+                    continue;
+                }
+                if blob.bytes.len() > self.limits.max_component_bytes {
+                    stats.skipped_components_by_size += 1;
+                    continue;
+                }
+                estimated_payload_bytes = estimated_payload_bytes
+                    .saturating_add(2 + 8 + 1 + 4)
+                    .saturating_add(blob.bytes.len());
+                component_deltas.push(ComponentDelta {
+                    component_id: *component_id,
+                    version: blob.version,
+                    flags: 0,
+                    bytes: blob.bytes.clone(),
+                });
+            }
+
+            if component_deltas.is_empty() {
+                continue;
+            }
+
+            stats.encoded_components += component_deltas.len();
+            estimated_payload_bytes = estimated_payload_bytes.saturating_add(8 + 8 + 2);
+            entity_deltas.push(EntityDelta {
+                entity_id: entity.id,
+                owner_epoch: entity.role.owner_epoch(),
+                components: component_deltas,
+            });
+        }
+
+        stats.encoded_entities = entity_deltas.len();
+        ReplicationFrameBuild {
+            frame: ReplicationFrame {
+                client_id,
+                server_tick,
+                entity_count: plan.entities.len().min(u32::MAX as usize) as u32,
+                estimated_payload_bytes: estimated_payload_bytes.min(u32::MAX as usize) as u32,
+                entities: entity_deltas,
+            },
+            stats,
+        }
+    }
 }
 
 /// Command acknowledgement frame.
@@ -544,5 +693,70 @@ mod tests {
             .decode(&bytes)
             .expect("decode should work");
         assert_eq!(decoded, RuntimeFrame::Barrier(frame));
+    }
+
+    #[test]
+    fn frame_builder_materializes_dirty_component_deltas() {
+        use sectorsync_core::prelude::{
+            Bounds, ComponentDescriptor, ComponentMigrationMode, ComponentSyncMode, InstanceId,
+            NodeId, PolicyId, Position3, ReplicationPlan, StationConfig, Vec3, Vec3LeCodec,
+        };
+
+        let mut station = Station::new(StationConfig {
+            station_id: sectorsync_core::prelude::StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let handle = station
+            .spawn_owned(
+                EntityId::new(10),
+                Position3::new(0.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+
+        let descriptor = ComponentDescriptor::sparse_blob(
+            ComponentId::new(1),
+            "velocity",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            12,
+        );
+        let mut components = ComponentStore::default();
+        components
+            .set_typed(
+                &descriptor,
+                handle,
+                3,
+                &Vec3LeCodec,
+                &Vec3::new(1.0, 2.0, 3.0),
+            )
+            .expect("typed component should encode");
+
+        let build = ReplicationFrameBuilder::new(ReplicationFrameLimits {
+            max_entity_deltas: 8,
+            max_components_per_entity: 4,
+            max_component_bytes: 64,
+        })
+        .build(
+            ClientId::new(5),
+            Tick::new(9),
+            &station,
+            &ReplicationPlan {
+                entities: vec![handle],
+                stats: Default::default(),
+            },
+            &components,
+            &ComponentSelection {
+                component_ids: vec![ComponentId::new(1)],
+            },
+        );
+
+        assert_eq!(build.stats.encoded_entities, 1);
+        assert_eq!(build.stats.encoded_components, 1);
+        assert_eq!(build.frame.entities[0].entity_id, EntityId::new(10));
+        assert_eq!(build.frame.entities[0].components[0].version, 3);
     }
 }
