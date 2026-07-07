@@ -3,19 +3,21 @@
 #![forbid(unsafe_code)]
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierState, ClientId, CommandId, ComponentId, ComponentStore, EntityId,
-    OwnerEpoch, ReplicationPlan, Station, Tick,
+    BarrierId, BarrierState, ClientId, CommandEnvelope, CommandId, CommandPriority, ComponentId,
+    ComponentStore, EntityId, OwnerEpoch, ReplicationPlan, Station, Tick,
 };
 
 /// Runtime frame kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     /// Replication update frame.
-    Replication,
+    Replication = 0,
     /// Command acknowledgement frame.
-    CommandAck,
+    CommandAck = 1,
     /// Runtime barrier notification.
-    Barrier,
+    Barrier = 2,
+    /// Client command ingress frame.
+    Command = 3,
 }
 
 impl FrameKind {
@@ -25,6 +27,7 @@ impl FrameKind {
             0 => Some(Self::Replication),
             1 => Some(Self::CommandAck),
             2 => Some(Self::Barrier),
+            3 => Some(Self::Command),
             _ => None,
         }
     }
@@ -232,6 +235,59 @@ pub struct CommandAckFrame {
     pub reason_code: u16,
 }
 
+/// Client command ingress frame.
+///
+/// The server stamps `received_at` when converting this into a
+/// `CommandEnvelope`; game validation and anti-cheat checks remain outside the
+/// wire codec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandFrame {
+    /// Client that submitted the command.
+    pub client_id: ClientId,
+    /// Command id used for replay and audit.
+    pub command_id: CommandId,
+    /// Entity the command intends to control.
+    pub entity_id: EntityId,
+    /// Client-side sequence number.
+    pub sequence: u64,
+    /// Game-defined command kind.
+    pub kind: u32,
+    /// Command priority.
+    pub priority: CommandPriority,
+    /// Opaque payload owned by the embedding game.
+    pub payload: Vec<u8>,
+}
+
+impl CommandFrame {
+    /// Converts an ingress frame into a runtime command envelope.
+    pub fn into_envelope(self, received_at: Tick) -> CommandEnvelope {
+        CommandEnvelope {
+            id: self.command_id,
+            client_id: self.client_id,
+            entity_id: self.entity_id,
+            sequence: self.sequence,
+            received_at,
+            kind: self.kind,
+            priority: self.priority,
+            payload: self.payload,
+        }
+    }
+
+    /// Converts a command envelope into a wire frame, dropping server-only tick
+    /// metadata.
+    pub fn from_envelope(envelope: &CommandEnvelope) -> Self {
+        Self {
+            client_id: envelope.client_id,
+            command_id: envelope.id,
+            entity_id: envelope.entity_id,
+            sequence: envelope.sequence,
+            kind: envelope.kind,
+            priority: envelope.priority,
+            payload: envelope.payload.clone(),
+        }
+    }
+}
+
 /// Runtime barrier notification frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BarrierFrame {
@@ -250,6 +306,8 @@ pub struct BarrierFrame {
 pub enum RuntimeFrame {
     /// Replication update.
     Replication(ReplicationFrame),
+    /// Client command ingress.
+    Command(CommandFrame),
     /// Command acknowledgement.
     CommandAck(CommandAckFrame),
     /// Barrier notification.
@@ -272,6 +330,13 @@ pub trait FrameEncoder {
     fn encode_command_ack(
         &mut self,
         frame: &CommandAckFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error>;
+
+    /// Encodes a client command frame into `out`.
+    fn encode_command(
+        &mut self,
+        frame: &CommandFrame,
         out: &mut Vec<u8>,
     ) -> Result<(), Self::Error>;
 
@@ -308,6 +373,8 @@ pub enum BinaryDecodeError {
     },
     /// Barrier state byte is invalid.
     InvalidBarrierState(u8),
+    /// Command priority byte is invalid.
+    InvalidCommandPriority(u8),
     /// Trailing bytes were present after a complete frame.
     TrailingBytes(usize),
 }
@@ -321,6 +388,9 @@ impl core::fmt::Display for BinaryDecodeError {
                 write!(f, "truncated frame: needed {needed}, available {available}")
             }
             Self::InvalidBarrierState(state) => write!(f, "invalid barrier state {state}"),
+            Self::InvalidCommandPriority(priority) => {
+                write!(f, "invalid command priority {priority}")
+            }
             Self::TrailingBytes(bytes) => write!(f, "frame has {bytes} trailing bytes"),
         }
     }
@@ -417,6 +487,18 @@ impl FrameDecoder for BinaryFrameDecoder {
                 accepted: cursor.read_u8()? != 0,
                 reason_code: cursor.read_u16()?,
             }),
+            FrameKind::Command => RuntimeFrame::Command(CommandFrame {
+                client_id: ClientId::new(cursor.read_u64()?),
+                command_id: CommandId::new(cursor.read_u64()?),
+                entity_id: EntityId::new(cursor.read_u64()?),
+                sequence: cursor.read_u64()?,
+                kind: cursor.read_u32()?,
+                priority: decode_command_priority(cursor.read_u8()?)?,
+                payload: {
+                    let byte_len = cursor.read_u32()? as usize;
+                    cursor.read_bytes(byte_len)?
+                },
+            }),
             FrameKind::Barrier => RuntimeFrame::Barrier(BarrierFrame {
                 client_id: ClientId::new(cursor.read_u64()?),
                 barrier_id: BarrierId::new(cursor.read_u64()?),
@@ -476,6 +558,22 @@ impl FrameEncoder for BinaryFrameEncoder {
         out.extend_from_slice(&frame.server_tick.get().to_le_bytes());
         out.push(u8::from(frame.accepted));
         out.extend_from_slice(&frame.reason_code.to_le_bytes());
+        Ok(())
+    }
+
+    fn encode_command(
+        &mut self,
+        frame: &CommandFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        out.push(FrameKind::Command as u8);
+        out.extend_from_slice(&frame.client_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.command_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.entity_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.sequence.to_le_bytes());
+        out.extend_from_slice(&frame.kind.to_le_bytes());
+        out.push(encode_command_priority(frame.priority));
+        write_bytes("command.payload", &frame.payload, out)?;
         Ok(())
     }
 
@@ -547,6 +645,23 @@ fn decode_barrier_state(state: u8) -> Result<BarrierState, BinaryDecodeError> {
         3 => Ok(BarrierState::Frozen),
         4 => Ok(BarrierState::Resuming),
         _ => Err(BinaryDecodeError::InvalidBarrierState(state)),
+    }
+}
+
+fn encode_command_priority(priority: CommandPriority) -> u8 {
+    match priority {
+        CommandPriority::Normal => 0,
+        CommandPriority::High => 1,
+        CommandPriority::Low => 2,
+    }
+}
+
+fn decode_command_priority(priority: u8) -> Result<CommandPriority, BinaryDecodeError> {
+    match priority {
+        0 => Ok(CommandPriority::Normal),
+        1 => Ok(CommandPriority::High),
+        2 => Ok(CommandPriority::Low),
+        _ => Err(BinaryDecodeError::InvalidCommandPriority(priority)),
     }
 }
 
@@ -673,6 +788,47 @@ mod tests {
             .decode(&bytes)
             .expect("decode should work");
         assert_eq!(decoded, RuntimeFrame::CommandAck(frame));
+    }
+
+    #[test]
+    fn binary_codec_roundtrips_command_frame() {
+        let frame = CommandFrame {
+            client_id: ClientId::new(1),
+            command_id: CommandId::new(2),
+            entity_id: EntityId::new(3),
+            sequence: 4,
+            kind: 5,
+            priority: CommandPriority::High,
+            payload: vec![9, 8, 7],
+        };
+        let mut encoder = BinaryFrameEncoder;
+        let mut bytes = Vec::new();
+        encoder
+            .encode_command(&frame, &mut bytes)
+            .expect("encoder is infallible");
+
+        let decoded = BinaryFrameDecoder
+            .decode(&bytes)
+            .expect("decode should work");
+        assert_eq!(decoded, RuntimeFrame::Command(frame));
+    }
+
+    #[test]
+    fn command_frame_converts_to_runtime_envelope() {
+        let frame = CommandFrame {
+            client_id: ClientId::new(1),
+            command_id: CommandId::new(2),
+            entity_id: EntityId::new(3),
+            sequence: 4,
+            kind: 5,
+            priority: CommandPriority::Low,
+            payload: vec![1, 2, 3],
+        };
+
+        let envelope = frame.clone().into_envelope(Tick::new(99));
+        assert_eq!(envelope.id, frame.command_id);
+        assert_eq!(envelope.received_at, Tick::new(99));
+        assert_eq!(CommandFrame::from_envelope(&envelope), frame);
     }
 
     #[test]
