@@ -82,8 +82,9 @@ Current crates:
   an in-process entity migration executor built on two-phase handoff. It also
   includes dynamic cell ownership tables, conservative automatic split
   scheduling with cooldown/capacity/improvement guards, cell-level migration
-  execution, a station event router, a bounded station event transport bridge,
-  and a simple station scheduler.
+  execution, a low-level deployment node/station route table, a station event
+  router, a bounded station event transport bridge, and a simple station
+  scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -96,6 +97,7 @@ cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example gateway_session
+cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example reliable_command_ingress
@@ -191,6 +193,10 @@ Initial status:
 - UDP station transport adapter supports one-local-station sockets, explicit
   station-to-address registration, endpoint checks, non-blocking receive, and
   byte/packet statistics for low-level cross-process station packet prototypes.
+- Deployment route table primitives support bounded node registration, station
+  placement routes, route epochs, node heartbeat timestamps, draining/offline
+  state, per-node station capacity checks, route moves, route removal, and stale
+  node detection/offline marking.
 - Runtime event router queues cross-station events by target station and drains
   events once their target tick is ready.
 - Runtime station event transport bridge encodes typed station events into wire
@@ -230,6 +236,10 @@ Initial status:
   low-level gateway session table connecting a client, routing commands into
   station command queues, rerouting to another station, rate-limiting a command,
   and reconnecting inside a grace window.
+- `cargo run -p sectorsync-bench --example deployment_routing` demonstrates a
+  low-level deployment route table registering nodes, assigning station routes,
+  marking a node draining, moving a station route to another node, and marking a
+  stale node offline.
 - `cargo run -p sectorsync-bench --example udp_loopback` demonstrates a
   replication frame encoded by `sectorsync-wire`, sent through the UDP transport
   adapter over localhost, received, and decoded back into a runtime frame.
@@ -259,9 +269,9 @@ Not complete yet:
 
 - Long-running split scheduler calibration against production telemetry and
   heavier workload profiles.
-- Authentication/encryption, NAT traversal, deployment-level routing,
+- Authentication/encryption, NAT traversal, external service discovery,
   production cluster integration, and long-running reliability calibration
-  beyond the low-level gateway/session, reliable client/station packet helpers,
-  and in-memory/UDP packet adapters.
+  beyond the low-level gateway/session, deployment routing, reliable
+  client/station packet helpers, and in-memory/UDP packet adapters.
 - Production gateway process orchestration for client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.

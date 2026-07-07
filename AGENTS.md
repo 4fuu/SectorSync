@@ -16,6 +16,9 @@
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
+- Use `cargo run -p sectorsync-bench --example deployment_routing` when changing
+  deployment node/station route tables, node heartbeat/stale checks, draining
+  behavior, route moves, or placement capacity rules.
 - Use `cargo run -p sectorsync-bench --example udp_loopback` when changing the
   UDP transport adapter or wire/transport integration.
 - Use `cargo run -p sectorsync-bench --example command_ingress` when changing
@@ -84,6 +87,11 @@ The core library does not own:
   and per-client command admission limits are allowed; sockets, auth providers,
   NAT traversal, deployment discovery, durable account state, and production
   process orchestration stay outside core.
+- Deployment routing primitives must remain metadata-only and bounded: node
+  registration, heartbeat ticks, station placement routes, route epochs,
+  draining/offline state, stale checks, and capacity guards are allowed;
+  service discovery, process supervision, cloud APIs, durable cluster state, and
+  automatic failover orchestration stay outside runtime.
 - Command wire frames and command envelopes are business-agnostic containers.
   SectorSync may encode, decode, queue, stamp `received_at`, and acknowledge
   them, but schema validation, anti-cheat, and game-rule translation belong in
