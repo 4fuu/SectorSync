@@ -220,6 +220,19 @@ pub struct InMemoryStationTransportStats {
     pub packets_rejected_bytes: usize,
 }
 
+/// Statistics for the UDP station transport adapter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UdpStationTransportStats {
+    /// Packets sent by this local station transport.
+    pub packets_sent: usize,
+    /// Packets received by this local station transport.
+    pub packets_received: usize,
+    /// Bytes sent by this local station transport.
+    pub bytes_sent: usize,
+    /// Bytes received by this local station transport.
+    pub bytes_received: usize,
+}
+
 /// Error produced by bounded in-memory station transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StationTransportError {
@@ -371,6 +384,252 @@ impl StationTransportReceiver for InMemoryStationTransport {
         self.stats.packets_received = self.stats.packets_received.saturating_add(1);
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(packet.bytes.len());
         Ok(Some(packet))
+    }
+}
+
+/// Error produced by the UDP station transport adapter.
+#[derive(Debug)]
+pub enum UdpStationTransportError {
+    /// No address has been registered for the target station.
+    UnknownStation(StationId),
+    /// A packet arrived from an unregistered remote address.
+    UnknownRemote(SocketAddr),
+    /// Outbound packet source did not match the local station.
+    LocalStationMismatch {
+        /// Local station owned by this transport.
+        local_station: StationId,
+        /// Packet source station.
+        packet_source: StationId,
+    },
+    /// Receive was requested for a station not owned by this transport.
+    TargetStationMismatch {
+        /// Local station owned by this transport.
+        local_station: StationId,
+        /// Requested target station.
+        requested_target: StationId,
+    },
+    /// Underlying socket error.
+    Io(io::Error),
+}
+
+impl core::fmt::Display for UdpStationTransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownStation(station_id) => {
+                write!(
+                    f,
+                    "udp station target {} is not registered",
+                    station_id.get()
+                )
+            }
+            Self::UnknownRemote(addr) => {
+                write!(f, "udp station remote address {addr} is not registered")
+            }
+            Self::LocalStationMismatch {
+                local_station,
+                packet_source,
+            } => write!(
+                f,
+                "udp station local source mismatch: local {}, packet source {}",
+                local_station.get(),
+                packet_source.get()
+            ),
+            Self::TargetStationMismatch {
+                local_station,
+                requested_target,
+            } => write!(
+                f,
+                "udp station receive target mismatch: local {}, requested {}",
+                local_station.get(),
+                requested_target.get()
+            ),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for UdpStationTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::UnknownStation(_)
+            | Self::UnknownRemote(_)
+            | Self::LocalStationMismatch { .. }
+            | Self::TargetStationMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for UdpStationTransportError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Lightweight UDP station-to-station packet adapter.
+///
+/// Each instance represents one local station socket. Reliability,
+/// authentication, encryption, and deployment routing remain outer-layer
+/// concerns.
+#[derive(Debug)]
+pub struct UdpStationTransport {
+    local_station: StationId,
+    socket: UdpSocket,
+    stations: HashMap<StationId, SocketAddr>,
+    addr_to_station: HashMap<SocketAddr, StationId>,
+    recv_buffer: Vec<u8>,
+    stats: UdpStationTransportStats,
+}
+
+impl UdpStationTransport {
+    /// Binds a non-blocking UDP station transport.
+    pub fn bind<A: ToSocketAddrs>(local_station: StationId, addr: A) -> io::Result<Self> {
+        let socket = UdpSocket::bind(addr)?;
+        Self::from_socket(local_station, socket)
+    }
+
+    /// Wraps an existing UDP socket and configures it as non-blocking.
+    pub fn from_socket(local_station: StationId, socket: UdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            local_station,
+            socket,
+            stations: HashMap::new(),
+            addr_to_station: HashMap::new(),
+            recv_buffer: vec![0; DEFAULT_UDP_RECV_BUFFER_SIZE],
+            stats: UdpStationTransportStats::default(),
+        })
+    }
+
+    /// Returns the local station id.
+    pub const fn local_station(&self) -> StationId {
+        self.local_station
+    }
+
+    /// Returns the local socket address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Borrows the underlying socket.
+    pub const fn socket(&self) -> &UdpSocket {
+        &self.socket
+    }
+
+    /// Mutably borrows the underlying socket.
+    pub fn socket_mut(&mut self) -> &mut UdpSocket {
+        &mut self.socket
+    }
+
+    /// Registers or replaces the network address for a station.
+    pub fn register_station(
+        &mut self,
+        station_id: StationId,
+        addr: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let old_addr = self.stations.insert(station_id, addr);
+        if let Some(old_addr) = old_addr {
+            self.addr_to_station.remove(&old_addr);
+        }
+        if let Some(old_station) = self.addr_to_station.insert(addr, station_id) {
+            if old_station != station_id {
+                self.stations.remove(&old_station);
+            }
+        }
+        old_addr
+    }
+
+    /// Removes a registered station address.
+    pub fn unregister_station(&mut self, station_id: StationId) -> Option<SocketAddr> {
+        let addr = self.stations.remove(&station_id)?;
+        self.addr_to_station.remove(&addr);
+        Some(addr)
+    }
+
+    /// Returns a registered address for a station.
+    pub fn station_addr(&self, station_id: StationId) -> Option<SocketAddr> {
+        self.stations.get(&station_id).copied()
+    }
+
+    /// Returns the registered station id for a remote address.
+    pub fn station_for_addr(&self, addr: SocketAddr) -> Option<StationId> {
+        self.addr_to_station.get(&addr).copied()
+    }
+
+    /// Sets the reusable receive buffer size.
+    pub fn set_recv_buffer_size(&mut self, bytes: usize) {
+        self.recv_buffer.resize(bytes.max(1), 0);
+    }
+
+    /// Returns the reusable receive buffer size.
+    pub fn recv_buffer_size(&self) -> usize {
+        self.recv_buffer.len()
+    }
+
+    /// Returns transport statistics.
+    pub const fn stats(&self) -> UdpStationTransportStats {
+        self.stats
+    }
+}
+
+impl StationTransportSink for UdpStationTransport {
+    type Error = UdpStationTransportError;
+
+    fn send_station(&mut self, packet: StationOutboundPacket) -> Result<(), Self::Error> {
+        if packet.source_station != self.local_station {
+            return Err(UdpStationTransportError::LocalStationMismatch {
+                local_station: self.local_station,
+                packet_source: packet.source_station,
+            });
+        }
+        let addr = self.stations.get(&packet.target_station).copied().ok_or(
+            UdpStationTransportError::UnknownStation(packet.target_station),
+        )?;
+        let sent = self.socket.send_to(&packet.bytes, addr)?;
+        if sent != packet.bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "udp station socket reported a partial datagram send",
+            )
+            .into());
+        }
+        self.stats.packets_sent = self.stats.packets_sent.saturating_add(1);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(packet.bytes.len());
+        Ok(())
+    }
+}
+
+impl StationTransportReceiver for UdpStationTransport {
+    type Error = UdpStationTransportError;
+
+    fn try_recv_station(
+        &mut self,
+        target_station: StationId,
+    ) -> Result<Option<StationInboundPacket>, Self::Error> {
+        if target_station != self.local_station {
+            return Err(UdpStationTransportError::TargetStationMismatch {
+                local_station: self.local_station,
+                requested_target: target_station,
+            });
+        }
+        match self.socket.recv_from(&mut self.recv_buffer) {
+            Ok((len, remote_addr)) => {
+                let source_station = self
+                    .addr_to_station
+                    .get(&remote_addr)
+                    .copied()
+                    .ok_or(UdpStationTransportError::UnknownRemote(remote_addr))?;
+                self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+                self.stats.bytes_received = self.stats.bytes_received.saturating_add(len);
+                Ok(Some(StationInboundPacket {
+                    source_station,
+                    target_station: self.local_station,
+                    bytes: self.recv_buffer[..len].to_vec(),
+                }))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -704,6 +963,22 @@ mod tests {
         panic!("udp packet was not received");
     }
 
+    fn recv_station_with_retry(
+        transport: &mut UdpStationTransport,
+        station_id: StationId,
+    ) -> StationInboundPacket {
+        for _ in 0..50 {
+            if let Some(packet) = transport
+                .try_recv_station(station_id)
+                .expect("udp station receive should work")
+            {
+                return packet;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("udp station packet was not received");
+    }
+
     #[test]
     fn fake_transport_counts_batches_without_storing_packets() {
         let mut batch = PacketBatch::new();
@@ -850,6 +1125,102 @@ mod tests {
                 assert_eq!(client_id, ClientId::new(99));
             }
             UdpTransportError::Io(error) => panic!("unexpected io error: {error}"),
+        }
+    }
+
+    #[test]
+    fn udp_station_transport_sends_and_receives_registered_stations() {
+        let station_one = StationId::new(1);
+        let station_two = StationId::new(2);
+        let mut first =
+            UdpStationTransport::bind(station_one, "127.0.0.1:0").expect("first should bind");
+        let mut second =
+            UdpStationTransport::bind(station_two, "127.0.0.1:0").expect("second should bind");
+        let first_addr = first.local_addr().expect("first addr should exist");
+        let second_addr = second.local_addr().expect("second addr should exist");
+
+        first.register_station(station_two, second_addr);
+        second.register_station(station_one, first_addr);
+
+        first
+            .send_station(StationOutboundPacket {
+                source_station: station_one,
+                target_station: station_two,
+                bytes: b"handoff-prepare".to_vec(),
+            })
+            .expect("first station should send");
+        let inbound = recv_station_with_retry(&mut second, station_two);
+        assert_eq!(inbound.source_station, station_one);
+        assert_eq!(inbound.target_station, station_two);
+        assert_eq!(inbound.bytes, b"handoff-prepare");
+
+        second
+            .send_station(StationOutboundPacket {
+                source_station: station_two,
+                target_station: station_one,
+                bytes: b"handoff-commit".to_vec(),
+            })
+            .expect("second station should send");
+        let inbound = recv_station_with_retry(&mut first, station_one);
+        assert_eq!(inbound.source_station, station_two);
+        assert_eq!(inbound.target_station, station_one);
+        assert_eq!(inbound.bytes, b"handoff-commit");
+        assert_eq!(first.stats().packets_sent, 1);
+        assert_eq!(first.stats().packets_received, 1);
+        assert_eq!(second.stats().packets_sent, 1);
+        assert_eq!(second.stats().packets_received, 1);
+    }
+
+    #[test]
+    fn udp_station_transport_rejects_invalid_station_endpoints() {
+        let local = StationId::new(1);
+        let mut transport =
+            UdpStationTransport::bind(local, "127.0.0.1:0").expect("transport should bind");
+
+        let source_mismatch = transport
+            .send_station(StationOutboundPacket {
+                source_station: StationId::new(9),
+                target_station: StationId::new(2),
+                bytes: Vec::new(),
+            })
+            .expect_err("source should match local station");
+        match source_mismatch {
+            UdpStationTransportError::LocalStationMismatch {
+                local_station,
+                packet_source,
+            } => {
+                assert_eq!(local_station, local);
+                assert_eq!(packet_source, StationId::new(9));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let unknown = transport
+            .send_station(StationOutboundPacket {
+                source_station: local,
+                target_station: StationId::new(2),
+                bytes: Vec::new(),
+            })
+            .expect_err("target station should be registered");
+        match unknown {
+            UdpStationTransportError::UnknownStation(station_id) => {
+                assert_eq!(station_id, StationId::new(2));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let target_mismatch = transport
+            .try_recv_station(StationId::new(99))
+            .expect_err("receive target should match local station");
+        match target_mismatch {
+            UdpStationTransportError::TargetStationMismatch {
+                local_station,
+                requested_target,
+            } => {
+                assert_eq!(local_station, local);
+                assert_eq!(requested_target, StationId::new(99));
+            }
+            other => panic!("unexpected error: {other}"),
         }
     }
 }
