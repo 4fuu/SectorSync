@@ -21,6 +21,8 @@ pub enum FrameKind {
     Command = 3,
     /// Cross-station event frame.
     StationEvent = 4,
+    /// Gateway-to-station command dispatch frame.
+    CommandDispatch = 5,
 }
 
 impl FrameKind {
@@ -32,6 +34,7 @@ impl FrameKind {
             2 => Some(Self::Barrier),
             3 => Some(Self::Command),
             4 => Some(Self::StationEvent),
+            5 => Some(Self::CommandDispatch),
             _ => None,
         }
     }
@@ -292,6 +295,63 @@ impl CommandFrame {
     }
 }
 
+/// Internal gateway-to-station command dispatch frame.
+///
+/// Unlike `CommandFrame`, this preserves the server `received_at` tick stamped
+/// by the gateway pipeline before the command is forwarded to a station node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDispatchFrame {
+    /// Target station selected by gateway/deployment routing.
+    pub station_id: StationId,
+    /// Client that submitted the command.
+    pub client_id: ClientId,
+    /// Command id used for replay and audit.
+    pub command_id: CommandId,
+    /// Entity the command intends to control.
+    pub entity_id: EntityId,
+    /// Client-side sequence number.
+    pub sequence: u64,
+    /// Server tick observed when the command entered SectorSync.
+    pub received_at: Tick,
+    /// Game-defined command kind.
+    pub kind: u32,
+    /// Command priority.
+    pub priority: CommandPriority,
+    /// Opaque payload owned by the embedding game.
+    pub payload: Vec<u8>,
+}
+
+impl CommandDispatchFrame {
+    /// Converts a stamped command envelope into an internal dispatch frame.
+    pub fn from_envelope(station_id: StationId, envelope: &CommandEnvelope) -> Self {
+        Self {
+            station_id,
+            client_id: envelope.client_id,
+            command_id: envelope.id,
+            entity_id: envelope.entity_id,
+            sequence: envelope.sequence,
+            received_at: envelope.received_at,
+            kind: envelope.kind,
+            priority: envelope.priority,
+            payload: envelope.payload.clone(),
+        }
+    }
+
+    /// Converts an internal dispatch frame back into a command envelope.
+    pub fn into_envelope(self) -> CommandEnvelope {
+        CommandEnvelope {
+            id: self.command_id,
+            client_id: self.client_id,
+            entity_id: self.entity_id,
+            sequence: self.sequence,
+            received_at: self.received_at,
+            kind: self.kind,
+            priority: self.priority,
+            payload: self.payload,
+        }
+    }
+}
+
 /// Cross-station event frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StationEventFrame {
@@ -359,6 +419,8 @@ pub enum RuntimeFrame {
     Replication(ReplicationFrame),
     /// Client command ingress.
     Command(CommandFrame),
+    /// Gateway-to-station command dispatch.
+    CommandDispatch(CommandDispatchFrame),
     /// Command acknowledgement.
     CommandAck(CommandAckFrame),
     /// Barrier notification.
@@ -390,6 +452,13 @@ pub trait FrameEncoder {
     fn encode_command(
         &mut self,
         frame: &CommandFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error>;
+
+    /// Encodes an internal command dispatch frame into `out`.
+    fn encode_command_dispatch(
+        &mut self,
+        frame: &CommandDispatchFrame,
         out: &mut Vec<u8>,
     ) -> Result<(), Self::Error>;
 
@@ -565,6 +634,20 @@ impl FrameDecoder for BinaryFrameDecoder {
                     cursor.read_bytes(byte_len)?
                 },
             }),
+            FrameKind::CommandDispatch => RuntimeFrame::CommandDispatch(CommandDispatchFrame {
+                station_id: StationId::new(cursor.read_u32()?),
+                client_id: ClientId::new(cursor.read_u64()?),
+                command_id: CommandId::new(cursor.read_u64()?),
+                entity_id: EntityId::new(cursor.read_u64()?),
+                sequence: cursor.read_u64()?,
+                received_at: Tick::new(cursor.read_u64()?),
+                kind: cursor.read_u32()?,
+                priority: decode_command_priority(cursor.read_u8()?)?,
+                payload: {
+                    let byte_len = cursor.read_u32()? as usize;
+                    cursor.read_bytes(byte_len)?
+                },
+            }),
             FrameKind::Barrier => RuntimeFrame::Barrier(BarrierFrame {
                 client_id: ClientId::new(cursor.read_u64()?),
                 barrier_id: BarrierId::new(cursor.read_u64()?),
@@ -649,6 +732,24 @@ impl FrameEncoder for BinaryFrameEncoder {
         out.extend_from_slice(&frame.kind.to_le_bytes());
         out.push(encode_command_priority(frame.priority));
         write_bytes("command.payload", &frame.payload, out)?;
+        Ok(())
+    }
+
+    fn encode_command_dispatch(
+        &mut self,
+        frame: &CommandDispatchFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        out.push(FrameKind::CommandDispatch as u8);
+        out.extend_from_slice(&frame.station_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.client_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.command_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.entity_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.sequence.to_le_bytes());
+        out.extend_from_slice(&frame.received_at.get().to_le_bytes());
+        out.extend_from_slice(&frame.kind.to_le_bytes());
+        out.push(encode_command_priority(frame.priority));
+        write_bytes("command_dispatch.payload", &frame.payload, out)?;
         Ok(())
     }
 
@@ -957,6 +1058,31 @@ mod tests {
     }
 
     #[test]
+    fn binary_codec_roundtrips_command_dispatch_frame() {
+        let frame = CommandDispatchFrame {
+            station_id: StationId::new(10),
+            client_id: ClientId::new(1),
+            command_id: CommandId::new(2),
+            entity_id: EntityId::new(3),
+            sequence: 4,
+            received_at: Tick::new(99),
+            kind: 5,
+            priority: CommandPriority::High,
+            payload: vec![9, 8, 7],
+        };
+        let mut encoder = BinaryFrameEncoder;
+        let mut bytes = Vec::new();
+        encoder
+            .encode_command_dispatch(&frame, &mut bytes)
+            .expect("encoder is infallible");
+
+        let decoded = BinaryFrameDecoder
+            .decode(&bytes)
+            .expect("decode should work");
+        assert_eq!(decoded, RuntimeFrame::CommandDispatch(frame));
+    }
+
+    #[test]
     fn command_frame_converts_to_runtime_envelope() {
         let frame = CommandFrame {
             client_id: ClientId::new(1),
@@ -972,6 +1098,25 @@ mod tests {
         assert_eq!(envelope.id, frame.command_id);
         assert_eq!(envelope.received_at, Tick::new(99));
         assert_eq!(CommandFrame::from_envelope(&envelope), frame);
+    }
+
+    #[test]
+    fn command_dispatch_frame_preserves_stamped_envelope_tick() {
+        let envelope = CommandEnvelope {
+            id: CommandId::new(2),
+            client_id: ClientId::new(1),
+            entity_id: EntityId::new(3),
+            sequence: 4,
+            received_at: Tick::new(99),
+            kind: 5,
+            priority: CommandPriority::Low,
+            payload: vec![1, 2, 3],
+        };
+
+        let frame = CommandDispatchFrame::from_envelope(StationId::new(10), &envelope);
+        assert_eq!(frame.station_id, StationId::new(10));
+        assert_eq!(frame.received_at, Tick::new(99));
+        assert_eq!(frame.into_envelope(), envelope);
     }
 
     #[test]

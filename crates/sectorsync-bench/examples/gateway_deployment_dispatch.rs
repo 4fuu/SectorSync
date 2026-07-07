@@ -8,7 +8,8 @@ use sectorsync_runtime::{
     DeploymentConfig, DeploymentRouteTable, GATEWAY_COMMAND_ACK_ACCEPTED, GatewayCommandPipeline,
 };
 use sectorsync_wire::{
-    BinaryFrameDecoder, BinaryFrameEncoder, CommandFrame, FrameDecoder, FrameEncoder, RuntimeFrame,
+    BinaryFrameDecoder, BinaryFrameEncoder, CommandDispatchFrame, CommandFrame, FrameDecoder,
+    FrameEncoder, RuntimeFrame,
 };
 
 fn main() {
@@ -70,13 +71,30 @@ fn main() {
     let second_delivery = second.delivery.expect("delivery should resolve");
     assert_eq!(second_delivery.node_id, node_two);
     assert_eq!(second_delivery.station_route_epoch, 2);
+    let dispatch_frame = CommandDispatchFrame::from_envelope(
+        second_delivery.station_id,
+        second.command.as_ref().expect("command should exist"),
+    );
+    let mut dispatch_bytes = Vec::new();
+    BinaryFrameEncoder
+        .encode_command_dispatch(&dispatch_frame, &mut dispatch_bytes)
+        .expect("dispatch frame should encode");
+    let RuntimeFrame::CommandDispatch(decoded_dispatch) = BinaryFrameDecoder
+        .decode(&dispatch_bytes)
+        .expect("dispatch frame should decode")
+    else {
+        panic!("expected command dispatch frame");
+    };
+    assert_eq!(decoded_dispatch.station_id, station_id);
+    assert_eq!(decoded_dispatch.into_envelope().received_at, Tick::new(12));
 
     println!(
-        "gateway_deployment_dispatch routed={} first_node={} second_node={} station_route_epoch={} acked={}",
+        "gateway_deployment_dispatch routed={} first_node={} second_node={} station_route_epoch={} dispatch_bytes={} acked={}",
         pipeline.stats().commands_routed_deployment,
         node_one.get(),
         second_delivery.node_id.get(),
         second_delivery.station_route_epoch,
+        dispatch_bytes.len(),
         pipeline.stats().acks_encoded
     );
 }

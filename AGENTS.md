@@ -21,7 +21,7 @@
   queue routing, or command ACK generation.
 - Use `cargo run -p sectorsync-bench --example gateway_deployment_dispatch`
   when changing gateway-to-deployment delivery route resolution or gateway
-  command dispatch reports for external node transports.
+  command dispatch reports/frames for external node transports.
 - Use `cargo run -p sectorsync-bench --example deployment_routing` when changing
   deployment node/station route tables, node heartbeat/stale checks, draining
   behavior, route moves, or placement capacity rules.
@@ -122,6 +122,10 @@ The core library does not own:
   SectorSync may encode, decode, queue, stamp `received_at`, and acknowledge
   them, but schema validation, anti-cheat, and game-rule translation belong in
   external validators before commands are applied.
+- Internal command dispatch frames may carry gateway-stamped command envelopes
+  from a gateway process to a station node. They must preserve `received_at`
+  and target station metadata without interpreting the command payload or
+  replacing external service discovery and transport security.
 - Reliable client packet helpers may carry command, command ACK, replication, or
   integration-defined frames, but they must not interpret game semantics or
   replace external command validation.

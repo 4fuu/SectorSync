@@ -66,9 +66,10 @@ Current crates:
   metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, client command
-  ingress frames, command acknowledgements, cross-station event frames, and
-  barrier notifications. It also provides a replication frame builder that
-  materializes dirty component deltas from a core replication plan.
+  ingress frames, internal gateway-to-station command dispatch frames, command
+  acknowledgements, cross-station event frames, and barrier notifications. It
+  also provides a replication frame builder that materializes dirty component
+  deltas from a core replication plan.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
   byte-budget transport wrapper, fake transport for tests/benchmarks, bounded
   in-memory client packet hubs, bounded in-memory station-to-station packet
@@ -187,6 +188,9 @@ Initial status:
 - Wire codec supports client command ingress frames that convert into
   `CommandEnvelope` after the server stamps `received_at`, plus command ACK
   frames for the return path. Command payloads remain opaque to SectorSync.
+- Wire codec supports internal command dispatch frames for gateway-to-station
+  node delivery. These frames preserve the gateway-stamped `received_at` tick
+  and target station while keeping command payloads opaque.
 - Custom component registry and sparse blob storage allow external systems to
   register game-owned data without forcing a full ECS framework.
 - Typed component codecs and schema helpers support compact user-defined
@@ -265,7 +269,8 @@ Initial status:
   rate-limit rejection.
 - `cargo run -p sectorsync-bench --example gateway_deployment_dispatch`
   demonstrates gateway-admitted command bytes resolving to deployment node
-  delivery routes before and after a station route move.
+  delivery routes before and after a station route move, then encoding the
+  stamped command envelope into an internal command dispatch frame.
 - `cargo run -p sectorsync-bench --example deployment_routing` demonstrates a
   low-level deployment route table registering nodes, assigning station routes,
   marking a node draining, moving a station route to another node, and marking a
