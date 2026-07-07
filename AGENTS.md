@@ -74,6 +74,8 @@ The core library does not own:
   and maintain binary encode/decode roundtrip tests.
 - SDK-level changes should include or update an example/integration test when
   they affect the expected external usage flow.
+- Split/migration changes should keep `cargo run -p sectorsync-bench --example
+  split_migration` working as the executable usage example.
 - Runtime-configurable sync policies must compile into compact hot-path data.
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.

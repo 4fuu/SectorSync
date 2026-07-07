@@ -81,6 +81,7 @@ cargo test --workspace
 cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
+cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
@@ -162,6 +163,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example sdk_flow` demonstrates an
   end-to-end embeddable SDK path: station, cell index, component store,
   replication plan, frame builder, binary codec, and fake transport.
+- `cargo run -p sectorsync-bench --example split_migration` demonstrates a
+  split proposal being applied to the cell ownership table and then executed as
+  cell-level entity owner migration.
 
 Not complete yet:
 
