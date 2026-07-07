@@ -12,9 +12,9 @@ use sectorsync_core::prelude::{
     EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues, GatewayError,
     GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner, HotspotSeverity,
     HotspotThresholds, NodeId, OwnerEpoch, PolicyTable, PushOutcome, ReplicationBudget,
-    ReplicationPlanner, RuntimeBarrier, SnapshotVersion, SplitProposal, Station, StationError,
-    StationEvent, StationId, StationLoadSample, StationSnapshot, Tick, ViewerQuery,
-    VisibilityFilter,
+    ReplicationPlanner, RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion, SplitProposal,
+    Station, StationError, StationEvent, StationId, StationLoadSample, StationSnapshot, Tick,
+    ViewerQuery, VisibilityFilter,
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
@@ -3547,6 +3547,123 @@ impl BarrierController {
     }
 }
 
+/// Report produced after applying an external upgrade hook to frozen snapshots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BarrierUpgradeReport {
+    /// Snapshot version requested for export.
+    pub version: SnapshotVersion,
+    /// Snapshots passed through the upgrade hook.
+    pub snapshots_migrated: usize,
+    /// Stations restored from migrated snapshots.
+    pub stations_restored: usize,
+    /// Entity records restored across all stations.
+    pub entities_restored: usize,
+}
+
+/// Error produced while applying an upgrade hook around a frozen barrier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BarrierUpgradeError {
+    /// Barrier was missing or not frozen.
+    Barrier(BarrierRuntimeError),
+    /// Station disappeared between snapshot export and restore.
+    MissingStation(StationId),
+    /// Restoring a migrated snapshot failed.
+    Restore {
+        /// Station being restored.
+        station_id: StationId,
+        /// Restore error.
+        error: StationError,
+    },
+}
+
+impl core::fmt::Display for BarrierUpgradeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Barrier(error) => write!(f, "{error}"),
+            Self::MissingStation(station_id) => {
+                write!(f, "upgrade station {} is missing", station_id.get())
+            }
+            Self::Restore { station_id, error } => {
+                write!(
+                    f,
+                    "upgrade restore for station {} failed: {error}",
+                    station_id.get()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BarrierUpgradeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Barrier(error) => Some(error),
+            Self::Restore { error, .. } => Some(error),
+            Self::MissingStation(_) => None,
+        }
+    }
+}
+
+impl From<BarrierRuntimeError> for BarrierUpgradeError {
+    fn from(value: BarrierRuntimeError) -> Self {
+        Self::Barrier(value)
+    }
+}
+
+/// Applies an external in-memory upgrade hook while a runtime barrier is frozen.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BarrierUpgradeExecutor;
+
+impl BarrierUpgradeExecutor {
+    /// Exports frozen station snapshots, lets `hook` migrate them, and restores
+    /// every station only after all migrated snapshots are valid.
+    pub fn migrate_frozen<H>(
+        controller: &mut BarrierController,
+        stations: &mut StationSet,
+        version: SnapshotVersion,
+        hook: &mut H,
+    ) -> Result<BarrierUpgradeReport, BarrierUpgradeError>
+    where
+        H: RuntimeUpgradeHook,
+    {
+        let report_version = version.clone();
+        let snapshots = controller.export_snapshots(stations, version)?;
+        let mut restored = Vec::with_capacity(snapshots.len());
+        let mut entities_restored = 0usize;
+
+        for snapshot in snapshots {
+            let station_id = snapshot.meta.station_id;
+            let config = stations
+                .get(station_id)
+                .ok_or(BarrierUpgradeError::MissingStation(station_id))?
+                .config();
+            hook.pre_upgrade(&snapshot.meta);
+            let migrated = hook.migrate_state(snapshot);
+            let migrated_meta = migrated.meta.clone();
+            let restored_station = Station::restore(config, migrated)
+                .map_err(|error| BarrierUpgradeError::Restore { station_id, error })?;
+            entities_restored = entities_restored.saturating_add(restored_station.len());
+            hook.post_upgrade(&migrated_meta);
+            restored.push((station_id, restored_station));
+        }
+
+        let stations_restored = restored.len();
+        for (station_id, restored_station) in restored {
+            let station = stations
+                .get_mut(station_id)
+                .ok_or(BarrierUpgradeError::MissingStation(station_id))?;
+            *station = restored_station;
+        }
+
+        Ok(BarrierUpgradeReport {
+            version: report_version,
+            snapshots_migrated: stations_restored,
+            stations_restored,
+            entities_restored,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3555,7 +3672,7 @@ mod tests {
         CompiledSyncPolicy, ComponentDescriptor, ComponentId, ComponentMigrationMode,
         ComponentSyncMode, EventId, EventKind, EventPriority, GatewayConfig, GridSpec,
         HotspotThresholds, InstanceId, NodeId, PolicyId, Position3, RangeOnlyVisibility,
-        StationConfig, StationLoadSample, U32LeCodec,
+        SnapshotMeta, StationConfig, StationLoadSample, U32LeCodec,
     };
     use sectorsync_transport::{
         ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportHub,
@@ -3644,6 +3761,101 @@ mod tests {
 
         let metrics = controller.resume().expect("resume should work");
         assert_eq!(metrics.station_count, 2);
+        assert_eq!(metrics.snapshots_exported, 2);
+        assert_eq!(controller.progress().state, BarrierState::Running);
+    }
+
+    #[derive(Default)]
+    struct MoveSnapshotUpgrade {
+        pre_calls: usize,
+        migrate_calls: usize,
+        post_calls: usize,
+    }
+
+    impl RuntimeUpgradeHook for MoveSnapshotUpgrade {
+        fn pre_upgrade(&mut self, meta: &SnapshotMeta) {
+            self.pre_calls = self.pre_calls.saturating_add(1);
+            assert_eq!(meta.version.runtime_version, 2);
+        }
+
+        fn migrate_state(&mut self, mut snapshot: StationSnapshot) -> StationSnapshot {
+            self.migrate_calls = self.migrate_calls.saturating_add(1);
+            for entity in &mut snapshot.entities {
+                entity.position.x += 10.0;
+            }
+            snapshot
+        }
+
+        fn post_upgrade(&mut self, meta: &SnapshotMeta) {
+            self.post_calls = self.post_calls.saturating_add(1);
+            assert_eq!(meta.version.runtime_version, 2);
+        }
+    }
+
+    #[test]
+    fn barrier_upgrade_executor_migrates_and_restores_frozen_snapshots() {
+        let mut first = station(1, 10);
+        first
+            .spawn_owned(
+                EntityId::new(100),
+                Position3::new(1.0, 2.0, 3.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+        let mut stations = StationSet::default();
+        stations.push(first);
+        stations.push(station(2, 10));
+
+        for station in stations.iter_mut() {
+            station.advance_tick();
+            station.advance_tick();
+        }
+
+        let mut controller = BarrierController::default();
+        controller
+            .request(
+                &stations,
+                BarrierId::new(8),
+                BarrierScope::Instance(InstanceId::new(10)),
+                Tick::new(2),
+                CommandQueueMode::Buffer,
+            )
+            .expect("request should work");
+        assert_eq!(
+            controller.poll(&stations).expect("poll should work").state,
+            BarrierState::Frozen
+        );
+
+        let mut hook = MoveSnapshotUpgrade::default();
+        let version = SnapshotVersion {
+            runtime_version: 2,
+            ..SnapshotVersion::default()
+        };
+        let report = BarrierUpgradeExecutor::migrate_frozen(
+            &mut controller,
+            &mut stations,
+            version.clone(),
+            &mut hook,
+        )
+        .expect("upgrade should migrate frozen snapshots");
+
+        assert_eq!(report.version, version);
+        assert_eq!(report.snapshots_migrated, 2);
+        assert_eq!(report.stations_restored, 2);
+        assert_eq!(report.entities_restored, 1);
+        assert_eq!(hook.pre_calls, 2);
+        assert_eq!(hook.migrate_calls, 2);
+        assert_eq!(hook.post_calls, 2);
+        let moved = stations
+            .get(StationId::new(1))
+            .expect("station should exist")
+            .get_by_id(EntityId::new(100))
+            .expect("entity should restore");
+        assert_eq!(moved.position, Position3::new(11.0, 2.0, 3.0));
+        assert_eq!(controller.progress().state, BarrierState::Frozen);
+
+        let metrics = controller.resume().expect("resume should work");
         assert_eq!(metrics.snapshots_exported, 2);
         assert_eq!(controller.progress().state, BarrierState::Running);
     }

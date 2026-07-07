@@ -24,6 +24,9 @@
 - Use `cargo run -p sectorsync-bench --example barrier_transport` when changing
   runtime barrier controllers, client barrier notifications, or
   pause/freeze/resume transport integration.
+- Use `cargo run -p sectorsync-bench --example barrier_upgrade` when changing
+  frozen snapshot upgrade hooks, station restore around barriers, or
+  pause/snapshot/upgrade/resume integration.
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
@@ -111,6 +114,11 @@ The core library does not own:
 - Runtime barrier notification bridges may encode and broadcast barrier states
   to bounded client transport. They must not execute hot-update scripts, manage
   client connections, add blocking IO, or hide unbounded notification buffers.
+- Runtime barrier upgrade executors may export frozen in-memory snapshots,
+  invoke caller-provided `RuntimeUpgradeHook`, validate restored stations, and
+  replace station state before resume. They must not load scripts, own plugin
+  systems, run game business migrations by default, persist snapshots, or
+  bypass frozen-barrier checks.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded
   command buffers on hot paths.
 - Gateway/session primitives must remain low-level and bounded: session tables,
