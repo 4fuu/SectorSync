@@ -51,6 +51,9 @@ The core library does not own:
   and candidate queries, but cannot make final state changes.
 - Two-phase handoff must prewarm target ghosts before owner commit and must
   downgrade the old owner to a short-lived ghost after commit.
+- Cell-level migration must update both ownership metadata and source/target
+  spatial indexes. Do not move a cell without preserving source ghost visibility
+  during the handoff window.
 - Runtime barrier work must preserve the sequence: request, align to tick
   boundary, freeze, snapshot or migrate, resume.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded

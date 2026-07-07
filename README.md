@@ -70,7 +70,8 @@ Current crates:
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
-  includes a station event router and simple station scheduler.
+  includes dynamic cell ownership tables, cell-level migration execution, a
+  station event router, and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -150,6 +151,9 @@ Initial status:
   events once their target tick is ready.
 - Hotspot planner evaluates station/cell load samples and proposes high-pressure
   cells for external schedulers to move.
+- Cell ownership table and cell migration executor can apply split proposals and
+  migrate owner entities found in moved cells while refreshing source/target
+  station indexes.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
   command latency in ticks, max queue depth, payload entity/component delta
@@ -161,7 +165,7 @@ Initial status:
 
 Not complete yet:
 
-- Automatic station ownership split execution and migration scheduling.
+- Production-grade automatic split scheduling policy.
 - Multi-station scheduler and bounded cross-station transport integration beyond
   core queue primitives.
 - Generated schema helpers.
