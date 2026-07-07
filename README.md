@@ -62,10 +62,10 @@ Current crates:
   command/event queues, handoff transfer types, hotspot planning, barrier
   metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
-  replication frames with entity/component delta payloads, command
-  acknowledgements, and barrier notifications. It also provides a replication
-  frame builder that materializes dirty component deltas from a core replication
-  plan.
+  replication frames with entity/component delta payloads, client command
+  ingress frames, command acknowledgements, and barrier notifications. It also
+  provides a replication frame builder that materializes dirty component deltas
+  from a core replication plan.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
   byte-budget transport wrapper, fake transport for tests/benchmarks, and a
   non-blocking `std::net::UdpSocket` adapter with explicit client address
@@ -87,6 +87,7 @@ cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example udp_loopback
+cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
@@ -144,6 +145,9 @@ Initial status:
   stations while leaving the old station with a short-lived ghost.
 - Bounded command queues support priority ordering and barrier-aware
   buffer/reject/drain behavior.
+- Wire codec supports client command ingress frames that convert into
+  `CommandEnvelope` after the server stamps `received_at`, plus command ACK
+  frames for the return path. Command payloads remain opaque to SectorSync.
 - Custom component registry and sparse blob storage allow external systems to
   register game-owned data without forcing a full ECS framework.
 - Typed component codecs and schema helpers support compact user-defined
@@ -178,6 +182,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example udp_loopback` demonstrates a
   replication frame encoded by `sectorsync-wire`, sent through the UDP transport
   adapter over localhost, received, and decoded back into a runtime frame.
+- `cargo run -p sectorsync-bench --example command_ingress` demonstrates a
+  client command frame sent over UDP, decoded by the server, converted into a
+  bounded command queue entry, applied, and acknowledged back to the client.
 
 Not complete yet:
 

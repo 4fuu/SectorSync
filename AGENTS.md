@@ -15,6 +15,8 @@
   benchmark smoke test.
 - Use `cargo run -p sectorsync-bench --example udp_loopback` when changing the
   UDP transport adapter or wire/transport integration.
+- Use `cargo run -p sectorsync-bench --example command_ingress` when changing
+  command wire frames, command queues, or ingress/ACK integration.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -62,6 +64,10 @@ The core library does not own:
   boundary, freeze, snapshot or migrate, resume.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded
   command buffers on hot paths.
+- Command wire frames and command envelopes are business-agnostic containers.
+  SectorSync may encode, decode, queue, stamp `received_at`, and acknowledge
+  them, but schema validation, anti-cheat, and game-rule translation belong in
+  external validators before commands are applied.
 - Custom component work should keep SectorSync as a low-level SDK. Do not turn
   it into a mandatory ECS framework; expose descriptors, storage, and hooks.
 - Component codecs should stay dependency-light by default. Prefer traits and
