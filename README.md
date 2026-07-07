@@ -88,7 +88,8 @@ Current crates:
   scheduling with cooldown/capacity/improvement guards, cell-level migration
   execution, a low-level deployment node/station route table, a station event
   router, bounded station event and command dispatch transport bridges, a
-  business-agnostic gateway command pipeline, and a simple station scheduler.
+  bounded client replication transport bridge, a business-agnostic gateway
+  command pipeline, and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -100,6 +101,7 @@ cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
+cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --example gateway_command_pipeline
 cargo run -p sectorsync-bench --example gateway_deployment_dispatch
@@ -206,6 +208,9 @@ Initial status:
   barrier frames. Replication frames can carry concrete entity/component deltas.
 - Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
   concrete wire payloads with bounded entity/component materialization.
+- Runtime replication transport bridge plans AOI for a viewer, builds a concrete
+  replication frame from component storage, skips empty frames by default,
+  encodes the frame, and submits it to bounded client packet transport.
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
 - Packet security helpers support bounded security envelopes, key ids, nonces,
   authentication tags, pluggable authenticator/cipher traits, explicit
@@ -264,6 +269,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
   scheduler cooldown and target-capacity guard behavior without running a heavy
   benchmark profile.
+- `cargo run -p sectorsync-bench --example replication_bridge` demonstrates a
+  low-level downlink path: viewer AOI planning, replication frame building,
+  bounded in-memory client transport send, receive, and decode.
 - `cargo run -p sectorsync-bench --example gateway_session` demonstrates a
   low-level gateway session table connecting a client, routing commands into
   station command queues, rerouting to another station, rate-limiting a command,
