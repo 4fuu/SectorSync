@@ -77,8 +77,9 @@ Current crates:
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
   includes dynamic cell ownership tables, conservative automatic split
-  scheduling, cell-level migration execution, a station event router, a bounded
-  station event transport bridge, and a simple station scheduler.
+  scheduling with cooldown/capacity/improvement guards, cell-level migration
+  execution, a station event router, a bounded station event transport bridge,
+  and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -89,6 +90,7 @@ cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
+cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example station_event_transport
@@ -187,6 +189,9 @@ Initial status:
   station indexes.
 - Split scheduler can evaluate station load samples, choose a lower-load target,
   produce bounded split actions, update ownership, and execute cell migrations.
+  It includes planning guards for source cooldown, minimum source/target score
+  improvement, target score capacity after move, warm-target admission, and
+  explicit skip counters for tuning.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
   command latency in ticks, max queue depth, payload entity/component delta
@@ -197,6 +202,9 @@ Initial status:
   replication plan, frame builder, binary codec, and fake transport.
 - `cargo run -p sectorsync-bench --example split_migration` demonstrates a
   load-sample-driven split scheduler producing and executing a cell migration.
+- `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
+  scheduler cooldown and target-capacity guard behavior without running a heavy
+  benchmark profile.
 - `cargo run -p sectorsync-bench --example udp_loopback` demonstrates a
   replication frame encoded by `sectorsync-wire`, sent through the UDP transport
   adapter over localhost, received, and decoded back into a runtime frame.
@@ -215,7 +223,8 @@ Initial status:
 
 Not complete yet:
 
-- Production-grade tuning for automatic split scheduling policy.
+- Long-running split scheduler calibration against production telemetry and
+  heavier workload profiles.
 - Reliable station transport policies, authentication/encryption, reconnects,
   deployment-level routing, and production cluster integration beyond the
   low-level in-memory and UDP packet adapters.

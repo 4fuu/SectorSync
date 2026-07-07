@@ -110,6 +110,9 @@ The core library does not own:
   they affect the expected external usage flow.
 - Split/migration changes should keep `cargo run -p sectorsync-bench --example
   split_migration` working as the executable usage example.
+- Split scheduler policy changes should also run
+  `cargo run -p sectorsync-bench --example split_tuning` and preserve cooldown,
+  target-capacity, and score-improvement guard behavior.
 - Runtime-configurable sync policies must compile into compact hot-path data.
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.
