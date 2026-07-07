@@ -3,6 +3,128 @@
 use std::collections::HashMap;
 
 use crate::ids::{ComponentId, EntityHandle};
+use crate::spatial::Vec3;
+
+/// Component codec error used by built-in codecs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentCodecError {
+    /// Input length did not match codec expectation.
+    ExpectedBytes {
+        /// Expected byte count.
+        expected: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+}
+
+impl core::fmt::Display for ComponentCodecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ExpectedBytes { expected, actual } => {
+                write!(f, "expected {expected} bytes, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ComponentCodecError {}
+
+/// Typed component codec. Embedders can implement this for their own compact
+/// schema and bit-packing formats.
+pub trait ComponentCodec<T> {
+    /// Encodes `value` into `out`.
+    fn encode(&self, value: &T, out: &mut Vec<u8>) -> Result<(), ComponentCodecError>;
+
+    /// Decodes a value from bytes.
+    fn decode(&self, input: &[u8]) -> Result<T, ComponentCodecError>;
+
+    /// Fixed encoded size when known.
+    fn fixed_size(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Little-endian `u32` codec.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct U32LeCodec;
+
+impl ComponentCodec<u32> for U32LeCodec {
+    fn encode(&self, value: &u32, out: &mut Vec<u8>) -> Result<(), ComponentCodecError> {
+        out.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(&self, input: &[u8]) -> Result<u32, ComponentCodecError> {
+        let bytes = exact_array::<4>(input)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn fixed_size(&self) -> Option<usize> {
+        Some(4)
+    }
+}
+
+/// Little-endian `f32` codec.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct F32LeCodec;
+
+impl ComponentCodec<f32> for F32LeCodec {
+    fn encode(&self, value: &f32, out: &mut Vec<u8>) -> Result<(), ComponentCodecError> {
+        out.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(&self, input: &[u8]) -> Result<f32, ComponentCodecError> {
+        let bytes = exact_array::<4>(input)?;
+        Ok(f32::from_le_bytes(bytes))
+    }
+
+    fn fixed_size(&self) -> Option<usize> {
+        Some(4)
+    }
+}
+
+/// Little-endian `Vec3` codec.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Vec3LeCodec;
+
+impl ComponentCodec<Vec3> for Vec3LeCodec {
+    fn encode(&self, value: &Vec3, out: &mut Vec<u8>) -> Result<(), ComponentCodecError> {
+        out.extend_from_slice(&value.x.to_le_bytes());
+        out.extend_from_slice(&value.y.to_le_bytes());
+        out.extend_from_slice(&value.z.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(&self, input: &[u8]) -> Result<Vec3, ComponentCodecError> {
+        if input.len() != 12 {
+            return Err(ComponentCodecError::ExpectedBytes {
+                expected: 12,
+                actual: input.len(),
+            });
+        }
+        let x = f32::from_le_bytes(input[0..4].try_into().expect("slice length checked"));
+        let y = f32::from_le_bytes(input[4..8].try_into().expect("slice length checked"));
+        let z = f32::from_le_bytes(input[8..12].try_into().expect("slice length checked"));
+        Ok(Vec3 { x, y, z })
+    }
+
+    fn fixed_size(&self) -> Option<usize> {
+        Some(12)
+    }
+}
+
+fn exact_array<const N: usize>(input: &[u8]) -> Result<[u8; N], ComponentCodecError> {
+    if input.len() != N {
+        return Err(ComponentCodecError::ExpectedBytes {
+            expected: N,
+            actual: input.len(),
+        });
+    }
+    let mut out = [0_u8; N];
+    out.copy_from_slice(input);
+    Ok(out)
+}
 
 /// Storage strategy declared by a registered component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +174,8 @@ pub struct ComponentDescriptor {
     pub migration: ComponentMigrationMode,
     /// Maximum accepted blob size in bytes for SectorSync-owned storage.
     pub max_bytes: usize,
+    /// Stable schema hash selected by the embedding application.
+    pub schema_hash: u64,
 }
 
 impl ComponentDescriptor {
@@ -70,6 +194,32 @@ impl ComponentDescriptor {
             sync,
             migration,
             max_bytes,
+            schema_hash: 0,
+        }
+    }
+
+    /// Attaches a stable schema hash to this descriptor.
+    pub const fn with_schema_hash(mut self, schema_hash: u64) -> Self {
+        self.schema_hash = schema_hash;
+        self
+    }
+}
+
+/// Typed component schema descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentSchema {
+    /// Component descriptor.
+    pub descriptor: ComponentDescriptor,
+    /// Fixed encoded size when known.
+    pub fixed_size: Option<usize>,
+}
+
+impl ComponentSchema {
+    /// Creates a typed schema from a descriptor and codec.
+    pub fn new<T, C: ComponentCodec<T>>(descriptor: ComponentDescriptor, codec: &C) -> Self {
+        Self {
+            descriptor,
+            fixed_size: codec.fixed_size(),
         }
     }
 }
@@ -169,6 +319,10 @@ pub enum ComponentStoreError {
         /// Maximum allowed size in bytes.
         max: usize,
     },
+    /// Codec failed while encoding or decoding.
+    Codec(ComponentCodecError),
+    /// Component blob does not exist.
+    MissingBlob(ComponentId),
 }
 
 impl core::fmt::Display for ComponentStoreError {
@@ -188,6 +342,8 @@ impl core::fmt::Display for ComponentStoreError {
                 actual,
                 max
             ),
+            Self::Codec(error) => write!(f, "{error}"),
+            Self::MissingBlob(id) => write!(f, "component {} blob is missing", id.get()),
         }
     }
 }
@@ -237,6 +393,22 @@ impl ComponentStore {
         Ok(())
     }
 
+    /// Encodes and writes a typed component value using `codec`.
+    pub fn set_typed<T, C: ComponentCodec<T>>(
+        &mut self,
+        descriptor: &ComponentDescriptor,
+        entity: EntityHandle,
+        version: u64,
+        codec: &C,
+        value: &T,
+    ) -> Result<(), ComponentStoreError> {
+        let mut bytes = Vec::with_capacity(codec.fixed_size().unwrap_or(0));
+        codec
+            .encode(value, &mut bytes)
+            .map_err(ComponentStoreError::Codec)?;
+        self.set_blob(descriptor, entity, version, bytes)
+    }
+
     /// Gets an opaque component blob.
     pub fn get_blob(
         &self,
@@ -247,6 +419,21 @@ impl ComponentStore {
             .get(usize::from(component_id.get()))
             .and_then(Option::as_ref)
             .and_then(|column| column.values.get(&entity))
+    }
+
+    /// Decodes a typed component value using `codec`.
+    pub fn get_typed<T, C: ComponentCodec<T>>(
+        &self,
+        component_id: ComponentId,
+        entity: EntityHandle,
+        codec: &C,
+    ) -> Result<T, ComponentStoreError> {
+        let blob = self
+            .get_blob(component_id, entity)
+            .ok_or(ComponentStoreError::MissingBlob(component_id))?;
+        codec
+            .decode(&blob.bytes)
+            .map_err(ComponentStoreError::Codec)
     }
 
     /// Gets a mutable opaque component blob.
@@ -408,5 +595,32 @@ mod tests {
                 .bytes,
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn typed_component_codec_roundtrips_values() {
+        let descriptor = ComponentDescriptor::sparse_blob(
+            ComponentId::new(3),
+            "velocity",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            12,
+        )
+        .with_schema_hash(0xABCD);
+        let schema = ComponentSchema::new(descriptor.clone(), &Vec3LeCodec);
+        assert_eq!(schema.fixed_size, Some(12));
+        assert_eq!(schema.descriptor.schema_hash, 0xABCD);
+
+        let mut store = ComponentStore::default();
+        let entity = EntityHandle::new(7, 0);
+        let value = Vec3::new(1.0, 2.0, 3.5);
+
+        store
+            .set_typed(&descriptor, entity, 1, &Vec3LeCodec, &value)
+            .expect("typed set should work");
+        let decoded = store
+            .get_typed(ComponentId::new(3), entity, &Vec3LeCodec)
+            .expect("typed get should work");
+        assert_eq!(decoded, value);
     }
 }

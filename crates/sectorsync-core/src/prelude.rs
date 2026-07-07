@@ -6,9 +6,10 @@ pub use crate::command::{
     CommandQueueError, CommandQueueLimits, CommandQueues, CommandRejectReason,
 };
 pub use crate::component::{
-    ComponentBlob, ComponentDescriptor, ComponentMigrationMode, ComponentRegistry,
-    ComponentRegistryError, ComponentStorageKind, ComponentStore, ComponentStoreError,
-    ComponentSyncMode,
+    ComponentBlob, ComponentCodec, ComponentCodecError, ComponentDescriptor,
+    ComponentMigrationMode, ComponentRegistry, ComponentRegistryError, ComponentSchema,
+    ComponentStorageKind, ComponentStore, ComponentStoreError, ComponentSyncMode, F32LeCodec,
+    U32LeCodec, Vec3LeCodec,
 };
 pub use crate::entity::{DirtyMask, EntityRecord, EntityRole, EntityTags};
 pub use crate::event::{
