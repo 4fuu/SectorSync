@@ -457,9 +457,8 @@ impl DeploymentRouteTable {
     }
 
     /// Returns stale node ids without mutating node state.
-    pub fn stale_nodes(&mut self, now: Tick) -> Vec<NodeId> {
-        let stale = self
-            .nodes
+    pub fn stale_nodes(&self, now: Tick) -> Vec<NodeId> {
+        self.nodes
             .iter()
             .filter_map(|(node_id, node)| {
                 (node.route.state != DeploymentNodeState::Offline
@@ -467,15 +466,14 @@ impl DeploymentRouteTable {
                         > self.config.stale_after_ticks)
                     .then_some(*node_id)
             })
-            .collect::<Vec<_>>();
-        self.stats.stale_nodes_detected =
-            self.stats.stale_nodes_detected.saturating_add(stale.len());
-        stale
+            .collect::<Vec<_>>()
     }
 
     /// Marks stale nodes offline.
     pub fn mark_stale_offline(&mut self, now: Tick) -> usize {
         let stale = self.stale_nodes(now);
+        self.stats.stale_nodes_detected =
+            self.stats.stale_nodes_detected.saturating_add(stale.len());
         for node_id in &stale {
             let _ = self.mark_offline(*node_id);
         }
