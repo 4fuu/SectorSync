@@ -28,6 +28,10 @@ macro_rules! id_type {
 
 id_type!(/// Stable entity identifier visible to embedders.
 EntityId, u64);
+id_type!(/// Connected or simulated client identifier.
+ClientId, u64);
+id_type!(/// Client command identifier.
+CommandId, u64);
 id_type!(/// Station identifier selected by the embedding application.
 StationId, u32);
 id_type!(/// Logical node identifier selected by the embedding application.
@@ -48,7 +52,7 @@ id_type!(/// Entity ownership epoch used during handoff.
 OwnerEpoch, u64);
 
 /// Dense, generation-checked handle for station-local entity storage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityHandle {
     index: u32,
     generation: u32,
