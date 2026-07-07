@@ -19,6 +19,8 @@
   command wire frames, command queues, or ingress/ACK integration.
 - Use `cargo run -p sectorsync-bench --example station_event_transport` when
   changing station event frames, station transport, or event router bridging.
+- Use `cargo run -p sectorsync-bench --example udp_station_event` when changing
+  UDP station transport or generic station event bridge behavior.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -84,6 +86,9 @@ The core library does not own:
   queues. Do not reuse client transport abstractions for station event routing.
 - Station event transport bridges must validate packet endpoints against decoded
   frames before routing events into target queues.
+- UDP station transport instances represent one local station. They must reject
+  source/target station mismatches instead of silently forwarding malformed
+  station packets.
 - Wire and transport abstractions must stay at frame/packet/batch boundaries.
   Avoid per-entity transport abstraction on hot paths.
 - Transport implementations must be non-blocking or externally bounded at the

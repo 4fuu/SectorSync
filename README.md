@@ -45,8 +45,8 @@ Phase 1 should produce a usable core library and a benchmark simulator:
 - `sectorsync-wire`: wire/frame traits and default frame types, including
   station event frames.
 - `sectorsync-transport`: transport traits, fake transport support, byte-budget
-  guards, bounded in-memory station packet transport, and a lightweight
-  standard-library UDP adapter.
+  guards, bounded in-memory station packet transport, and lightweight
+  standard-library UDP adapters for client and station packets.
 - `sectorsync-runtime`: orchestration helpers for multi-station simulation.
 
 The first implementation should stay resource-aware. The development machine is
@@ -70,9 +70,9 @@ Current crates:
   materializes dirty component deltas from a core replication plan.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
   byte-budget transport wrapper, fake transport for tests/benchmarks, bounded
-  in-memory station-to-station packet transport, and a non-blocking
-  `std::net::UdpSocket` adapter with explicit client address registration and
-  inbound packet polling.
+  in-memory station-to-station packet transport, a non-blocking
+  `std::net::UdpSocket` client packet adapter, and a non-blocking UDP
+  station-to-station packet adapter with explicit station address registration.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
@@ -92,6 +92,7 @@ cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example station_event_transport
+cargo run -p sectorsync-bench --example udp_station_event
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
@@ -167,6 +168,9 @@ Initial status:
 - Standard UDP transport adapter supports non-blocking localhost/network packet
   send/receive, explicit client-to-address registration, and bounded reusable
   receive buffers while keeping reliability/session concerns outside the core.
+- UDP station transport adapter supports one-local-station sockets, explicit
+  station-to-address registration, endpoint checks, non-blocking receive, and
+  byte/packet statistics for low-level cross-process station packet prototypes.
 - Runtime event router queues cross-station events by target station and drains
   events once their target tick is ready.
 - Runtime station event transport bridge encodes typed station events into wire
@@ -199,12 +203,15 @@ Initial status:
   demonstrates a typed cross-station event encoded into a wire frame, delivered
   through bounded station transport, pumped into the target router, and drained
   at the target tick.
+- `cargo run -p sectorsync-bench --example udp_station_event` demonstrates the
+  same station event bridge over localhost UDP station transports.
 
 Not complete yet:
 
 - Production-grade tuning for automatic split scheduling policy.
-- Production cross-process station transport adapters, reliability policies, and
-  deployment-level routing beyond the in-memory bounded station packet bridge.
+- Reliable station transport policies, authentication/encryption, reconnects,
+  deployment-level routing, and production cluster integration beyond the
+  low-level in-memory and UDP packet adapters.
 - Generated schema helpers.
 - Reliable transport/session/gateway layers for production client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.
