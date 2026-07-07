@@ -89,8 +89,9 @@ Current crates:
   execution, a low-level deployment node/station route table, a station event
   router, bounded station event and command dispatch transport bridges, a
   bounded client replication send/receive transport bridge, a low-level client
-  command/inbound-frame transport bridge, a business-agnostic gateway command
-  pipeline, and a simple station scheduler.
+  command/inbound-frame transport bridge, a runtime barrier notification
+  transport bridge, a business-agnostic gateway command pipeline, and a simple
+  station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -104,6 +105,7 @@ cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example client_bridge
+cargo run -p sectorsync-bench --example barrier_transport
 cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --example gateway_command_pipeline
 cargo run -p sectorsync-bench --example gateway_deployment_dispatch
@@ -171,6 +173,9 @@ Initial status:
   snapshots, commands, and fake transport integration.
 - Runtime barrier controller can request scoped barriers, wait for station tick
   alignment, freeze, export snapshots, and resume.
+- Runtime barrier notification bridge encodes barrier states into bounded client
+  packet transport so pause/freeze/resume flows can notify clients without
+  owning hot-update logic or connection management.
 - Two-phase owner handoff primitives support target ghost prewarming, incoming
   owner commit, and source downgrade to short-lived ghost.
 - Runtime migration executor can move an authoritative entity between in-process
@@ -286,6 +291,10 @@ Initial status:
 - `cargo run -p sectorsync-bench --example client_bridge` demonstrates a
   low-level client SDK path: command frame send, gateway ACK return, replication
   downlink, and client-bound frame pumping through bounded in-memory transport.
+- `cargo run -p sectorsync-bench --example barrier_transport` demonstrates a
+  runtime barrier freeze/snapshot/resume flow that sends Frozen and Running
+  notifications through bounded client transport and receives them with the
+  low-level client bridge.
 - `cargo run -p sectorsync-bench --example gateway_session` demonstrates a
   low-level gateway session table connecting a client, routing commands into
   station command queues, rerouting to another station, rate-limiting a command,

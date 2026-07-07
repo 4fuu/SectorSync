@@ -943,6 +943,194 @@ impl ClientTransportBridge {
     }
 }
 
+/// Runtime barrier notification transport statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BarrierTransportStats {
+    /// Barrier frames encoded and submitted to client transport.
+    pub notifications_sent: usize,
+    /// Client targets submitted to transport.
+    pub clients_notified: usize,
+    /// Encoded bytes submitted to transport.
+    pub bytes_sent: usize,
+}
+
+/// Result of one barrier notification broadcast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarrierTransportReport {
+    /// Barrier id.
+    pub barrier_id: BarrierId,
+    /// Barrier state sent to clients.
+    pub state: BarrierState,
+    /// Server tick associated with the notification.
+    pub server_tick: Tick,
+    /// Client targets requested by the caller.
+    pub clients_requested: usize,
+    /// Client targets successfully submitted to transport.
+    pub clients_sent: usize,
+    /// Encoded bytes submitted to transport.
+    pub bytes_sent: usize,
+}
+
+/// Error produced while encoding or sending barrier notifications.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BarrierTransportError<E> {
+    /// Wire encoding failed.
+    Encode(BinaryEncodeError),
+    /// Underlying client transport failed.
+    Transport(E),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for BarrierTransportError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Encode(error) => write!(f, "{error}"),
+            Self::Transport(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for BarrierTransportError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::Transport(error) => Some(error),
+        }
+    }
+}
+
+impl<E> From<BinaryEncodeError> for BarrierTransportError<E> {
+    fn from(value: BinaryEncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
+
+/// Low-level bridge for sending runtime barrier notifications to clients.
+#[derive(Clone, Debug, Default)]
+pub struct BarrierTransportBridge {
+    stats: BarrierTransportStats,
+}
+
+impl BarrierTransportBridge {
+    /// Creates a barrier notification transport bridge.
+    pub const fn new() -> Self {
+        Self {
+            stats: BarrierTransportStats {
+                notifications_sent: 0,
+                clients_notified: 0,
+                bytes_sent: 0,
+            },
+        }
+    }
+
+    /// Returns accumulated statistics.
+    pub const fn stats(&self) -> BarrierTransportStats {
+        self.stats
+    }
+
+    /// Sends one barrier notification to one client.
+    pub fn send_state<T>(
+        &mut self,
+        transport: &mut T,
+        client_id: ClientId,
+        barrier_id: BarrierId,
+        server_tick: Tick,
+        state: BarrierState,
+    ) -> Result<usize, BarrierTransportError<T::Error>>
+    where
+        T: TransportSink,
+    {
+        let frame = BarrierFrame {
+            client_id,
+            barrier_id,
+            server_tick,
+            state,
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder.encode_barrier(&frame, &mut bytes)?;
+        let bytes_sent = bytes.len();
+        transport
+            .send(OutboundPacket { client_id, bytes })
+            .map_err(BarrierTransportError::Transport)?;
+        self.stats.notifications_sent = self.stats.notifications_sent.saturating_add(1);
+        self.stats.clients_notified = self.stats.clients_notified.saturating_add(1);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(bytes_sent);
+        Ok(bytes_sent)
+    }
+
+    /// Sends one runtime barrier notification to one client.
+    pub fn send_barrier<T>(
+        &mut self,
+        transport: &mut T,
+        client_id: ClientId,
+        barrier: RuntimeBarrier,
+    ) -> Result<usize, BarrierTransportError<T::Error>>
+    where
+        T: TransportSink,
+    {
+        self.send_state(
+            transport,
+            client_id,
+            barrier.id,
+            barrier.target_tick,
+            barrier.state,
+        )
+    }
+
+    /// Broadcasts one barrier state to a bounded caller-provided client list.
+    pub fn broadcast_state<T, I>(
+        &mut self,
+        transport: &mut T,
+        clients: I,
+        barrier_id: BarrierId,
+        server_tick: Tick,
+        state: BarrierState,
+    ) -> Result<BarrierTransportReport, BarrierTransportError<T::Error>>
+    where
+        T: TransportSink,
+        I: IntoIterator<Item = ClientId>,
+    {
+        let mut report = BarrierTransportReport {
+            barrier_id,
+            state,
+            server_tick,
+            clients_requested: 0,
+            clients_sent: 0,
+            bytes_sent: 0,
+        };
+        for client_id in clients {
+            report.clients_requested = report.clients_requested.saturating_add(1);
+            let bytes_sent =
+                self.send_state(transport, client_id, barrier_id, server_tick, state)?;
+            report.clients_sent = report.clients_sent.saturating_add(1);
+            report.bytes_sent = report.bytes_sent.saturating_add(bytes_sent);
+        }
+        Ok(report)
+    }
+
+    /// Broadcasts one runtime barrier to a bounded caller-provided client list.
+    pub fn broadcast_barrier<T, I>(
+        &mut self,
+        transport: &mut T,
+        clients: I,
+        barrier: RuntimeBarrier,
+    ) -> Result<BarrierTransportReport, BarrierTransportError<T::Error>>
+    where
+        T: TransportSink,
+        I: IntoIterator<Item = ClientId>,
+    {
+        self.broadcast_state(
+            transport,
+            clients,
+            barrier.id,
+            barrier.target_tick,
+            barrier.state,
+        )
+    }
+}
+
 /// Accepted command ACK reason code.
 pub const GATEWAY_COMMAND_ACK_ACCEPTED: u16 = 0;
 /// Command was rejected by generic gateway/session state.
@@ -3215,6 +3403,75 @@ mod tests {
         assert_eq!(metrics.station_count, 2);
         assert_eq!(metrics.snapshots_exported, 2);
         assert_eq!(controller.progress().state, BarrierState::Running);
+    }
+
+    #[test]
+    fn barrier_transport_bridge_broadcasts_client_notifications() {
+        let server_id = ClientId::new(0);
+        let clients = [ClientId::new(7), ClientId::new(8)];
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 4,
+            max_packet_bytes: 512,
+        });
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23400".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let mut client_transports = clients
+            .into_iter()
+            .enumerate()
+            .map(|(index, client_id)| {
+                hub.endpoint(
+                    client_id,
+                    format!("127.0.0.1:{}", 23407 + index)
+                        .parse()
+                        .expect("client addr"),
+                )
+                .expect("client endpoint should register")
+            })
+            .collect::<Vec<_>>();
+        let mut barrier = RuntimeBarrier::requested(
+            BarrierId::new(5),
+            BarrierScope::Instance(InstanceId::new(10)),
+            Tick::new(10),
+            Tick::new(12),
+            CommandQueueMode::Buffer,
+        );
+        barrier.wait_for_tick_boundary();
+        barrier.freeze();
+
+        let mut bridge = BarrierTransportBridge::default();
+        let report = bridge
+            .broadcast_barrier(&mut server_transport, clients, barrier)
+            .expect("barrier should broadcast");
+
+        assert_eq!(report.barrier_id, barrier.id);
+        assert_eq!(report.state, BarrierState::Frozen);
+        assert_eq!(report.server_tick, Tick::new(12));
+        assert_eq!(report.clients_requested, 2);
+        assert_eq!(report.clients_sent, 2);
+        assert!(report.bytes_sent > 0);
+        assert_eq!(bridge.stats().notifications_sent, 2);
+        assert_eq!(bridge.stats().clients_notified, 2);
+        assert_eq!(bridge.stats().bytes_sent, report.bytes_sent);
+
+        for (index, client_id) in clients.into_iter().enumerate() {
+            let mut client_bridge = ClientTransportBridge::new(
+                ClientTransportConfig::new(client_id, server_id).with_expected_source(server_id),
+            );
+            let pump = client_bridge
+                .pump(&mut client_transports[index], 2)
+                .expect("client should receive barrier");
+            assert_eq!(pump.barrier_frames_received(), 1);
+            assert_eq!(
+                pump.barriers[0],
+                BarrierFrame {
+                    client_id,
+                    barrier_id: barrier.id,
+                    server_tick: barrier.target_tick,
+                    state: BarrierState::Frozen,
+                }
+            );
+        }
     }
 
     #[test]

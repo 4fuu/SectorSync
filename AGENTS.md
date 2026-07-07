@@ -21,6 +21,9 @@
 - Use `cargo run -p sectorsync-bench --example client_bridge` when changing
   low-level client command send, ACK/replication/barrier receive pumping, or
   client-bound frame validation.
+- Use `cargo run -p sectorsync-bench --example barrier_transport` when changing
+  runtime barrier controllers, client barrier notifications, or
+  pause/freeze/resume transport integration.
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
@@ -105,6 +108,9 @@ The core library does not own:
   bounded moved cells, and preference for lower-load target stations.
 - Runtime barrier work must preserve the sequence: request, align to tick
   boundary, freeze, snapshot or migrate, resume.
+- Runtime barrier notification bridges may encode and broadcast barrier states
+  to bounded client transport. They must not execute hot-update scripts, manage
+  client connections, add blocking IO, or hide unbounded notification buffers.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded
   command buffers on hot paths.
 - Gateway/session primitives must remain low-level and bounded: session tables,
