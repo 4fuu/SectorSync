@@ -19,8 +19,8 @@
   runtime replication transport send/receive bridges, AOI-to-frame downlink
   flow, or client replication transport integration.
 - Use `cargo run -p sectorsync-bench --example client_bridge` when changing
-  low-level client command send, ACK/replication/barrier receive pumping, or
-  client-bound frame validation.
+  low-level client command send, gateway client command transport, ACK,
+  replication, or barrier receive pumping, or client-bound frame validation.
 - Use `cargo run -p sectorsync-bench --example barrier_transport` when changing
   runtime barrier controllers, client barrier notifications, or
   pause/freeze/resume transport integration.
@@ -71,7 +71,7 @@
 ## Project Boundary
 
 SectorSync is a high-performance embedded Rust library for spatial real-time
-entity replication. It is not a full game server framework.
+entity replication. It is not a game engine or a full game server framework.
 
 The core library owns:
 
@@ -122,6 +122,12 @@ The core library does not own:
   metadata admission, enqueue into bounded station command queues, and encode
   ACKs. They must not perform game-rule validation, anti-cheat decisions,
   account auth, reconnect loops, NAT traversal, blocking network IO, or
+  unbounded buffering.
+- Gateway client command transport bridges may pump bounded client packets into
+  the gateway command pipeline, validate packet source metadata against decoded
+  command frames, and return produced ACK bytes through client packet transport.
+  They must not perform account auth, anti-cheat, game-rule validation,
+  reconnect loops, NAT traversal, service discovery, blocking network IO, or
   unbounded buffering.
 - Gateway-to-deployment dispatch may resolve admitted command routes into node
   delivery metadata and return stamped command envelopes for external

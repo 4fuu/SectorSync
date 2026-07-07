@@ -1303,28 +1303,72 @@ impl GatewayCommandPipeline {
         now: Tick,
         ingress: CommandIngress,
     ) -> GatewayCommandPipelineReport {
+        let command_frame = match self.decode_command_frame(input) {
+            Ok(command_frame) => command_frame,
+            Err(error) => {
+                return GatewayCommandPipelineReport {
+                    error: Some(error),
+                    ..GatewayCommandPipelineReport::default()
+                };
+            }
+        };
+
+        self.process_command_frame(gateway, station_queues, command_frame, now, ingress)
+    }
+
+    /// Decodes and admits one command packet, then resolves a deployment route
+    /// for external node dispatch without touching local station queues.
+    pub fn dispatch(
+        &mut self,
+        gateway: &mut GatewaySessionTable,
+        deployment: &DeploymentRouteTable,
+        input: &[u8],
+        now: Tick,
+    ) -> GatewayCommandPipelineReport {
+        let command_frame = match self.decode_command_frame(input) {
+            Ok(command_frame) => command_frame,
+            Err(error) => {
+                return GatewayCommandPipelineReport {
+                    error: Some(error),
+                    ..GatewayCommandPipelineReport::default()
+                };
+            }
+        };
+
+        self.dispatch_command_frame(gateway, deployment, command_frame, now)
+    }
+
+    fn decode_command_frame(
+        &mut self,
+        input: &[u8],
+    ) -> Result<CommandFrame, GatewayCommandPipelineError> {
         let frame = match self.decoder.decode(input) {
             Ok(frame) => frame,
             Err(error) => {
                 self.stats.frames_rejected_decode =
                     self.stats.frames_rejected_decode.saturating_add(1);
-                return GatewayCommandPipelineReport {
-                    error: Some(GatewayCommandPipelineError::Decode(error)),
-                    ..GatewayCommandPipelineReport::default()
-                };
+                return Err(GatewayCommandPipelineError::Decode(error));
             }
         };
 
         let RuntimeFrame::Command(command_frame) = frame else {
             self.stats.frames_rejected_non_command =
                 self.stats.frames_rejected_non_command.saturating_add(1);
-            return GatewayCommandPipelineReport {
-                error: Some(GatewayCommandPipelineError::NonCommandFrame),
-                ..GatewayCommandPipelineReport::default()
-            };
+            return Err(GatewayCommandPipelineError::NonCommandFrame);
         };
         self.stats.command_frames_decoded = self.stats.command_frames_decoded.saturating_add(1);
 
+        Ok(command_frame)
+    }
+
+    fn process_command_frame(
+        &mut self,
+        gateway: &mut GatewaySessionTable,
+        station_queues: &mut BTreeMap<StationId, CommandQueues>,
+        command_frame: CommandFrame,
+        now: Tick,
+        ingress: CommandIngress,
+    ) -> GatewayCommandPipelineReport {
         let client_id = command_frame.client_id;
         let command_id = command_frame.command_id;
         let command = command_frame.into_envelope(now);
@@ -1378,37 +1422,13 @@ impl GatewayCommandPipeline {
         self.accepted_report(client_id, command_id, station_id, now)
     }
 
-    /// Decodes and admits one command packet, then resolves a deployment route
-    /// for external node dispatch without touching local station queues.
-    pub fn dispatch(
+    fn dispatch_command_frame(
         &mut self,
         gateway: &mut GatewaySessionTable,
         deployment: &DeploymentRouteTable,
-        input: &[u8],
+        command_frame: CommandFrame,
         now: Tick,
     ) -> GatewayCommandPipelineReport {
-        let frame = match self.decoder.decode(input) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.stats.frames_rejected_decode =
-                    self.stats.frames_rejected_decode.saturating_add(1);
-                return GatewayCommandPipelineReport {
-                    error: Some(GatewayCommandPipelineError::Decode(error)),
-                    ..GatewayCommandPipelineReport::default()
-                };
-            }
-        };
-
-        let RuntimeFrame::Command(command_frame) = frame else {
-            self.stats.frames_rejected_non_command =
-                self.stats.frames_rejected_non_command.saturating_add(1);
-            return GatewayCommandPipelineReport {
-                error: Some(GatewayCommandPipelineError::NonCommandFrame),
-                ..GatewayCommandPipelineReport::default()
-            };
-        };
-        self.stats.command_frames_decoded = self.stats.command_frames_decoded.saturating_add(1);
-
         let client_id = command_frame.client_id;
         let command_id = command_frame.command_id;
         let command = command_frame.into_envelope(now);
@@ -1618,6 +1638,229 @@ const fn queue_reject_reason_code(error: CommandQueueError) -> u16 {
     match error {
         CommandQueueError::QueueFull(_) => GATEWAY_COMMAND_ACK_QUEUE_FULL,
         CommandQueueError::RejectedByBarrier(_) => GATEWAY_COMMAND_ACK_BARRIER_REJECTED,
+    }
+}
+
+/// Gateway-side client command transport bridge statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GatewayClientTransportStats {
+    /// Client packets consumed from transport.
+    pub packets_received: usize,
+    /// Client packet bytes consumed from transport.
+    pub bytes_received: usize,
+    /// Command frames decoded from client packets.
+    pub command_frames_received: usize,
+    /// Packets rejected because transport source and command client differed.
+    pub source_mismatches: usize,
+    /// Commands accepted by the gateway command pipeline.
+    pub commands_accepted: usize,
+    /// Commands rejected by the gateway command pipeline.
+    pub commands_rejected: usize,
+    /// Command ACK frames submitted to client transport.
+    pub acks_sent: usize,
+    /// Command ACK bytes submitted to client transport.
+    pub ack_bytes_sent: usize,
+}
+
+/// Result of pumping gateway-side client command packets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayClientTransportPump {
+    /// Client packets consumed from transport.
+    pub packets_received: usize,
+    /// Client packet bytes consumed from transport.
+    pub bytes_received: usize,
+    /// Gateway pipeline reports produced from accepted or rejected commands.
+    pub reports: Vec<GatewayCommandPipelineReport>,
+    /// Command ACK frames submitted to client transport.
+    pub acks_sent: usize,
+    /// Command ACK bytes submitted to client transport.
+    pub ack_bytes_sent: usize,
+}
+
+impl GatewayClientTransportPump {
+    /// Returns processed command count.
+    pub fn commands_processed(&self) -> usize {
+        self.reports.len()
+    }
+
+    /// Returns accepted command count.
+    pub fn commands_accepted(&self) -> usize {
+        self.reports.iter().filter(|report| report.accepted).count()
+    }
+
+    /// Returns rejected command count.
+    pub fn commands_rejected(&self) -> usize {
+        self.reports
+            .iter()
+            .filter(|report| !report.accepted)
+            .count()
+    }
+}
+
+/// Error produced while pumping gateway-side client command packets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GatewayClientTransportError<E> {
+    /// Underlying client transport failed while receiving or ACKing.
+    Transport(E),
+    /// Wire decoding failed.
+    Decode(BinaryDecodeError),
+    /// Packet decoded as a non-command frame.
+    NonCommandFrame,
+    /// Transport source client and command frame client disagreed.
+    SourceMismatch {
+        /// Client identified by the transport.
+        packet_client_id: ClientId,
+        /// Client encoded inside the command frame.
+        frame_client_id: ClientId,
+    },
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for GatewayClientTransportError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::NonCommandFrame => f.write_str("gateway client transport expected command frame"),
+            Self::SourceMismatch {
+                packet_client_id,
+                frame_client_id,
+            } => write!(
+                f,
+                "gateway client source mismatch: packet {}, frame {}",
+                packet_client_id.get(),
+                frame_client_id.get()
+            ),
+        }
+    }
+}
+
+impl<E> std::error::Error for GatewayClientTransportError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::NonCommandFrame | Self::SourceMismatch { .. } => None,
+        }
+    }
+}
+
+/// Low-level bridge from client packet transport into the gateway command pipeline.
+#[derive(Clone, Debug, Default)]
+pub struct GatewayClientTransportBridge {
+    stats: GatewayClientTransportStats,
+}
+
+impl GatewayClientTransportBridge {
+    /// Creates a gateway client transport bridge.
+    pub const fn new() -> Self {
+        Self {
+            stats: GatewayClientTransportStats {
+                packets_received: 0,
+                bytes_received: 0,
+                command_frames_received: 0,
+                source_mismatches: 0,
+                commands_accepted: 0,
+                commands_rejected: 0,
+                acks_sent: 0,
+                ack_bytes_sent: 0,
+            },
+        }
+    }
+
+    /// Returns accumulated statistics.
+    pub const fn stats(&self) -> GatewayClientTransportStats {
+        self.stats
+    }
+
+    /// Pumps up to `max_packets` client command packets into station queues and
+    /// sends produced ACKs back through the same bounded client transport.
+    pub fn pump_ingress<T, E>(
+        &mut self,
+        transport: &mut T,
+        pipeline: &mut GatewayCommandPipeline,
+        gateway: &mut GatewaySessionTable,
+        station_queues: &mut BTreeMap<StationId, CommandQueues>,
+        now: Tick,
+        ingress: CommandIngress,
+        max_packets: usize,
+    ) -> Result<GatewayClientTransportPump, GatewayClientTransportError<E>>
+    where
+        T: TransportReceiver<Error = E> + TransportSink<Error = E>,
+    {
+        let mut pump = GatewayClientTransportPump::default();
+        for _ in 0..max_packets {
+            let Some(packet) = transport
+                .try_recv()
+                .map_err(GatewayClientTransportError::Transport)?
+            else {
+                break;
+            };
+            self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+            self.stats.bytes_received =
+                self.stats.bytes_received.saturating_add(packet.bytes.len());
+            pump.packets_received = pump.packets_received.saturating_add(1);
+            pump.bytes_received = pump.bytes_received.saturating_add(packet.bytes.len());
+
+            let command_frame = match pipeline.decode_command_frame(&packet.bytes) {
+                Ok(command_frame) => command_frame,
+                Err(GatewayCommandPipelineError::Decode(error)) => {
+                    return Err(GatewayClientTransportError::Decode(error));
+                }
+                Err(GatewayCommandPipelineError::NonCommandFrame) => {
+                    return Err(GatewayClientTransportError::NonCommandFrame);
+                }
+                Err(error) => {
+                    unreachable!(
+                        "decode_command_frame only returns decode/non-command errors: {error}"
+                    );
+                }
+            };
+            self.stats.command_frames_received =
+                self.stats.command_frames_received.saturating_add(1);
+
+            if let Some(packet_client_id) = packet.client_id {
+                if packet_client_id != command_frame.client_id {
+                    self.stats.source_mismatches = self.stats.source_mismatches.saturating_add(1);
+                    return Err(GatewayClientTransportError::SourceMismatch {
+                        packet_client_id,
+                        frame_client_id: command_frame.client_id,
+                    });
+                }
+            }
+
+            let ack_client_id = command_frame.client_id;
+            let report = pipeline.process_command_frame(
+                gateway,
+                station_queues,
+                command_frame,
+                now,
+                ingress,
+            );
+            if report.accepted {
+                self.stats.commands_accepted = self.stats.commands_accepted.saturating_add(1);
+            } else {
+                self.stats.commands_rejected = self.stats.commands_rejected.saturating_add(1);
+            }
+
+            if let Some(bytes) = &report.ack_bytes {
+                let ack_len = bytes.len();
+                transport
+                    .send(OutboundPacket {
+                        client_id: ack_client_id,
+                        bytes: bytes.clone(),
+                    })
+                    .map_err(GatewayClientTransportError::Transport)?;
+                self.stats.acks_sent = self.stats.acks_sent.saturating_add(1);
+                self.stats.ack_bytes_sent = self.stats.ack_bytes_sent.saturating_add(ack_len);
+                pump.acks_sent = pump.acks_sent.saturating_add(1);
+                pump.ack_bytes_sent = pump.ack_bytes_sent.saturating_add(ack_len);
+            }
+            pump.reports.push(report);
+        }
+        Ok(pump)
     }
 }
 
@@ -3881,6 +4124,158 @@ mod tests {
         assert_eq!(bridge.stats().packets_received, 1);
         assert_eq!(bridge.stats().command_acks_received, 0);
         assert_eq!(bridge.stats().frames_rejected_target, 1);
+    }
+
+    #[test]
+    fn gateway_client_transport_bridge_queues_command_and_sends_ack() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let station_id = StationId::new(1);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 8,
+            max_packet_bytes: 512,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, "127.0.0.1:23507".parse().expect("client addr"))
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23500".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let mut client_bridge = ClientTransportBridge::new(
+            ClientTransportConfig::new(client_id, server_id).with_expected_source(server_id),
+        );
+        let command = CommandFrame {
+            client_id,
+            command_id: CommandId::new(42),
+            entity_id: EntityId::new(100),
+            sequence: 9,
+            kind: 1,
+            priority: CommandPriority::High,
+            payload: b"move:north".to_vec(),
+        };
+        client_bridge
+            .send_command_frame(&mut client_transport, &command)
+            .expect("client command should send");
+
+        let mut gateway = gateway(4);
+        gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let mut station_queues = BTreeMap::from([(station_id, command_queues())]);
+        let mut pipeline = GatewayCommandPipeline::default();
+        let mut gateway_bridge = GatewayClientTransportBridge::default();
+
+        let pump = gateway_bridge
+            .pump_ingress(
+                &mut server_transport,
+                &mut pipeline,
+                &mut gateway,
+                &mut station_queues,
+                Tick::new(10),
+                CommandIngress::RUNNING,
+                4,
+            )
+            .expect("gateway client transport should pump");
+
+        assert_eq!(pump.packets_received, 1);
+        assert_eq!(pump.commands_processed(), 1);
+        assert_eq!(pump.commands_accepted(), 1);
+        assert_eq!(pump.acks_sent, 1);
+        assert_eq!(gateway_bridge.stats().packets_received, 1);
+        assert_eq!(gateway_bridge.stats().command_frames_received, 1);
+        assert_eq!(gateway_bridge.stats().commands_accepted, 1);
+        assert_eq!(gateway_bridge.stats().acks_sent, 1);
+        let queued = station_queues
+            .get_mut(&station_id)
+            .expect("station queue should exist")
+            .pop_next()
+            .expect("command should queue");
+        assert_eq!(queued.id, command.command_id);
+
+        let ack_pump = client_bridge
+            .pump(&mut client_transport, 4)
+            .expect("client should receive ACK");
+        assert_eq!(ack_pump.command_acks_received(), 1);
+        assert!(ack_pump.command_acks[0].accepted);
+        assert_eq!(ack_pump.command_acks[0].command_id, command.command_id);
+    }
+
+    #[test]
+    fn gateway_client_transport_bridge_rejects_source_mismatch_before_admission() {
+        let packet_client_id = ClientId::new(7);
+        let frame_client_id = ClientId::new(8);
+        let server_id = ClientId::new(0);
+        let station_id = StationId::new(1);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 4,
+            max_packet_bytes: 512,
+        });
+        let mut packet_client_transport = hub
+            .endpoint(
+                packet_client_id,
+                "127.0.0.1:23607".parse().expect("client addr"),
+            )
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23600".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let command = CommandFrame {
+            client_id: frame_client_id,
+            command_id: CommandId::new(42),
+            entity_id: EntityId::new(100),
+            sequence: 9,
+            kind: 1,
+            priority: CommandPriority::High,
+            payload: b"move:north".to_vec(),
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_command(&command, &mut bytes)
+            .expect("command should encode");
+        packet_client_transport
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes,
+            })
+            .expect("packet should send");
+
+        let mut gateway = gateway(4);
+        gateway
+            .connect(frame_client_id, station_id, Tick::new(10))
+            .expect("frame client should connect");
+        let mut station_queues = BTreeMap::from([(station_id, command_queues())]);
+        let mut pipeline = GatewayCommandPipeline::default();
+        let mut gateway_bridge = GatewayClientTransportBridge::default();
+
+        let error = gateway_bridge
+            .pump_ingress(
+                &mut server_transport,
+                &mut pipeline,
+                &mut gateway,
+                &mut station_queues,
+                Tick::new(10),
+                CommandIngress::RUNNING,
+                4,
+            )
+            .expect_err("source mismatch should reject before admission");
+
+        assert!(matches!(
+            error,
+            GatewayClientTransportError::SourceMismatch {
+                packet_client_id: actual_packet,
+                frame_client_id: actual_frame,
+            } if actual_packet == packet_client_id && actual_frame == frame_client_id
+        ));
+        assert_eq!(gateway_bridge.stats().source_mismatches, 1);
+        assert_eq!(gateway_bridge.stats().commands_accepted, 0);
+        assert_eq!(pipeline.stats().commands_admitted, 0);
+        assert_eq!(
+            station_queues
+                .get(&station_id)
+                .expect("station queue should exist")
+                .total_len(),
+            0
+        );
     }
 
     #[test]

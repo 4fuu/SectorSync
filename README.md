@@ -8,11 +8,11 @@ spatial ownership, low-latency command application, range/frustum culling,
 interest management, adaptive update rates, hotspot splitting, and cross-station
 event routing.
 
-SectorSync is not a full game server framework. It does not own combat,
-inventory, quests, economy, persistence, deployment, service discovery, or
-crash recovery. Game-specific systems are expected to integrate through
-station-local APIs, command/event hooks, custom components, and external
-transport/routing adapters.
+SectorSync is not a game engine or a full game server framework. It does not
+own combat, inventory, quests, economy, persistence, deployment, service
+discovery, or crash recovery. Game-specific systems are expected to integrate
+through station-local APIs, command/event hooks, custom components, and
+external transport/routing adapters.
 
 ## Core Direction
 
@@ -90,8 +90,8 @@ Current crates:
   router, bounded station event and command dispatch transport bridges, a
   bounded client replication send/receive transport bridge, a low-level client
   command/inbound-frame transport bridge, a runtime barrier notification
-  transport bridge, a business-agnostic gateway command pipeline, and a simple
-  station scheduler.
+  transport bridge, a bounded gateway client command transport bridge, a
+  business-agnostic gateway command pipeline, and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -190,6 +190,11 @@ Initial status:
   gateway/session metadata admission, queues accepted commands into target
   station queues, and encodes command ACKs for accepted or rejected commands
   without interpreting game payloads.
+- Runtime gateway client command transport bridge pumps bounded client command
+  packets into the gateway command pipeline, validates transport source metadata
+  against the command frame client id, and sends produced ACKs back through
+  client packet transport without owning sockets, reconnects, auth, or game
+  validation.
 - Deployment routing can resolve a connected gateway client's station route into
   node delivery metadata, including gateway/station/node route epochs. Runtime
   gateway command dispatch can return a stamped command envelope plus a
@@ -289,8 +294,9 @@ Initial status:
   bounded in-memory client transport send, receive, source/target validation,
   and decode.
 - `cargo run -p sectorsync-bench --example client_bridge` demonstrates a
-  low-level client SDK path: command frame send, gateway ACK return, replication
-  downlink, and client-bound frame pumping through bounded in-memory transport.
+  low-level client/gateway SDK path: command frame send, gateway transport
+  pump, ACK return, replication downlink, and client-bound frame pumping through
+  bounded in-memory transport.
 - `cargo run -p sectorsync-bench --example barrier_transport` demonstrates a
   runtime barrier freeze/snapshot/resume flow that sends Frozen and Running
   notifications through bounded client transport and receives them with the

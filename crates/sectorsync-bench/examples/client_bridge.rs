@@ -11,11 +11,9 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, GATEWAY_COMMAND_ACK_ACCEPTED,
-    GatewayCommandPipeline, ReplicationTransportBridge,
+    GatewayClientTransportBridge, GatewayCommandPipeline, ReplicationTransportBridge,
 };
-use sectorsync_transport::{
-    ClientTransportLimits, InMemoryTransportHub, OutboundPacket, TransportReceiver, TransportSink,
-};
+use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub};
 use sectorsync_wire::{CommandFrame, ComponentSelection};
 
 fn main() {
@@ -49,12 +47,6 @@ fn main() {
         .send_command_frame(&mut client_transport, &command)
         .expect("client command should send");
 
-    let inbound_command = server_transport
-        .try_recv()
-        .expect("server receive should work")
-        .expect("command packet should arrive");
-    assert_eq!(inbound_command.client_id, Some(client_id));
-
     let mut gateway = GatewaySessionTable::new(GatewayConfig {
         max_sessions: 8,
         reconnect_grace_ticks: 20,
@@ -76,21 +68,21 @@ fn main() {
         }),
     )]);
     let mut gateway_pipeline = GatewayCommandPipeline::default();
-    let ingress = gateway_pipeline.process(
-        &mut gateway,
-        &mut station_queues,
-        &inbound_command.bytes,
-        sectorsync_core::prelude::Tick::new(10),
-        CommandIngress::RUNNING,
-    );
-    assert!(ingress.accepted);
-    assert_eq!(ingress.reason_code, GATEWAY_COMMAND_ACK_ACCEPTED);
-    server_transport
-        .send(OutboundPacket {
-            client_id,
-            bytes: ingress.ack_bytes.expect("accepted ACK should exist"),
-        })
-        .expect("ACK should send");
+    let mut gateway_transport = GatewayClientTransportBridge::default();
+    let ingress = gateway_transport
+        .pump_ingress(
+            &mut server_transport,
+            &mut gateway_pipeline,
+            &mut gateway,
+            &mut station_queues,
+            sectorsync_core::prelude::Tick::new(10),
+            CommandIngress::RUNNING,
+            4,
+        )
+        .expect("gateway transport should pump command");
+    assert_eq!(ingress.commands_accepted(), 1);
+    assert_eq!(ingress.acks_sent, 1);
+    assert_eq!(ingress.reports[0].reason_code, GATEWAY_COMMAND_ACK_ACCEPTED);
     let applied = station_queues
         .get_mut(&station_id)
         .expect("station queue should exist")
