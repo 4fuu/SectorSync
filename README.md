@@ -266,10 +266,11 @@ Initial status:
   explicit skip counters for tuning.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
-  gateway/deployment command dispatch transport counts, command latency in
-  ticks, max queue depth, payload entity/component delta counts, tick timing
-  estimates, host parallelism, default resource guard limits, threshold checks,
-  and an aggregate `benchmark_ok` verdict.
+  gateway/deployment command dispatch transport counts, low-level client bridge
+  command/ACK/replication roundtrip counts, command latency in ticks, max queue
+  depth, payload entity/component delta counts, tick timing estimates, host
+  parallelism, default resource guard limits, threshold checks, and an
+  aggregate `benchmark_ok` verdict.
 - `cargo run -p sectorsync-bench --example sdk_flow` demonstrates an
   end-to-end embeddable SDK path: station, cell index, component store,
   replication plan, frame builder, binary codec, and fake transport.

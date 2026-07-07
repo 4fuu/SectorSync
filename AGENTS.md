@@ -13,7 +13,8 @@
 - Default Rust verification should start with `cargo test --workspace`.
 - Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
   benchmark smoke test, including the lightweight gateway/deployment command
-  dispatch transport workload.
+  dispatch transport workload and bounded low-level client bridge roundtrip
+  workload.
 - Use `cargo run -p sectorsync-bench --example replication_bridge` when changing
   runtime replication transport send/receive bridges, AOI-to-frame downlink
   flow, or client replication transport integration.
