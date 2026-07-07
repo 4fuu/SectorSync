@@ -8,7 +8,7 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 
-use sectorsync_core::prelude::{ClientId, StationId};
+use sectorsync_core::prelude::{ClientId, StationId, Tick};
 
 /// Default maximum UDP datagram bytes read by `UdpTransport`.
 pub const DEFAULT_UDP_RECV_BUFFER_SIZE: usize = 16 * 1024;
@@ -168,6 +168,8 @@ pub const DEFAULT_PACKET_SECURITY_MAX_PAYLOAD_BYTES: usize =
 pub const DEFAULT_PACKET_SECURITY_MAX_TAG_BYTES: usize = 128;
 /// Default replay history retained per security box.
 pub const DEFAULT_PACKET_SECURITY_REPLAY_HISTORY: usize = 4096;
+/// Default maximum packet keys tracked by one key ring.
+pub const DEFAULT_PACKET_KEY_RING_MAX_KEYS: usize = 32;
 
 /// Packet security framing configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +189,353 @@ impl Default for PacketSecurityConfig {
             max_tag_bytes: DEFAULT_PACKET_SECURITY_MAX_TAG_BYTES,
             max_replay_history: DEFAULT_PACKET_SECURITY_REPLAY_HISTORY,
         }
+    }
+}
+
+/// Packet key lifecycle state tracked by SectorSync metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketKeyState {
+    /// Key can be used for sending and receiving packets.
+    Active,
+    /// Key is accepted for receiving old packets but is not selected for send.
+    Retiring,
+    /// Key is explicitly rejected.
+    Revoked,
+}
+
+impl PacketKeyState {
+    fn can_send(self) -> bool {
+        self == Self::Active
+    }
+
+    fn can_accept(self) -> bool {
+        matches!(self, Self::Active | Self::Retiring)
+    }
+}
+
+/// Metadata for one externally managed packet security key.
+///
+/// SectorSync never stores secret material. The descriptor only lets hot-path
+/// packet helpers choose send keys and reject stale receive keys deterministically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketKeyDescriptor {
+    /// External key identifier carried in packet security envelopes.
+    pub key_id: u32,
+    /// Current lifecycle state.
+    pub state: PacketKeyState,
+    /// Tick at which the embedding system created/imported the key metadata.
+    pub created_at: Tick,
+    /// First tick at which this key may be used or accepted.
+    pub activated_at: Tick,
+    /// Tick at which the key began retiring, if known.
+    pub retires_at: Option<Tick>,
+    /// First tick at which this key must be rejected and can be removed.
+    pub expires_at: Option<Tick>,
+    /// Higher values win when multiple active keys are eligible for send.
+    pub send_priority: u32,
+}
+
+impl PacketKeyDescriptor {
+    /// Creates active key metadata.
+    pub const fn active(key_id: u32, now: Tick, send_priority: u32) -> Self {
+        Self {
+            key_id,
+            state: PacketKeyState::Active,
+            created_at: now,
+            activated_at: now,
+            retires_at: None,
+            expires_at: None,
+            send_priority,
+        }
+    }
+
+    /// Returns a copy with an expiration tick.
+    pub const fn with_expiry(mut self, expires_at: Tick) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Returns whether the key is active for sending at `now`.
+    pub fn is_send_eligible(self, now: Tick) -> bool {
+        self.state.can_send() && self.is_activated_at(now) && !self.is_expired_at(now)
+    }
+
+    /// Returns whether the key is accepted for receiving at `now`.
+    pub fn is_accept_eligible(self, now: Tick) -> bool {
+        self.state.can_accept() && self.is_activated_at(now) && !self.is_expired_at(now)
+    }
+
+    fn is_activated_at(self, now: Tick) -> bool {
+        now >= self.activated_at
+    }
+
+    fn is_expired_at(self, now: Tick) -> bool {
+        self.expires_at
+            .map(|expires_at| now >= expires_at)
+            .unwrap_or(false)
+    }
+}
+
+/// Packet key ring configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketKeyRingConfig {
+    /// Maximum key metadata records retained in the ring.
+    pub max_keys: usize,
+}
+
+impl Default for PacketKeyRingConfig {
+    fn default() -> Self {
+        Self {
+            max_keys: DEFAULT_PACKET_KEY_RING_MAX_KEYS,
+        }
+    }
+}
+
+/// Packet key ring maintenance statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketKeyRingStats {
+    /// Key descriptors inserted.
+    pub keys_inserted: usize,
+    /// Key descriptors activated.
+    pub keys_activated: usize,
+    /// Key descriptors moved to receive-only retirement.
+    pub keys_retired: usize,
+    /// Key descriptors revoked.
+    pub keys_revoked: usize,
+    /// Expired key descriptors removed.
+    pub keys_expired_removed: usize,
+}
+
+/// Packet key ring policy error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketKeyRingError {
+    /// The configured key metadata capacity is full.
+    CapacityFull {
+        /// Configured capacity.
+        capacity: usize,
+    },
+    /// Key id already exists.
+    DuplicateKey(u32),
+    /// Key id is not known.
+    MissingKey(u32),
+    /// No active, non-expired key can be selected for send.
+    NoSendKey,
+    /// Key cannot be used for sending.
+    KeyNotSendable {
+        /// Key id.
+        key_id: u32,
+        /// Current lifecycle state.
+        state: PacketKeyState,
+    },
+    /// Key cannot be accepted for receiving.
+    KeyNotAccepted {
+        /// Key id.
+        key_id: u32,
+        /// Current lifecycle state.
+        state: PacketKeyState,
+    },
+}
+
+impl core::fmt::Display for PacketKeyRingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::CapacityFull { capacity } => {
+                write!(f, "packet key ring capacity full: capacity {capacity}")
+            }
+            Self::DuplicateKey(key_id) => write!(f, "packet key {key_id} already exists"),
+            Self::MissingKey(key_id) => write!(f, "packet key {key_id} is missing"),
+            Self::NoSendKey => f.write_str("no packet key is eligible for send"),
+            Self::KeyNotSendable { key_id, state } => {
+                write!(f, "packet key {key_id} is not sendable in state {state:?}")
+            }
+            Self::KeyNotAccepted { key_id, state } => {
+                write!(f, "packet key {key_id} is not accepted in state {state:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PacketKeyRingError {}
+
+/// Bounded packet key lifecycle metadata.
+#[derive(Clone, Debug)]
+pub struct PacketKeyRing {
+    config: PacketKeyRingConfig,
+    keys: BTreeMap<u32, PacketKeyDescriptor>,
+    stats: PacketKeyRingStats,
+}
+
+impl PacketKeyRing {
+    /// Creates an empty key ring.
+    pub fn new(config: PacketKeyRingConfig) -> Self {
+        Self {
+            config,
+            keys: BTreeMap::new(),
+            stats: PacketKeyRingStats::default(),
+        }
+    }
+
+    /// Creates an empty key ring with default limits.
+    pub fn with_defaults() -> Self {
+        Self::new(PacketKeyRingConfig::default())
+    }
+
+    /// Returns configuration.
+    pub const fn config(&self) -> PacketKeyRingConfig {
+        self.config
+    }
+
+    /// Returns key metadata count.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Returns whether the ring has no key metadata.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Returns statistics.
+    pub const fn stats(&self) -> PacketKeyRingStats {
+        self.stats
+    }
+
+    /// Returns one key descriptor.
+    pub fn get(&self, key_id: u32) -> Option<PacketKeyDescriptor> {
+        self.keys.get(&key_id).copied()
+    }
+
+    /// Iterates key descriptors in key-id order.
+    pub fn iter(&self) -> impl Iterator<Item = &PacketKeyDescriptor> {
+        self.keys.values()
+    }
+
+    /// Inserts a descriptor if capacity and uniqueness allow it.
+    pub fn insert(&mut self, descriptor: PacketKeyDescriptor) -> Result<(), PacketKeyRingError> {
+        if self.keys.contains_key(&descriptor.key_id) {
+            return Err(PacketKeyRingError::DuplicateKey(descriptor.key_id));
+        }
+        if self.keys.len() >= self.config.max_keys {
+            return Err(PacketKeyRingError::CapacityFull {
+                capacity: self.config.max_keys,
+            });
+        }
+        self.keys.insert(descriptor.key_id, descriptor);
+        self.stats.keys_inserted = self.stats.keys_inserted.saturating_add(1);
+        Ok(())
+    }
+
+    /// Inserts active key metadata.
+    pub fn insert_active(
+        &mut self,
+        key_id: u32,
+        now: Tick,
+        send_priority: u32,
+    ) -> Result<(), PacketKeyRingError> {
+        self.insert(PacketKeyDescriptor::active(key_id, now, send_priority))
+    }
+
+    /// Marks a key active and send-eligible from `activated_at`.
+    pub fn activate(&mut self, key_id: u32, activated_at: Tick) -> Result<(), PacketKeyRingError> {
+        let descriptor = self
+            .keys
+            .get_mut(&key_id)
+            .ok_or(PacketKeyRingError::MissingKey(key_id))?;
+        descriptor.state = PacketKeyState::Active;
+        descriptor.activated_at = activated_at;
+        descriptor.retires_at = None;
+        self.stats.keys_activated = self.stats.keys_activated.saturating_add(1);
+        Ok(())
+    }
+
+    /// Marks a key receive-only for retirement.
+    pub fn retire(&mut self, key_id: u32, retires_at: Tick) -> Result<(), PacketKeyRingError> {
+        let descriptor = self
+            .keys
+            .get_mut(&key_id)
+            .ok_or(PacketKeyRingError::MissingKey(key_id))?;
+        descriptor.state = PacketKeyState::Retiring;
+        descriptor.retires_at = Some(retires_at);
+        self.stats.keys_retired = self.stats.keys_retired.saturating_add(1);
+        Ok(())
+    }
+
+    /// Marks a key rejected.
+    pub fn revoke(&mut self, key_id: u32) -> Result<(), PacketKeyRingError> {
+        let descriptor = self
+            .keys
+            .get_mut(&key_id)
+            .ok_or(PacketKeyRingError::MissingKey(key_id))?;
+        descriptor.state = PacketKeyState::Revoked;
+        self.stats.keys_revoked = self.stats.keys_revoked.saturating_add(1);
+        Ok(())
+    }
+
+    /// Updates the expiration tick for one key.
+    pub fn set_expiry(
+        &mut self,
+        key_id: u32,
+        expires_at: Option<Tick>,
+    ) -> Result<(), PacketKeyRingError> {
+        let descriptor = self
+            .keys
+            .get_mut(&key_id)
+            .ok_or(PacketKeyRingError::MissingKey(key_id))?;
+        descriptor.expires_at = expires_at;
+        Ok(())
+    }
+
+    /// Removes expired descriptors and returns the removed count.
+    pub fn remove_expired(&mut self, now: Tick) -> usize {
+        let before = self.keys.len();
+        self.keys
+            .retain(|_, descriptor| !descriptor.is_expired_at(now));
+        let removed = before.saturating_sub(self.keys.len());
+        self.stats.keys_expired_removed = self.stats.keys_expired_removed.saturating_add(removed);
+        removed
+    }
+
+    /// Selects the best active key for sending at `now`.
+    pub fn select_send_key(&self, now: Tick) -> Result<PacketKeyDescriptor, PacketKeyRingError> {
+        self.keys
+            .values()
+            .copied()
+            .filter(|descriptor| descriptor.is_send_eligible(now))
+            .max_by_key(|descriptor| {
+                (
+                    descriptor.send_priority,
+                    descriptor.activated_at,
+                    descriptor.key_id,
+                )
+            })
+            .ok_or(PacketKeyRingError::NoSendKey)
+    }
+
+    /// Checks that `key_id` is accepted for receiving at `now`.
+    pub fn accept_key(
+        &self,
+        key_id: u32,
+        now: Tick,
+    ) -> Result<PacketKeyDescriptor, PacketKeyRingError> {
+        let descriptor = self
+            .keys
+            .get(&key_id)
+            .copied()
+            .ok_or(PacketKeyRingError::MissingKey(key_id))?;
+        if descriptor.is_accept_eligible(now) {
+            Ok(descriptor)
+        } else {
+            Err(PacketKeyRingError::KeyNotAccepted {
+                key_id,
+                state: descriptor.state,
+            })
+        }
+    }
+}
+
+impl Default for PacketKeyRing {
+    fn default() -> Self {
+        Self::with_defaults()
     }
 }
 
@@ -507,6 +856,8 @@ pub struct PacketSecurityStats {
     pub sealed: usize,
     /// Packets opened.
     pub opened: usize,
+    /// Packets rejected by key lifecycle policy.
+    pub key_rejected: usize,
     /// Packets rejected because authentication failed.
     pub auth_failed: usize,
     /// Packets rejected because the nonce was replayed.
@@ -524,6 +875,8 @@ pub enum PacketSecurityError<A, C> {
     Authenticator(A),
     /// Cipher failed.
     Cipher(C),
+    /// Key lifecycle policy rejected the packet or send attempt.
+    Key(PacketKeyRingError),
     /// Authenticator returned false.
     AuthenticationFailed {
         /// Key id.
@@ -549,6 +902,7 @@ impl<A: core::fmt::Display, C: core::fmt::Display> core::fmt::Display
             Self::Decode(error) => write!(f, "{error}"),
             Self::Authenticator(error) => write!(f, "{error}"),
             Self::Cipher(error) => write!(f, "{error}"),
+            Self::Key(error) => write!(f, "{error}"),
             Self::AuthenticationFailed { key_id, nonce } => write!(
                 f,
                 "packet authentication failed for key {key_id} nonce {nonce}"
@@ -571,6 +925,7 @@ where
             Self::Decode(error) => Some(error),
             Self::Authenticator(error) => Some(error),
             Self::Cipher(error) => Some(error),
+            Self::Key(error) => Some(error),
             Self::AuthenticationFailed { .. } | Self::Replay { .. } => None,
         }
     }
@@ -637,6 +992,19 @@ where
         self.seal_with_nonce(key_id, nonce, payload)
     }
 
+    /// Selects a send key from `key_ring`, then seals and encodes one payload.
+    pub fn seal_with_key_ring(
+        &mut self,
+        key_ring: &PacketKeyRing,
+        payload: &[u8],
+        now: Tick,
+    ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        let descriptor = key_ring
+            .select_send_key(now)
+            .map_err(PacketSecurityError::Key)?;
+        self.seal(descriptor.key_id, payload)
+    }
+
     /// Seals and encodes one payload with an explicit nonce.
     pub fn seal_with_nonce(
         &mut self,
@@ -685,6 +1053,29 @@ where
     ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
         let envelope = PacketSecurityEnvelope::decode(self.config, input)
             .map_err(PacketSecurityError::Decode)?;
+        self.open_decoded(envelope)
+    }
+
+    /// Decodes an envelope, validates its key against `key_ring`, then opens it.
+    pub fn open_with_key_ring(
+        &mut self,
+        key_ring: &PacketKeyRing,
+        input: &[u8],
+        now: Tick,
+    ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        let envelope = PacketSecurityEnvelope::decode(self.config, input)
+            .map_err(PacketSecurityError::Decode)?;
+        if let Err(error) = key_ring.accept_key(envelope.key_id, now) {
+            self.stats.key_rejected = self.stats.key_rejected.saturating_add(1);
+            return Err(PacketSecurityError::Key(error));
+        }
+        self.open_decoded(envelope)
+    }
+
+    fn open_decoded(
+        &mut self,
+        envelope: PacketSecurityEnvelope,
+    ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
         let verified = self
             .authenticator
             .verify(
@@ -3380,6 +3771,85 @@ mod tests {
     }
 
     #[test]
+    fn packet_key_ring_selects_active_key_and_accepts_retiring_key() {
+        let now = Tick::new(10);
+        let mut ring = PacketKeyRing::new(PacketKeyRingConfig { max_keys: 4 });
+        ring.insert_active(1, now, 1)
+            .expect("first key should insert");
+        ring.insert_active(2, Tick::new(11), 10)
+            .expect("second key should insert");
+
+        assert_eq!(
+            ring.select_send_key(now).expect("key 1 should send").key_id,
+            1
+        );
+        assert_eq!(
+            ring.select_send_key(Tick::new(11))
+                .expect("key 2 should send")
+                .key_id,
+            2
+        );
+
+        ring.retire(1, Tick::new(12)).expect("key 1 should retire");
+        assert_eq!(
+            ring.accept_key(1, Tick::new(12))
+                .expect("retiring key should still receive")
+                .state,
+            PacketKeyState::Retiring
+        );
+        assert_eq!(
+            ring.select_send_key(Tick::new(12))
+                .expect("active key should win")
+                .key_id,
+            2
+        );
+        assert_eq!(ring.stats().keys_inserted, 2);
+        assert_eq!(ring.stats().keys_retired, 1);
+    }
+
+    #[test]
+    fn packet_key_ring_rejects_revoked_expired_and_over_capacity_keys() {
+        let mut ring = PacketKeyRing::new(PacketKeyRingConfig { max_keys: 2 });
+        ring.insert(PacketKeyDescriptor::active(1, Tick::new(1), 1).with_expiry(Tick::new(5)))
+            .expect("expiring key should insert");
+        ring.insert_active(2, Tick::new(1), 2)
+            .expect("second key should insert");
+        assert_eq!(
+            ring.insert_active(3, Tick::new(1), 3)
+                .expect_err("ring should be full"),
+            PacketKeyRingError::CapacityFull { capacity: 2 }
+        );
+        assert_eq!(
+            ring.insert_active(2, Tick::new(1), 2)
+                .expect_err("duplicate should reject"),
+            PacketKeyRingError::DuplicateKey(2)
+        );
+
+        assert!(ring.accept_key(1, Tick::new(4)).is_ok());
+        assert_eq!(
+            ring.accept_key(1, Tick::new(5))
+                .expect_err("expired key should reject"),
+            PacketKeyRingError::KeyNotAccepted {
+                key_id: 1,
+                state: PacketKeyState::Active
+            }
+        );
+        ring.revoke(2).expect("key should revoke");
+        assert_eq!(
+            ring.accept_key(2, Tick::new(4))
+                .expect_err("revoked key should reject"),
+            PacketKeyRingError::KeyNotAccepted {
+                key_id: 2,
+                state: PacketKeyState::Revoked
+            }
+        );
+        assert_eq!(ring.remove_expired(Tick::new(5)), 1);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.stats().keys_revoked, 1);
+        assert_eq!(ring.stats().keys_expired_removed, 1);
+    }
+
+    #[test]
     fn packet_security_box_seals_opens_and_rejects_replay() {
         let mut sender = PacketSecurityBox::new(
             PacketSecurityConfig::default(),
@@ -3407,6 +3877,81 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(receiver.stats().replay_rejected, 1);
+    }
+
+    #[test]
+    fn packet_security_box_uses_key_ring_for_rotation_policy() {
+        let mut sender_ring = PacketKeyRing::default();
+        let mut receiver_ring = PacketKeyRing::default();
+        sender_ring
+            .insert_active(7, Tick::new(10), 1)
+            .expect("sender key should insert");
+        receiver_ring
+            .insert_active(7, Tick::new(10), 1)
+            .expect("receiver key should insert");
+
+        let mut sender = PacketSecurityBox::new(
+            PacketSecurityConfig::default(),
+            TestAuthenticator,
+            PlaintextPacketCipher,
+        );
+        let mut receiver = PacketSecurityBox::new(
+            PacketSecurityConfig::default(),
+            TestAuthenticator,
+            PlaintextPacketCipher,
+        );
+
+        let sealed = sender
+            .seal_with_key_ring(&sender_ring, b"command", Tick::new(10))
+            .expect("packet should seal through selected key");
+        let envelope = PacketSecurityEnvelope::decode(PacketSecurityConfig::default(), &sealed)
+            .expect("packet should decode");
+        assert_eq!(envelope.key_id, 7);
+        assert_eq!(
+            receiver
+                .open_with_key_ring(&receiver_ring, &sealed, Tick::new(10))
+                .expect("packet should open through accepted key"),
+            b"command"
+        );
+
+        sender_ring
+            .insert_active(8, Tick::new(11), 10)
+            .expect("rotated sender key should insert");
+        receiver_ring
+            .insert_active(8, Tick::new(11), 10)
+            .expect("rotated receiver key should insert");
+        receiver_ring
+            .retire(7, Tick::new(11))
+            .expect("old key should retire");
+        let rotated = sender
+            .seal_with_key_ring(&sender_ring, b"ack", Tick::new(11))
+            .expect("rotated packet should seal");
+        let rotated_envelope =
+            PacketSecurityEnvelope::decode(PacketSecurityConfig::default(), &rotated)
+                .expect("rotated packet should decode");
+        assert_eq!(rotated_envelope.key_id, 8);
+        assert_eq!(
+            receiver
+                .open_with_key_ring(&receiver_ring, &rotated, Tick::new(11))
+                .expect("rotated packet should open"),
+            b"ack"
+        );
+
+        receiver_ring.revoke(7).expect("old key should revoke");
+        let stale = sender
+            .seal_with_nonce(7, 99, b"stale")
+            .expect("explicit stale-key packet should seal");
+        let error = receiver
+            .open_with_key_ring(&receiver_ring, &stale, Tick::new(12))
+            .expect_err("revoked key should reject before auth");
+        match error {
+            PacketSecurityError::Key(PacketKeyRingError::KeyNotAccepted { key_id, state }) => {
+                assert_eq!(key_id, 7);
+                assert_eq!(state, PacketKeyState::Revoked);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(receiver.stats().key_rejected, 1);
     }
 
     #[test]

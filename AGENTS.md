@@ -26,6 +26,9 @@
 - Use `cargo run -p sectorsync-bench --example secure_command_ingress` when
   changing packet security envelopes, authenticator/cipher hooks, replay
   windows, or secure command ingress examples.
+- Use `cargo run -p sectorsync-bench --example secure_key_rotation` when
+  changing packet key lifecycle metadata, send-key selection, receive-key
+  acceptance, retirement, revocation, or expiration behavior.
 - Use `cargo run -p sectorsync-bench --example reliable_command_ingress` when
   changing reliable client packet helpers, in-memory client transport hubs, or
   reliable command ingress examples.
@@ -138,9 +141,11 @@ The core library does not own:
   queues, or hidden per-entity network work in core transport adapters.
 - Packet security helpers must remain framing and policy hooks: bounded
   envelopes, key ids, nonces, authenticator/cipher traits, and replay windows
-  are allowed; mandatory crypto dependencies, hard-coded algorithms, key
-  rotation services, certificate stores, and account auth systems stay outside
-  SectorSync.
+  are allowed. Bounded key lifecycle metadata for activation, send-key
+  selection, receive-key acceptance, retirement, revocation, and expiration is
+  allowed, but secret material, mandatory crypto dependencies, hard-coded
+  algorithms, key rotation services, certificate stores, and account auth
+  systems stay outside SectorSync.
 - The standard UDP adapter is a low-level packet adapter only. Reliability,
   encryption, authentication, reconnect, NAT traversal, and gateway/session
   semantics must not be hidden inside the UDP adapter. Use explicit reliable

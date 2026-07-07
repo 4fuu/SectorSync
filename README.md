@@ -77,8 +77,9 @@ Current crates:
   address registration. It also provides low-level reliable client and station
   packet helpers with bounded in-flight windows, ACKs, retries, timeout
   accounting, and duplicate suppression history, plus packet security envelope
-  hooks for external authentication/encryption implementations and bounded
-  replay windows.
+  hooks for external authentication/encryption implementations, bounded replay
+  windows, and bounded key lifecycle metadata for rotation/retirement/revocation
+  policy.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
@@ -103,6 +104,7 @@ cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example secure_command_ingress
+cargo run -p sectorsync-bench --example secure_key_rotation
 cargo run -p sectorsync-bench --example reliable_command_ingress
 cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --example udp_station_event
@@ -186,7 +188,9 @@ Initial status:
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
 - Packet security helpers support bounded security envelopes, key ids, nonces,
   authentication tags, pluggable authenticator/cipher traits, explicit
-  plaintext cipher mode for tests/integrations, and bounded replay windows.
+  plaintext cipher mode for tests/integrations, bounded replay windows, and
+  bounded key ring metadata for send-key selection, receive-key acceptance,
+  activation, retirement, revocation, and expiration.
 - Bounded in-memory client transport hubs support explicit local endpoints,
   per-client queue capacity, packet byte limits, source-client stamping, and
   delivery statistics for deterministic SDK tests or adapter prototypes.
@@ -256,6 +260,10 @@ Initial status:
   demonstrates a client command and command ACK wrapped in packet security
   envelopes with an external authenticator hook, plus replay rejection for a
   duplicate secure command.
+- `cargo run -p sectorsync-bench --example secure_key_rotation`
+  demonstrates bounded packet key metadata driving initial send/open, rotated
+  key selection, receive-only old-key retirement, and revoked-key rejection
+  while leaving secret storage and key distribution outside SectorSync.
 - `cargo run -p sectorsync-bench --example reliable_command_ingress`
   demonstrates a client command frame wrapped in a reliable client packet
   envelope, retried once, duplicate-suppressed at the server, applied, and then
@@ -279,10 +287,11 @@ Not complete yet:
 
 - Long-running split scheduler calibration against production telemetry and
   heavier workload profiles.
-- Production authentication/encryption implementations, key management, NAT
-  traversal, external service discovery, production cluster integration, and
-  long-running reliability calibration beyond the low-level gateway/session,
-  deployment routing, packet security hooks, reliable client/station packet
-  helpers, and in-memory/UDP packet adapters.
+- Production authentication/encryption implementations, secret storage, key
+  distribution, certificate rotation, NAT traversal, external service
+  discovery, production cluster integration, and long-running reliability
+  calibration beyond the low-level gateway/session, deployment routing, packet
+  security hooks/key lifecycle metadata, reliable client/station packet helpers,
+  and in-memory/UDP packet adapters.
 - Production gateway process orchestration for client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.
