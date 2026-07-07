@@ -1,0 +1,189 @@
+//! Secure command ingress SDK example.
+
+use sectorsync_core::prelude::{
+    ClientId, CommandId, CommandIngress, CommandPriority, CommandQueueLimits, CommandQueues,
+    EntityId, Tick,
+};
+use sectorsync_transport::{
+    ClientTransportLimits, InMemoryTransportHub, OutboundPacket, PacketAuthenticator,
+    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, PlaintextPacketCipher,
+    TransportReceiver, TransportSink,
+};
+use sectorsync_wire::{
+    BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame, CommandFrame, FrameDecoder,
+    FrameEncoder, RuntimeFrame,
+};
+
+fn main() {
+    let client_id = ClientId::new(7);
+    let server_id = ClientId::new(0);
+    let client_to_server_key = 100;
+    let server_to_client_key = 200;
+
+    let hub = InMemoryTransportHub::new(ClientTransportLimits {
+        max_queued_packets_per_client: 8,
+        max_packet_bytes: 512,
+    });
+    let mut client_transport = hub
+        .endpoint(client_id, "127.0.0.1:21007".parse().expect("client addr"))
+        .expect("client endpoint should register");
+    let mut server_transport = hub
+        .endpoint(server_id, "127.0.0.1:21000".parse().expect("server addr"))
+        .expect("server endpoint should register");
+
+    let security_config = PacketSecurityConfig {
+        max_payload_bytes: 256,
+        max_tag_bytes: 16,
+        max_replay_history: 16,
+    };
+    let mut client_security =
+        PacketSecurityBox::new(security_config, ExampleAuthenticator, PlaintextPacketCipher);
+    let mut server_security =
+        PacketSecurityBox::new(security_config, ExampleAuthenticator, PlaintextPacketCipher);
+
+    let command = CommandFrame {
+        client_id,
+        command_id: CommandId::new(42),
+        entity_id: EntityId::new(100),
+        sequence: 9,
+        kind: 1,
+        priority: CommandPriority::High,
+        payload: b"move:north".to_vec(),
+    };
+    let mut encoder = BinaryFrameEncoder;
+    let mut command_bytes = Vec::new();
+    encoder
+        .encode_command(&command, &mut command_bytes)
+        .expect("command should encode");
+    let secure_command = client_security
+        .seal(client_to_server_key, &command_bytes)
+        .expect("command should seal");
+    client_transport
+        .send(OutboundPacket {
+            client_id: server_id,
+            bytes: secure_command,
+        })
+        .expect("client should send secure command");
+
+    let inbound = server_transport
+        .try_recv()
+        .expect("server receive should work")
+        .expect("secure command packet should exist");
+    assert_eq!(inbound.client_id, Some(client_id));
+    let sealed_command = inbound.bytes.clone();
+    let opened_command = server_security
+        .open(&inbound.bytes)
+        .expect("server should open secure command");
+    let RuntimeFrame::Command(command) = BinaryFrameDecoder
+        .decode(&opened_command)
+        .expect("server should decode command")
+    else {
+        panic!("expected command frame");
+    };
+    let replay = server_security
+        .open(&sealed_command)
+        .expect_err("duplicate secure command should replay-reject");
+    match replay {
+        PacketSecurityError::Replay { key_id, nonce } => {
+            assert_eq!(key_id, client_to_server_key);
+            assert_eq!(nonce, 1);
+        }
+        other => panic!("unexpected replay error: {other}"),
+    }
+
+    let mut queues = CommandQueues::new(CommandQueueLimits {
+        high: 4,
+        normal: 4,
+        low: 4,
+    });
+    queues
+        .push(
+            command.clone().into_envelope(Tick::new(10)),
+            CommandIngress::RUNNING,
+        )
+        .expect("command should enqueue");
+    let applied = queues.pop_next().expect("command should be ready");
+
+    let ack = CommandAckFrame {
+        client_id,
+        command_id: command.command_id,
+        server_tick: Tick::new(10),
+        accepted: true,
+        reason_code: 0,
+    };
+    let ack_command_id = ack.command_id;
+    let mut ack_bytes = Vec::new();
+    encoder
+        .encode_command_ack(&ack, &mut ack_bytes)
+        .expect("ack should encode");
+    let secure_ack = server_security
+        .seal(server_to_client_key, &ack_bytes)
+        .expect("ack should seal");
+    server_transport
+        .send(OutboundPacket {
+            client_id,
+            bytes: secure_ack,
+        })
+        .expect("server should send secure ack");
+
+    let inbound_ack = client_transport
+        .try_recv()
+        .expect("client receive should work")
+        .expect("secure ACK should exist");
+    assert_eq!(inbound_ack.client_id, Some(server_id));
+    let opened_ack = client_security
+        .open(&inbound_ack.bytes)
+        .expect("client should open secure ACK");
+    let decoded_ack = BinaryFrameDecoder
+        .decode(&opened_ack)
+        .expect("client should decode ACK");
+    assert_eq!(decoded_ack, RuntimeFrame::CommandAck(ack));
+
+    println!(
+        "secure_command_ingress sealed={} opened={} replay_rejected={} applied_command={} ack_command={}",
+        client_security.stats().sealed + server_security.stats().sealed,
+        client_security.stats().opened + server_security.stats().opened,
+        server_security.stats().replay_rejected,
+        applied.id.get(),
+        ack_command_id.get()
+    );
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExampleAuthenticator;
+
+impl PacketAuthenticator for ExampleAuthenticator {
+    type Error = core::convert::Infallible;
+
+    fn sign(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        out.extend_from_slice(&example_tag(key_id, nonce, payload));
+        Ok(())
+    }
+
+    fn verify(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        tag: &[u8],
+    ) -> Result<bool, Self::Error> {
+        Ok(tag == example_tag(key_id, nonce, payload))
+    }
+}
+
+fn example_tag(key_id: u32, nonce: u64, payload: &[u8]) -> [u8; 8] {
+    let mut acc = (key_id as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(nonce.rotate_left(17));
+    for (index, byte) in payload.iter().copied().enumerate() {
+        acc = acc.rotate_left(5) ^ ((byte as u64) << ((index % 8) * 8));
+        acc = acc.wrapping_mul(0x1000_0000_01B3);
+    }
+    acc.to_le_bytes()
+}
