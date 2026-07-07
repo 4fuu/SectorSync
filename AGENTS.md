@@ -62,6 +62,9 @@
   or ACK/retry/duplicate-suppression behavior.
 - Use `cargo run -p sectorsync-bench --example generated_schema` when changing
   component schema helpers, generated layout descriptors, or schema hashes.
+- Use `cargo run -p sectorsync-bench --example load_scheduler` when changing
+  station scheduler behavior, load-aware scheduling, or station advancement
+  planning.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -95,6 +98,8 @@ The core library does not own:
 - Durable persistence, crash recovery, failover, or backups.
 - Process management, service discovery, deployment, or cluster scheduling.
 - Mandatory GPU execution.
+- Built-in GPU kernels, accelerator resource scheduling, or mandatory GPU
+  runtime.
 - Production gateway process or full-featured client SDK in the first phase.
 
 ## Architecture Rules
@@ -109,6 +114,10 @@ The core library does not own:
   during the handoff window.
 - Split scheduler changes should remain conservative by default: bounded actions,
   bounded moved cells, and preference for lower-load target stations.
+- Station scheduler changes should stay deterministic and bounded. Load-aware
+  scheduling may prioritize station advances from `StationLoadSample`, but it
+  must not add hidden threads, process placement, accelerator execution,
+  blocking waits, or game business scheduling.
 - Runtime barrier work must preserve the sequence: request, align to tick
   boundary, freeze, snapshot or migrate, resume.
 - Runtime barrier notification bridges may encode and broadcast barrier states
@@ -232,7 +241,9 @@ The core library does not own:
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.
 - Keep GPU work outside the core. If acceleration is needed later, add optional
-  adapter crates and keep CPU fallback semantics.
+  adapter crates and keep CPU fallback semantics; business systems can run GPU
+  batches externally and feed resulting state/events back through SectorSync
+  APIs.
 
 ## Documentation Rules
 

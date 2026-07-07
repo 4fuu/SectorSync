@@ -17,8 +17,8 @@ external transport/routing adapters.
 ## Core Direction
 
 - Embedded Rust library first, not a daemon.
-- CPU-first high-performance core; GPU acceleration is external or future
-  optional adapter work.
+- CPU-first high-performance core; GPU acceleration stays outside the core or
+  in optional adapter crates with CPU fallback semantics.
 - In-memory runtime state, with snapshot/restore/migration APIs but no built-in
   durable storage.
 - Fixed 3D cell topology with dynamic station ownership.
@@ -92,7 +92,7 @@ Current crates:
   command/inbound-frame transport bridge, a runtime barrier notification
   transport bridge, a frozen snapshot upgrade executor, a bounded gateway client
   command transport bridge, a business-agnostic gateway command pipeline, and a
-  simple station scheduler.
+  bounded load-aware station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -104,6 +104,7 @@ cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
+cargo run -p sectorsync-bench --example load_scheduler
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example barrier_transport
@@ -157,6 +158,8 @@ measured against simpler strategies.
 - Built-in crash recovery or failover.
 - Built-in process manager or cluster scheduler.
 - Mandatory GPU dependency.
+- Built-in GPU kernels, GPU resource scheduling, or mandatory accelerator
+  runtime.
 - Mandatory production/full-featured client SDK in Phase 1.
 - Dynamic script/WASM/plugin hot loading in Phase 1.
 
@@ -279,6 +282,10 @@ Initial status:
   It includes planning guards for source cooldown, minimum source/target score
   improvement, target score capacity after move, warm-target admission, and
   explicit skip counters for tuning.
+- Runtime station scheduler can turn station load samples into a deterministic
+  bounded advancement plan and advance only the selected high-pressure stations
+  by one tick, leaving thread pools, process scheduling, and accelerator
+  execution outside SectorSync.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
   gateway/deployment command dispatch transport counts, low-level
@@ -294,6 +301,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
   scheduler cooldown and target-capacity guard behavior without running a heavy
   benchmark profile.
+- `cargo run -p sectorsync-bench --example load_scheduler` demonstrates a
+  bounded load-aware station scheduler pass that prioritizes high-pressure
+  stations without owning thread pools, processes, or GPU execution.
 - `cargo run -p sectorsync-bench --example replication_bridge` demonstrates a
   low-level downlink path: viewer AOI planning, replication frame building,
   bounded in-memory client transport send, receive, source/target validation,

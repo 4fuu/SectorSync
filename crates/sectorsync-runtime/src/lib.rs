@@ -3288,6 +3288,45 @@ impl CommandDispatchTransportBridge {
     }
 }
 
+/// Budget for a load-aware scheduler step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationScheduleConfig {
+    /// Maximum stations that may advance during one scheduler step.
+    pub max_station_advances_per_step: usize,
+}
+
+impl Default for StationScheduleConfig {
+    fn default() -> Self {
+        Self {
+            max_station_advances_per_step: usize::MAX,
+        }
+    }
+}
+
+/// Candidate selected by the load-aware station scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationScheduleCandidate {
+    /// Station selected for advancement.
+    pub station_id: StationId,
+    /// Deterministic pressure score derived from the latest load sample.
+    pub load_score: u64,
+    /// How far this station is behind the most advanced station in the set.
+    pub tick_lag: u64,
+}
+
+/// Result of one load-aware station scheduling pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StationSchedulePlan {
+    /// Stations considered by this pass.
+    pub candidates_considered: usize,
+    /// Stations selected by this pass.
+    pub stations_selected: usize,
+    /// Station tick advances requested by this pass.
+    pub total_advances: usize,
+    /// Selected stations in deterministic execution order.
+    pub selected: Vec<StationScheduleCandidate>,
+}
+
 /// Basic in-process station scheduler.
 #[derive(Clone, Debug, Default)]
 pub struct StationScheduler {
@@ -3304,6 +3343,76 @@ impl StationScheduler {
         }
     }
 
+    /// Plans a bounded station advancement pass from load samples.
+    pub fn plan_loaded(
+        &self,
+        stations: &StationSet,
+        samples: &[StationLoadSample],
+        config: StationScheduleConfig,
+    ) -> StationSchedulePlan {
+        let candidates_considered = stations.len();
+        let limit = config
+            .max_station_advances_per_step
+            .min(candidates_considered);
+        let max_tick = stations
+            .iter()
+            .map(|station| station.tick().get())
+            .max()
+            .unwrap_or(0);
+        let samples_by_station = samples
+            .iter()
+            .map(|sample| (sample.station_id, sample))
+            .collect::<BTreeMap<_, _>>();
+        let mut selected = stations
+            .iter()
+            .map(|station| {
+                let station_id = station.config().station_id;
+                let load_score = samples_by_station
+                    .get(&station_id)
+                    .map(|sample| station_schedule_score(*sample))
+                    .unwrap_or(0);
+                StationScheduleCandidate {
+                    station_id,
+                    load_score,
+                    tick_lag: max_tick.saturating_sub(station.tick().get()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        selected.sort_by(|left, right| {
+            right
+                .load_score
+                .cmp(&left.load_score)
+                .then_with(|| right.tick_lag.cmp(&left.tick_lag))
+                .then_with(|| left.station_id.cmp(&right.station_id))
+        });
+        selected.truncate(limit);
+
+        StationSchedulePlan {
+            candidates_considered,
+            stations_selected: selected.len(),
+            total_advances: selected.len(),
+            selected,
+        }
+    }
+
+    /// Advances a bounded set of high-load stations by one tick each.
+    pub fn advance_loaded(
+        &mut self,
+        stations: &mut StationSet,
+        samples: &[StationLoadSample],
+        config: StationScheduleConfig,
+    ) -> StationSchedulePlan {
+        let plan = self.plan_loaded(stations, samples, config);
+        for candidate in &plan.selected {
+            if let Some(station) = stations.get_mut(candidate.station_id) {
+                station.advance_tick();
+                self.advanced_ticks = self.advanced_ticks.saturating_add(1);
+            }
+        }
+        plan
+    }
+
     /// Drains router events ready for each station's current tick.
     pub fn drain_ready_events(
         &mut self,
@@ -3316,6 +3425,10 @@ impl StationScheduler {
         }
         Ok(events)
     }
+}
+
+fn station_schedule_score(sample: &StationLoadSample) -> u64 {
+    station_load_score(sample).saturating_add(sample.max_cell_pressure())
 }
 
 /// Per-station progress inside a full runtime barrier.
@@ -4815,6 +4928,78 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(router.stats().routed_events, 1);
         assert_eq!(router.stats().drained_events, 1);
+    }
+
+    #[test]
+    fn station_scheduler_prioritizes_loaded_stations_with_budget() {
+        let mut stations = StationSet::default();
+        stations.push(station(1, 10));
+        stations.push(station(2, 10));
+        stations.push(station(3, 10));
+
+        let samples = vec![
+            StationLoadSample {
+                station_id: StationId::new(1),
+                owned_entities: 1,
+                ..StationLoadSample::default()
+            },
+            StationLoadSample {
+                station_id: StationId::new(2),
+                owned_entities: 100,
+                subscribers: 40,
+                queued_events: 20,
+                tick_cost_units: 500,
+                cells: vec![CellLoadSample {
+                    cell: CellCoord3::new(0, 0, 0),
+                    owned_entities: 90,
+                    subscribers: 40,
+                    event_pressure: 10,
+                    ..CellLoadSample::default()
+                }],
+                ..StationLoadSample::default()
+            },
+            StationLoadSample {
+                station_id: StationId::new(3),
+                owned_entities: 25,
+                subscribers: 10,
+                queued_events: 5,
+                tick_cost_units: 50,
+                ..StationLoadSample::default()
+            },
+        ];
+
+        let mut scheduler = StationScheduler::default();
+        let plan = scheduler.advance_loaded(
+            &mut stations,
+            &samples,
+            StationScheduleConfig {
+                max_station_advances_per_step: 2,
+            },
+        );
+
+        assert_eq!(plan.candidates_considered, 3);
+        assert_eq!(plan.stations_selected, 2);
+        assert_eq!(plan.total_advances, 2);
+        assert_eq!(
+            plan.selected
+                .iter()
+                .map(|candidate| candidate.station_id)
+                .collect::<Vec<_>>(),
+            vec![StationId::new(2), StationId::new(3)]
+        );
+        assert_eq!(scheduler.advanced_ticks, 2);
+        assert_eq!(
+            stations.get(StationId::new(1)).expect("station").tick(),
+            Tick::new(0)
+        );
+        assert_eq!(
+            stations.get(StationId::new(2)).expect("station").tick(),
+            Tick::new(1)
+        );
+        assert_eq!(
+            stations.get(StationId::new(3)).expect("station").tick(),
+            Tick::new(1)
+        );
     }
 
     #[test]
