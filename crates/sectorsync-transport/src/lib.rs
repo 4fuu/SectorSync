@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
 
 use sectorsync_core::prelude::{ClientId, StationId};
 
@@ -154,6 +155,952 @@ pub trait TransportReceiver {
     /// Implementations should return `Ok(None)` when no packet is currently
     /// available instead of blocking the caller's station tick.
     fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error>;
+}
+
+/// Bounded in-memory client transport limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientTransportLimits {
+    /// Maximum queued packets per target client.
+    pub max_queued_packets_per_client: usize,
+    /// Maximum bytes accepted per packet.
+    pub max_packet_bytes: usize,
+}
+
+impl Default for ClientTransportLimits {
+    fn default() -> Self {
+        Self {
+            max_queued_packets_per_client: 4096,
+            max_packet_bytes: 16 * 1024,
+        }
+    }
+}
+
+/// Statistics for the bounded in-memory client transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InMemoryTransportStats {
+    /// Packets accepted for delivery.
+    pub packets_sent: usize,
+    /// Packets received by local endpoints.
+    pub packets_received: usize,
+    /// Bytes accepted for delivery.
+    pub bytes_sent: usize,
+    /// Bytes received by local endpoints.
+    pub bytes_received: usize,
+    /// Packets rejected because the target queue was full.
+    pub packets_rejected_full: usize,
+    /// Packets rejected because they exceeded the packet byte budget.
+    pub packets_rejected_bytes: usize,
+}
+
+/// Error produced by bounded in-memory client transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InMemoryTransportError {
+    /// Local endpoint has not been registered.
+    MissingLocal(ClientId),
+    /// Target client was not registered.
+    MissingTarget(ClientId),
+    /// Target client queue is full.
+    QueueFull {
+        /// Target client.
+        client_id: ClientId,
+        /// Configured queue capacity.
+        capacity: usize,
+    },
+    /// Packet exceeded the byte budget.
+    PacketTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+    /// Shared in-memory transport state was poisoned.
+    Poisoned,
+}
+
+impl core::fmt::Display for InMemoryTransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingLocal(client_id) => {
+                write!(
+                    f,
+                    "in-memory transport local client {} is missing",
+                    client_id.get()
+                )
+            }
+            Self::MissingTarget(client_id) => {
+                write!(
+                    f,
+                    "in-memory transport target client {} is missing",
+                    client_id.get()
+                )
+            }
+            Self::QueueFull {
+                client_id,
+                capacity,
+            } => write!(
+                f,
+                "in-memory transport target client {} queue is full at capacity {capacity}",
+                client_id.get()
+            ),
+            Self::PacketTooLarge { budget, actual } => {
+                write!(
+                    f,
+                    "in-memory transport packet exceeded byte budget: budget {budget}, actual {actual}"
+                )
+            }
+            Self::Poisoned => f.write_str("in-memory transport state is poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for InMemoryTransportError {}
+
+#[derive(Clone, Debug)]
+struct InMemoryTransportClient {
+    remote_addr: SocketAddr,
+    queue: VecDeque<InboundPacket>,
+}
+
+#[derive(Debug)]
+struct InMemoryTransportInner {
+    limits: ClientTransportLimits,
+    clients: BTreeMap<ClientId, InMemoryTransportClient>,
+    addr_to_client: HashMap<SocketAddr, ClientId>,
+    stats: InMemoryTransportStats,
+}
+
+/// Shared bounded in-memory client packet hub.
+#[derive(Clone, Debug)]
+pub struct InMemoryTransportHub {
+    inner: Arc<Mutex<InMemoryTransportInner>>,
+}
+
+impl InMemoryTransportHub {
+    /// Creates an empty in-memory transport hub.
+    pub fn new(limits: ClientTransportLimits) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(InMemoryTransportInner {
+                limits,
+                clients: BTreeMap::new(),
+                addr_to_client: HashMap::new(),
+                stats: InMemoryTransportStats::default(),
+            })),
+        }
+    }
+
+    /// Registers a client endpoint address.
+    pub fn register_client(
+        &self,
+        client_id: ClientId,
+        remote_addr: SocketAddr,
+    ) -> Result<Option<SocketAddr>, InMemoryTransportError> {
+        let mut inner = self.lock_inner()?;
+        let queue_capacity = inner.limits.max_queued_packets_per_client;
+        let old_addr = inner.clients.insert(
+            client_id,
+            InMemoryTransportClient {
+                remote_addr,
+                queue: VecDeque::with_capacity(queue_capacity),
+            },
+        );
+        let previous_addr = old_addr.map(|client| client.remote_addr);
+        if let Some(previous_addr) = previous_addr {
+            inner.addr_to_client.remove(&previous_addr);
+        }
+        if let Some(old_client) = inner.addr_to_client.insert(remote_addr, client_id) {
+            if old_client != client_id {
+                inner.clients.remove(&old_client);
+            }
+        }
+        Ok(previous_addr)
+    }
+
+    /// Registers and returns a local endpoint for a client.
+    pub fn endpoint(
+        &self,
+        client_id: ClientId,
+        remote_addr: SocketAddr,
+    ) -> Result<InMemoryTransportEndpoint, InMemoryTransportError> {
+        self.register_client(client_id, remote_addr)?;
+        Ok(self.endpoint_for_registered(client_id))
+    }
+
+    /// Returns an endpoint handle for a client that should already be
+    /// registered.
+    pub fn endpoint_for_registered(&self, client_id: ClientId) -> InMemoryTransportEndpoint {
+        InMemoryTransportEndpoint {
+            local_client_id: client_id,
+            hub: self.clone(),
+        }
+    }
+
+    /// Returns queued packet count for a client.
+    pub fn queued_len(&self, client_id: ClientId) -> Result<Option<usize>, InMemoryTransportError> {
+        let inner = self.lock_inner()?;
+        Ok(inner
+            .clients
+            .get(&client_id)
+            .map(|client| client.queue.len()))
+    }
+
+    /// Returns configured limits.
+    pub fn limits(&self) -> Result<ClientTransportLimits, InMemoryTransportError> {
+        let inner = self.lock_inner()?;
+        Ok(inner.limits)
+    }
+
+    /// Returns transport statistics.
+    pub fn stats(&self) -> Result<InMemoryTransportStats, InMemoryTransportError> {
+        let inner = self.lock_inner()?;
+        Ok(inner.stats)
+    }
+
+    fn lock_inner(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, InMemoryTransportInner>, InMemoryTransportError> {
+        self.inner
+            .lock()
+            .map_err(|_| InMemoryTransportError::Poisoned)
+    }
+}
+
+impl Default for InMemoryTransportHub {
+    fn default() -> Self {
+        Self::new(ClientTransportLimits::default())
+    }
+}
+
+/// Local endpoint handle for a bounded in-memory client packet hub.
+#[derive(Clone, Debug)]
+pub struct InMemoryTransportEndpoint {
+    local_client_id: ClientId,
+    hub: InMemoryTransportHub,
+}
+
+impl InMemoryTransportEndpoint {
+    /// Returns the local client id.
+    pub const fn local_client_id(&self) -> ClientId {
+        self.local_client_id
+    }
+
+    /// Returns the local endpoint address.
+    pub fn local_addr(&self) -> Result<Option<SocketAddr>, InMemoryTransportError> {
+        let inner = self.hub.lock_inner()?;
+        Ok(inner
+            .clients
+            .get(&self.local_client_id)
+            .map(|client| client.remote_addr))
+    }
+}
+
+impl TransportSink for InMemoryTransportEndpoint {
+    type Error = InMemoryTransportError;
+
+    fn send(&mut self, packet: OutboundPacket) -> Result<(), Self::Error> {
+        let actual = packet.bytes.len();
+        let mut inner = self.hub.lock_inner()?;
+        let limits = inner.limits;
+        if actual > limits.max_packet_bytes {
+            inner.stats.packets_rejected_bytes =
+                inner.stats.packets_rejected_bytes.saturating_add(1);
+            return Err(InMemoryTransportError::PacketTooLarge {
+                budget: limits.max_packet_bytes,
+                actual,
+            });
+        }
+
+        let source_addr = inner
+            .clients
+            .get(&self.local_client_id)
+            .ok_or(InMemoryTransportError::MissingLocal(self.local_client_id))?
+            .remote_addr;
+        let queue_len = inner
+            .clients
+            .get(&packet.client_id)
+            .ok_or(InMemoryTransportError::MissingTarget(packet.client_id))?
+            .queue
+            .len();
+        if queue_len >= limits.max_queued_packets_per_client {
+            inner.stats.packets_rejected_full = inner.stats.packets_rejected_full.saturating_add(1);
+            return Err(InMemoryTransportError::QueueFull {
+                client_id: packet.client_id,
+                capacity: limits.max_queued_packets_per_client,
+            });
+        }
+
+        inner.stats.packets_sent = inner.stats.packets_sent.saturating_add(1);
+        inner.stats.bytes_sent = inner.stats.bytes_sent.saturating_add(actual);
+        let target = inner
+            .clients
+            .get_mut(&packet.client_id)
+            .ok_or(InMemoryTransportError::MissingTarget(packet.client_id))?;
+        target.queue.push_back(InboundPacket {
+            client_id: Some(self.local_client_id),
+            remote_addr: source_addr,
+            bytes: packet.bytes,
+        });
+        Ok(())
+    }
+}
+
+impl TransportReceiver for InMemoryTransportEndpoint {
+    type Error = InMemoryTransportError;
+
+    fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error> {
+        let mut inner = self.hub.lock_inner()?;
+        let local = inner
+            .clients
+            .get_mut(&self.local_client_id)
+            .ok_or(InMemoryTransportError::MissingLocal(self.local_client_id))?;
+        let Some(packet) = local.queue.pop_front() else {
+            return Ok(None);
+        };
+        inner.stats.packets_received = inner.stats.packets_received.saturating_add(1);
+        inner.stats.bytes_received = inner
+            .stats
+            .bytes_received
+            .saturating_add(packet.bytes.len());
+        Ok(Some(packet))
+    }
+}
+
+const RELIABLE_CLIENT_MAGIC: [u8; 4] = *b"SSCR";
+const RELIABLE_CLIENT_KIND_DATA: u8 = 0;
+const RELIABLE_CLIENT_KIND_ACK: u8 = 1;
+/// Reliable client data frame header bytes before payload.
+pub const RELIABLE_CLIENT_DATA_HEADER_BYTES: usize = 17;
+/// Reliable client ACK frame bytes.
+pub const RELIABLE_CLIENT_ACK_BYTES: usize = 13;
+/// Default reliable client payload budget aligned to the default packet budget
+/// after reliable header overhead.
+pub const DEFAULT_RELIABLE_CLIENT_MAX_PAYLOAD_BYTES: usize =
+    (16 * 1024) - RELIABLE_CLIENT_DATA_HEADER_BYTES;
+/// Default duplicate-suppression history retained per reliable client endpoint.
+pub const DEFAULT_RELIABLE_CLIENT_DELIVERED_HISTORY: usize = 4096;
+
+/// Bounded reliable client link configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReliableClientConfig {
+    /// Maximum in-flight reliable packets per peer client.
+    pub max_in_flight_per_peer: usize,
+    /// Number of ticks to wait before retrying an unacknowledged packet.
+    pub retry_after_ticks: u64,
+    /// Maximum send attempts before dropping an in-flight packet.
+    pub max_attempts: u8,
+    /// Maximum payload bytes before reliable envelope overhead.
+    pub max_payload_bytes: usize,
+    /// Maximum recently delivered packet ids retained for duplicate
+    /// suppression. Set to zero to disable duplicate suppression history.
+    pub max_delivered_history: usize,
+}
+
+impl Default for ReliableClientConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight_per_peer: 1024,
+            retry_after_ticks: 2,
+            max_attempts: 4,
+            max_payload_bytes: DEFAULT_RELIABLE_CLIENT_MAX_PAYLOAD_BYTES,
+            max_delivered_history: DEFAULT_RELIABLE_CLIENT_DELIVERED_HISTORY,
+        }
+    }
+}
+
+/// Reliable client endpoint statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReliableClientStats {
+    /// New reliable data packets sent.
+    pub data_sent: usize,
+    /// Retry data packets sent.
+    pub retries_sent: usize,
+    /// ACK packets sent.
+    pub acks_sent: usize,
+    /// ACK packets received.
+    pub acks_received: usize,
+    /// Unique data packets delivered to the caller.
+    pub data_delivered: usize,
+    /// Duplicate data packets suppressed.
+    pub duplicates_suppressed: usize,
+    /// In-flight packets dropped after exhausting attempts.
+    pub timed_out: usize,
+}
+
+/// Encoded reliable client frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReliableClientFrame {
+    /// Reliable data packet.
+    Data {
+        /// Sender-local sequence number scoped to the peer client.
+        sequence: u64,
+        /// Original packet payload.
+        payload: Vec<u8>,
+    },
+    /// Acknowledgement for a reliable data packet.
+    Ack {
+        /// Acknowledged sequence number.
+        sequence: u64,
+    },
+}
+
+impl ReliableClientFrame {
+    /// Encodes a reliable client frame.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ReliableClientEncodeError> {
+        out.extend_from_slice(&RELIABLE_CLIENT_MAGIC);
+        match self {
+            Self::Data { sequence, payload } => {
+                out.push(RELIABLE_CLIENT_KIND_DATA);
+                out.extend_from_slice(&sequence.to_le_bytes());
+                let len = u32::try_from(payload.len()).map_err(|_| {
+                    ReliableClientEncodeError::PayloadTooLarge {
+                        actual: payload.len(),
+                    }
+                })?;
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(payload);
+            }
+            Self::Ack { sequence } => {
+                out.push(RELIABLE_CLIENT_KIND_ACK);
+                out.extend_from_slice(&sequence.to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes a reliable client frame.
+    pub fn decode(input: &[u8]) -> Result<Self, ReliableClientDecodeError> {
+        let mut cursor = ReliableCursor::new(input);
+        let magic = cursor
+            .read_array::<4>()
+            .map_err(ReliableClientDecodeError::from_station_decode)?;
+        if magic != RELIABLE_CLIENT_MAGIC {
+            return Err(ReliableClientDecodeError::BadMagic);
+        }
+        let kind = cursor
+            .read_u8()
+            .map_err(ReliableClientDecodeError::from_station_decode)?;
+        let sequence = cursor
+            .read_u64()
+            .map_err(ReliableClientDecodeError::from_station_decode)?;
+        let frame = match kind {
+            RELIABLE_CLIENT_KIND_DATA => {
+                let len = cursor
+                    .read_u32()
+                    .map_err(ReliableClientDecodeError::from_station_decode)?
+                    as usize;
+                let payload = cursor
+                    .read_bytes(len)
+                    .map_err(ReliableClientDecodeError::from_station_decode)?;
+                Self::Data { sequence, payload }
+            }
+            RELIABLE_CLIENT_KIND_ACK => Self::Ack { sequence },
+            other => return Err(ReliableClientDecodeError::UnknownKind(other)),
+        };
+        cursor
+            .finish()
+            .map_err(ReliableClientDecodeError::from_station_decode)?;
+        Ok(frame)
+    }
+}
+
+/// Reliable client frame encode error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReliableClientEncodeError {
+    /// Payload length exceeded `u32::MAX`.
+    PayloadTooLarge {
+        /// Actual byte count.
+        actual: usize,
+    },
+}
+
+impl core::fmt::Display for ReliableClientEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PayloadTooLarge { actual } => {
+                write!(f, "reliable client payload too large: {actual} bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReliableClientEncodeError {}
+
+/// Reliable client frame decode error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReliableClientDecodeError {
+    /// Frame magic did not match.
+    BadMagic,
+    /// Frame kind byte is unknown.
+    UnknownKind(u8),
+    /// Frame ended before all fields were available.
+    Truncated {
+        /// Required bytes.
+        needed: usize,
+        /// Available bytes.
+        available: usize,
+    },
+    /// Frame had trailing bytes after a complete payload.
+    TrailingBytes(usize),
+}
+
+impl ReliableClientDecodeError {
+    fn from_station_decode(error: ReliableStationDecodeError) -> Self {
+        match error {
+            ReliableStationDecodeError::BadMagic => Self::BadMagic,
+            ReliableStationDecodeError::UnknownKind(kind) => Self::UnknownKind(kind),
+            ReliableStationDecodeError::Truncated { needed, available } => {
+                Self::Truncated { needed, available }
+            }
+            ReliableStationDecodeError::TrailingBytes(bytes) => Self::TrailingBytes(bytes),
+        }
+    }
+}
+
+impl core::fmt::Display for ReliableClientDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadMagic => f.write_str("bad reliable client frame magic"),
+            Self::UnknownKind(kind) => write!(f, "unknown reliable client frame kind {kind}"),
+            Self::Truncated { needed, available } => {
+                write!(
+                    f,
+                    "truncated reliable client frame: needed {needed}, available {available}"
+                )
+            }
+            Self::TrailingBytes(bytes) => {
+                write!(f, "reliable client frame has {bytes} trailing bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReliableClientDecodeError {}
+
+/// Error produced by reliable client endpoints.
+#[derive(Debug)]
+pub enum ReliableClientError<E> {
+    /// Underlying transport failed.
+    Transport(E),
+    /// Inbound packet did not contain a source client id.
+    MissingSourceClient,
+    /// Payload exceeded configured byte budget.
+    PayloadTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+    /// Peer client in-flight window is full.
+    WindowFull {
+        /// Peer client.
+        peer_client: ClientId,
+        /// Configured in-flight capacity.
+        capacity: usize,
+    },
+    /// Reliable frame encode failed.
+    Encode(ReliableClientEncodeError),
+    /// Reliable frame decode failed.
+    Decode(ReliableClientDecodeError),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for ReliableClientError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::MissingSourceClient => f.write_str("reliable client packet source is unknown"),
+            Self::PayloadTooLarge { budget, actual } => {
+                write!(
+                    f,
+                    "reliable client payload exceeded byte budget: budget {budget}, actual {actual}"
+                )
+            }
+            Self::WindowFull {
+                peer_client,
+                capacity,
+            } => write!(
+                f,
+                "reliable client peer {} window is full at capacity {capacity}",
+                peer_client.get()
+            ),
+            Self::Encode(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for ReliableClientError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Encode(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::MissingSourceClient | Self::PayloadTooLarge { .. } | Self::WindowFull { .. } => {
+                None
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InFlightReliableClientPacket {
+    peer_client: ClientId,
+    sequence: u64,
+    payload: Vec<u8>,
+    first_sent_tick: u64,
+    last_sent_tick: u64,
+    attempts: u8,
+}
+
+/// Bounded reliable client sender state.
+#[derive(Clone, Debug)]
+pub struct ReliableClientSender {
+    config: ReliableClientConfig,
+    next_sequence: BTreeMap<ClientId, u64>,
+    in_flight: BTreeMap<(ClientId, u64), InFlightReliableClientPacket>,
+    stats: ReliableClientStats,
+}
+
+impl ReliableClientSender {
+    /// Creates a reliable client sender.
+    pub fn new(config: ReliableClientConfig) -> Self {
+        Self {
+            config,
+            next_sequence: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
+            stats: ReliableClientStats::default(),
+        }
+    }
+
+    /// Returns sender configuration.
+    pub const fn config(&self) -> ReliableClientConfig {
+        self.config
+    }
+
+    /// Returns sender statistics.
+    pub const fn stats(&self) -> ReliableClientStats {
+        self.stats
+    }
+
+    /// Returns total in-flight reliable packets.
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Returns in-flight reliable packets for one peer client.
+    pub fn in_flight_for(&self, peer_client: ClientId) -> usize {
+        self.in_flight
+            .keys()
+            .filter(|(client_id, _)| *client_id == peer_client)
+            .count()
+    }
+
+    /// Sends a new reliable packet and stores it until acknowledged or timed
+    /// out.
+    pub fn send<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        packet: OutboundPacket,
+        now_tick: u64,
+    ) -> Result<u64, ReliableClientError<T::Error>> {
+        self.validate_payload(packet.bytes.len())?;
+        if self.in_flight_for(packet.client_id) >= self.config.max_in_flight_per_peer {
+            return Err(ReliableClientError::WindowFull {
+                peer_client: packet.client_id,
+                capacity: self.config.max_in_flight_per_peer,
+            });
+        }
+
+        let sequence = self.allocate_sequence(packet.client_id);
+        self.send_data_frame(transport, packet.client_id, sequence, &packet.bytes)?;
+        self.in_flight.insert(
+            (packet.client_id, sequence),
+            InFlightReliableClientPacket {
+                peer_client: packet.client_id,
+                sequence,
+                payload: packet.bytes,
+                first_sent_tick: now_tick,
+                last_sent_tick: now_tick,
+                attempts: 1,
+            },
+        );
+        self.stats.data_sent = self.stats.data_sent.saturating_add(1);
+        Ok(sequence)
+    }
+
+    /// Processes an ACK from `ack_source_client`.
+    pub fn acknowledge(&mut self, ack_source_client: ClientId, sequence: u64) -> bool {
+        let removed = self
+            .in_flight
+            .remove(&(ack_source_client, sequence))
+            .is_some();
+        if removed {
+            self.stats.acks_received = self.stats.acks_received.saturating_add(1);
+        }
+        removed
+    }
+
+    /// Retries due in-flight packets.
+    pub fn retry_due<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        now_tick: u64,
+    ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
+        let keys = self
+            .in_flight
+            .iter()
+            .filter_map(|(key, packet)| {
+                let due =
+                    now_tick.saturating_sub(packet.last_sent_tick) >= self.config.retry_after_ticks;
+                due.then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        let mut report = ReliableRetryReport::default();
+
+        for key in keys {
+            let Some(packet) = self.in_flight.get(&key).cloned() else {
+                continue;
+            };
+            if packet.attempts >= self.config.max_attempts {
+                self.in_flight.remove(&key);
+                self.stats.timed_out = self.stats.timed_out.saturating_add(1);
+                report.timed_out = report.timed_out.saturating_add(1);
+                continue;
+            }
+
+            self.send_data_frame(
+                transport,
+                packet.peer_client,
+                packet.sequence,
+                &packet.payload,
+            )?;
+            if let Some(stored) = self.in_flight.get_mut(&key) {
+                stored.last_sent_tick = now_tick;
+                stored.attempts = stored.attempts.saturating_add(1);
+            }
+            self.stats.retries_sent = self.stats.retries_sent.saturating_add(1);
+            report.retried = report.retried.saturating_add(1);
+        }
+
+        Ok(report)
+    }
+
+    fn validate_payload<E>(&self, bytes: usize) -> Result<(), ReliableClientError<E>> {
+        if bytes > self.config.max_payload_bytes {
+            Err(ReliableClientError::PayloadTooLarge {
+                budget: self.config.max_payload_bytes,
+                actual: bytes,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn allocate_sequence(&mut self, peer_client: ClientId) -> u64 {
+        let next = self.next_sequence.entry(peer_client).or_insert(1);
+        let sequence = *next;
+        *next = next.saturating_add(1);
+        sequence
+    }
+
+    fn send_data_frame<T: TransportSink>(
+        &self,
+        transport: &mut T,
+        peer_client: ClientId,
+        sequence: u64,
+        payload: &[u8],
+    ) -> Result<(), ReliableClientError<T::Error>> {
+        let mut bytes = Vec::with_capacity(
+            payload
+                .len()
+                .saturating_add(RELIABLE_CLIENT_DATA_HEADER_BYTES),
+        );
+        ReliableClientFrame::Data {
+            sequence,
+            payload: payload.to_vec(),
+        }
+        .encode(&mut bytes)
+        .map_err(ReliableClientError::Encode)?;
+        transport
+            .send(OutboundPacket {
+                client_id: peer_client,
+                bytes,
+            })
+            .map_err(ReliableClientError::Transport)
+    }
+}
+
+impl Default for ReliableClientSender {
+    fn default() -> Self {
+        Self::new(ReliableClientConfig::default())
+    }
+}
+
+/// Bounded reliable client receiver state.
+#[derive(Clone, Debug)]
+pub struct ReliableClientReceiver {
+    config: ReliableClientConfig,
+    delivered: BTreeSet<(ClientId, u64)>,
+    delivered_order: VecDeque<(ClientId, u64)>,
+    stats: ReliableClientStats,
+}
+
+impl ReliableClientReceiver {
+    /// Creates a bounded reliable client receiver.
+    pub fn new(config: ReliableClientConfig) -> Self {
+        Self {
+            config,
+            delivered: BTreeSet::new(),
+            delivered_order: VecDeque::new(),
+            stats: ReliableClientStats::default(),
+        }
+    }
+
+    /// Returns receiver configuration.
+    pub const fn config(&self) -> ReliableClientConfig {
+        self.config
+    }
+
+    /// Returns receiver statistics.
+    pub const fn stats(&self) -> ReliableClientStats {
+        self.stats
+    }
+
+    /// Handles a reliable data packet, sends an ACK, and returns a payload only
+    /// for first delivery.
+    pub fn handle_data<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        packet: InboundPacket,
+        source_client: ClientId,
+        sequence: u64,
+        payload: Vec<u8>,
+    ) -> Result<Option<InboundPacket>, ReliableClientError<T::Error>> {
+        self.send_ack(transport, source_client, sequence)?;
+        if !self.record_unique(source_client, sequence) {
+            self.stats.duplicates_suppressed = self.stats.duplicates_suppressed.saturating_add(1);
+            return Ok(None);
+        }
+
+        self.stats.data_delivered = self.stats.data_delivered.saturating_add(1);
+        Ok(Some(InboundPacket {
+            client_id: Some(source_client),
+            remote_addr: packet.remote_addr,
+            bytes: payload,
+        }))
+    }
+
+    fn send_ack<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        target_client: ClientId,
+        sequence: u64,
+    ) -> Result<(), ReliableClientError<T::Error>> {
+        let mut bytes = Vec::with_capacity(RELIABLE_CLIENT_ACK_BYTES);
+        ReliableClientFrame::Ack { sequence }
+            .encode(&mut bytes)
+            .map_err(ReliableClientError::Encode)?;
+        transport
+            .send(OutboundPacket {
+                client_id: target_client,
+                bytes,
+            })
+            .map_err(ReliableClientError::Transport)?;
+        self.stats.acks_sent = self.stats.acks_sent.saturating_add(1);
+        Ok(())
+    }
+
+    fn record_unique(&mut self, source_client: ClientId, sequence: u64) -> bool {
+        if self.config.max_delivered_history == 0 {
+            return true;
+        }
+
+        let key = (source_client, sequence);
+        if self.delivered.contains(&key) {
+            return false;
+        }
+
+        self.delivered.insert(key);
+        self.delivered_order.push_back(key);
+        while self.delivered_order.len() > self.config.max_delivered_history {
+            if let Some(old) = self.delivered_order.pop_front() {
+                self.delivered.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+impl Default for ReliableClientReceiver {
+    fn default() -> Self {
+        Self::new(ReliableClientConfig::default())
+    }
+}
+
+/// Reliable client endpoint combining sender and receiver state.
+#[derive(Clone, Debug)]
+pub struct ReliableClientEndpoint {
+    /// Sender state.
+    pub sender: ReliableClientSender,
+    /// Receiver state.
+    pub receiver: ReliableClientReceiver,
+}
+
+impl ReliableClientEndpoint {
+    /// Creates a reliable client endpoint.
+    pub fn new(config: ReliableClientConfig) -> Self {
+        Self {
+            sender: ReliableClientSender::new(config),
+            receiver: ReliableClientReceiver::new(config),
+        }
+    }
+
+    /// Sends a new reliable packet to a peer client.
+    pub fn send<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        packet: OutboundPacket,
+        now_tick: u64,
+    ) -> Result<u64, ReliableClientError<T::Error>> {
+        self.sender.send(transport, packet, now_tick)
+    }
+
+    /// Retries due reliable client packets.
+    pub fn retry_due<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        now_tick: u64,
+    ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
+        self.sender.retry_due(transport, now_tick)
+    }
+
+    /// Handles one inbound reliable client packet.
+    pub fn handle_inbound<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        packet: InboundPacket,
+    ) -> Result<Option<InboundPacket>, ReliableClientError<T::Error>> {
+        let source_client = packet
+            .client_id
+            .ok_or(ReliableClientError::MissingSourceClient)?;
+        match ReliableClientFrame::decode(&packet.bytes).map_err(ReliableClientError::Decode)? {
+            ReliableClientFrame::Data { sequence, payload } => {
+                self.receiver
+                    .handle_data(transport, packet, source_client, sequence, payload)
+            }
+            ReliableClientFrame::Ack { sequence } => {
+                self.sender.acknowledge(source_client, sequence);
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl Default for ReliableClientEndpoint {
+    fn default() -> Self {
+        Self::new(ReliableClientConfig::default())
+    }
 }
 
 /// Station-to-station packet sink abstraction.
@@ -1647,6 +2594,10 @@ mod tests {
         }
     }
 
+    fn memory_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
     fn recv_with_retry(transport: &mut UdpTransport) -> InboundPacket {
         for _ in 0..50 {
             if let Some(packet) = transport.try_recv().expect("udp receive should work") {
@@ -1707,6 +2658,393 @@ mod tests {
             }
         );
         assert_eq!(transport.inner().packets_sent(), 0);
+    }
+
+    #[test]
+    fn in_memory_transport_delivers_bounded_packets() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 2,
+            max_packet_bytes: 8,
+        });
+        let mut client = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        let mut server = hub
+            .endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+
+        client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: b"command".to_vec(),
+            })
+            .expect("client packet should send");
+        assert_eq!(
+            hub.queued_len(server_id).expect("queue should exist"),
+            Some(1)
+        );
+
+        let inbound = server
+            .try_recv()
+            .expect("server receive should work")
+            .expect("packet should exist");
+        assert_eq!(inbound.client_id, Some(client_id));
+        assert_eq!(inbound.remote_addr, memory_addr(20007));
+        assert_eq!(inbound.bytes, b"command");
+
+        let stats = hub.stats().expect("stats should read");
+        assert_eq!(stats.packets_sent, 1);
+        assert_eq!(stats.packets_received, 1);
+        assert_eq!(stats.bytes_sent, 7);
+        assert_eq!(stats.bytes_received, 7);
+    }
+
+    #[test]
+    fn in_memory_transport_rejects_full_queue_and_large_packet() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 1,
+            max_packet_bytes: 4,
+        });
+        let mut client = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        hub.endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+
+        client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: vec![0; 4],
+            })
+            .expect("first packet should send");
+
+        let full = client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: vec![0; 4],
+            })
+            .expect_err("queue should be full");
+        assert_eq!(
+            full,
+            InMemoryTransportError::QueueFull {
+                client_id: server_id,
+                capacity: 1
+            }
+        );
+
+        let large = client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: vec![0; 5],
+            })
+            .expect_err("packet should exceed budget");
+        assert_eq!(
+            large,
+            InMemoryTransportError::PacketTooLarge {
+                budget: 4,
+                actual: 5
+            }
+        );
+
+        let stats = hub.stats().expect("stats should read");
+        assert_eq!(stats.packets_rejected_full, 1);
+        assert_eq!(stats.packets_rejected_bytes, 1);
+    }
+
+    #[test]
+    fn reliable_client_frame_roundtrips_data_and_ack() {
+        let data = ReliableClientFrame::Data {
+            sequence: 42,
+            payload: b"command".to_vec(),
+        };
+        let mut bytes = Vec::new();
+        data.encode(&mut bytes).expect("data frame should encode");
+        assert_eq!(
+            ReliableClientFrame::decode(&bytes).expect("data frame should decode"),
+            data
+        );
+
+        let ack = ReliableClientFrame::Ack { sequence: 42 };
+        bytes.clear();
+        ack.encode(&mut bytes).expect("ack frame should encode");
+        assert_eq!(
+            ReliableClientFrame::decode(&bytes).expect("ack frame should decode"),
+            ack
+        );
+    }
+
+    #[test]
+    fn reliable_client_endpoint_delivers_payload_and_acknowledges() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::default();
+        let mut client_transport = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        let mut server_transport = hub
+            .endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+        let mut client = ReliableClientEndpoint::default();
+        let mut server = ReliableClientEndpoint::default();
+
+        let sequence = client
+            .send(
+                &mut client_transport,
+                OutboundPacket {
+                    client_id: server_id,
+                    bytes: b"command".to_vec(),
+                },
+                0,
+            )
+            .expect("reliable command should send");
+        assert_eq!(sequence, 1);
+        assert_eq!(client.sender.in_flight_len(), 1);
+
+        let raw = server_transport
+            .try_recv()
+            .expect("server receive should work")
+            .expect("data packet should exist");
+        let delivered = server
+            .handle_inbound(&mut server_transport, raw)
+            .expect("data packet should handle")
+            .expect("first data packet should deliver");
+        assert_eq!(delivered.client_id, Some(client_id));
+        assert_eq!(delivered.remote_addr, memory_addr(20007));
+        assert_eq!(delivered.bytes, b"command");
+        assert_eq!(server.receiver.stats().data_delivered, 1);
+        assert_eq!(server.receiver.stats().acks_sent, 1);
+
+        let ack = client_transport
+            .try_recv()
+            .expect("client ACK receive should work")
+            .expect("ACK packet should exist");
+        assert_eq!(
+            client
+                .handle_inbound(&mut client_transport, ack)
+                .expect("ACK should handle"),
+            None
+        );
+        assert_eq!(client.sender.in_flight_len(), 0);
+        assert_eq!(client.sender.stats().acks_received, 1);
+    }
+
+    #[test]
+    fn reliable_client_endpoint_retries_and_suppresses_duplicate_delivery() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::default();
+        let mut client_transport = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        let mut server_transport = hub
+            .endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+        let mut client = ReliableClientEndpoint::default();
+        let mut server = ReliableClientEndpoint::default();
+
+        client
+            .send(
+                &mut client_transport,
+                OutboundPacket {
+                    client_id: server_id,
+                    bytes: b"idempotent-command".to_vec(),
+                },
+                0,
+            )
+            .expect("reliable command should send");
+        let retry = client
+            .retry_due(&mut client_transport, 2)
+            .expect("retry should send");
+        assert_eq!(retry.retried, 1);
+        assert_eq!(retry.timed_out, 0);
+        assert_eq!(client.sender.stats().retries_sent, 1);
+        assert_eq!(
+            hub.queued_len(server_id).expect("queue should exist"),
+            Some(2)
+        );
+
+        let first_raw = server_transport
+            .try_recv()
+            .expect("server receive should work")
+            .expect("first data packet should exist");
+        let delivered = server
+            .handle_inbound(&mut server_transport, first_raw)
+            .expect("first data packet should handle")
+            .expect("first data packet should deliver");
+        assert_eq!(delivered.bytes, b"idempotent-command");
+
+        let duplicate_raw = server_transport
+            .try_recv()
+            .expect("server receive should work")
+            .expect("duplicate data packet should exist");
+        assert_eq!(
+            server
+                .handle_inbound(&mut server_transport, duplicate_raw)
+                .expect("duplicate data packet should handle"),
+            None
+        );
+        assert_eq!(server.receiver.stats().data_delivered, 1);
+        assert_eq!(server.receiver.stats().duplicates_suppressed, 1);
+        assert_eq!(server.receiver.stats().acks_sent, 2);
+    }
+
+    #[test]
+    fn reliable_client_receiver_bounds_duplicate_history() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::default();
+        hub.endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        let mut server_transport = hub
+            .endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+        let config = ReliableClientConfig {
+            max_in_flight_per_peer: 8,
+            retry_after_ticks: 2,
+            max_attempts: 4,
+            max_payload_bytes: DEFAULT_RELIABLE_CLIENT_MAX_PAYLOAD_BYTES,
+            max_delivered_history: 1,
+        };
+        let mut server = ReliableClientEndpoint::new(config);
+
+        let packet = |sequence: u64, payload: &[u8]| {
+            let mut bytes = Vec::new();
+            ReliableClientFrame::Data {
+                sequence,
+                payload: payload.to_vec(),
+            }
+            .encode(&mut bytes)
+            .expect("data frame should encode");
+            InboundPacket {
+                client_id: Some(client_id),
+                remote_addr: memory_addr(20007),
+                bytes,
+            }
+        };
+
+        assert!(
+            server
+                .handle_inbound(&mut server_transport, packet(1, b"first"))
+                .expect("first data packet should handle")
+                .is_some()
+        );
+        assert_eq!(
+            server
+                .handle_inbound(&mut server_transport, packet(1, b"first-duplicate"))
+                .expect("duplicate data packet should handle"),
+            None
+        );
+        assert!(
+            server
+                .handle_inbound(&mut server_transport, packet(2, b"second"))
+                .expect("second data packet should handle")
+                .is_some()
+        );
+        assert!(
+            server
+                .handle_inbound(&mut server_transport, packet(1, b"first-after-eviction"))
+                .expect("evicted data packet should handle")
+                .is_some()
+        );
+        assert_eq!(server.receiver.stats().data_delivered, 3);
+        assert_eq!(server.receiver.stats().duplicates_suppressed, 1);
+    }
+
+    #[test]
+    fn reliable_client_sender_enforces_payload_and_window_limits() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::default();
+        let mut client_transport = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        hub.endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+        let config = ReliableClientConfig {
+            max_in_flight_per_peer: 1,
+            retry_after_ticks: 2,
+            max_attempts: 4,
+            max_payload_bytes: 4,
+            max_delivered_history: DEFAULT_RELIABLE_CLIENT_DELIVERED_HISTORY,
+        };
+        let mut client = ReliableClientEndpoint::new(config);
+
+        let too_large = client
+            .send(
+                &mut client_transport,
+                OutboundPacket {
+                    client_id: server_id,
+                    bytes: vec![0; 5],
+                },
+                0,
+            )
+            .expect_err("payload should exceed configured budget");
+        match too_large {
+            ReliableClientError::PayloadTooLarge { budget, actual } => {
+                assert_eq!(budget, 4);
+                assert_eq!(actual, 5);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        client
+            .send(
+                &mut client_transport,
+                OutboundPacket {
+                    client_id: server_id,
+                    bytes: vec![0; 4],
+                },
+                0,
+            )
+            .expect("first packet should fit");
+        let full = client
+            .send(
+                &mut client_transport,
+                OutboundPacket {
+                    client_id: server_id,
+                    bytes: vec![1; 4],
+                },
+                0,
+            )
+            .expect_err("in-flight window should be full");
+        match full {
+            ReliableClientError::WindowFull {
+                peer_client,
+                capacity,
+            } => {
+                assert_eq!(peer_client, server_id);
+                assert_eq!(capacity, 1);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn reliable_client_endpoint_rejects_unknown_packet_source() {
+        let mut endpoint = ReliableClientEndpoint::default();
+        let mut transport = FakeTransport::default();
+        let mut bytes = Vec::new();
+        ReliableClientFrame::Ack { sequence: 1 }
+            .encode(&mut bytes)
+            .expect("ACK should encode");
+        let error = endpoint
+            .handle_inbound(
+                &mut transport,
+                InboundPacket {
+                    client_id: None,
+                    remote_addr: memory_addr(20007),
+                    bytes,
+                },
+            )
+            .expect_err("unknown source should be rejected");
+        match error {
+            ReliableClientError::MissingSourceClient => {}
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
