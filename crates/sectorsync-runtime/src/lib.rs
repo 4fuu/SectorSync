@@ -11,6 +11,14 @@ use sectorsync_core::prelude::{
     SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
     StationLoadSample, StationSnapshot, Tick,
 };
+use sectorsync_transport::{
+    InMemoryStationTransport, StationOutboundPacket, StationTransportError,
+    StationTransportReceiver, StationTransportSink,
+};
+use sectorsync_wire::{
+    BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, FrameDecoder,
+    FrameEncoder, RuntimeFrame, StationEventFrame,
+};
 
 /// Small in-process station collection for simulations and embedders.
 #[derive(Clone, Debug, Default)]
@@ -824,6 +832,208 @@ impl Default for EventRouter {
     }
 }
 
+/// Statistics for station event transport bridging.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StationEventTransportStats {
+    /// Events encoded and submitted to station transport.
+    pub events_sent: usize,
+    /// Bytes submitted to station transport.
+    pub bytes_sent: usize,
+    /// Packets received from station transport.
+    pub packets_received: usize,
+    /// Bytes received from station transport.
+    pub bytes_received: usize,
+    /// Events decoded and accepted by the target router.
+    pub events_routed: usize,
+}
+
+/// Result of pumping station event packets for one target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StationEventPumpReport {
+    /// Target station pumped.
+    pub target_station: StationId,
+    /// Packets consumed from the station transport.
+    pub packets_received: usize,
+    /// Bytes consumed from the station transport.
+    pub bytes_received: usize,
+    /// Events accepted by the target router.
+    pub events_routed: usize,
+}
+
+/// Error produced while bridging station events through packet transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StationEventTransportError {
+    /// Underlying station transport failed.
+    Transport(StationTransportError),
+    /// Wire encoding failed.
+    Encode(BinaryEncodeError),
+    /// Wire decoding failed.
+    Decode(BinaryDecodeError),
+    /// Packet decoded as a non-event frame.
+    UnexpectedFrame,
+    /// Packet envelope and decoded event disagreed about endpoints.
+    EndpointMismatch {
+        /// Packet source station.
+        packet_source: StationId,
+        /// Packet target station.
+        packet_target: StationId,
+        /// Decoded event source station.
+        event_source: StationId,
+        /// Decoded event target station.
+        event_target: StationId,
+    },
+    /// Event router rejected the decoded event.
+    Router(EventRouterError),
+}
+
+impl core::fmt::Display for StationEventTransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Encode(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::UnexpectedFrame => f.write_str("station transport packet was not an event frame"),
+            Self::EndpointMismatch {
+                packet_source,
+                packet_target,
+                event_source,
+                event_target,
+            } => write!(
+                f,
+                "station event endpoint mismatch: packet {}->{}, event {}->{}",
+                packet_source.get(),
+                packet_target.get(),
+                event_source.get(),
+                event_target.get()
+            ),
+            Self::Router(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for StationEventTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Encode(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::UnexpectedFrame | Self::EndpointMismatch { .. } => None,
+            Self::Router(error) => Some(error),
+        }
+    }
+}
+
+impl From<StationTransportError> for StationEventTransportError {
+    fn from(value: StationTransportError) -> Self {
+        Self::Transport(value)
+    }
+}
+
+impl From<BinaryEncodeError> for StationEventTransportError {
+    fn from(value: BinaryEncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
+
+impl From<BinaryDecodeError> for StationEventTransportError {
+    fn from(value: BinaryDecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+impl From<EventRouterError> for StationEventTransportError {
+    fn from(value: EventRouterError) -> Self {
+        Self::Router(value)
+    }
+}
+
+/// Bridge between typed station events and bounded station packet transport.
+#[derive(Clone, Debug, Default)]
+pub struct StationEventTransportBridge {
+    stats: StationEventTransportStats,
+}
+
+impl StationEventTransportBridge {
+    /// Returns bridge statistics.
+    pub const fn stats(&self) -> StationEventTransportStats {
+        self.stats
+    }
+
+    /// Encodes and sends one station event through the station transport.
+    pub fn send_event(
+        &mut self,
+        transport: &mut InMemoryStationTransport,
+        event: &StationEvent,
+    ) -> Result<(), StationEventTransportError> {
+        let frame = StationEventFrame::from_event(event);
+        let mut bytes = Vec::with_capacity(64);
+        BinaryFrameEncoder.encode_station_event(&frame, &mut bytes)?;
+        let byte_len = bytes.len();
+        transport.send_station(StationOutboundPacket {
+            source_station: event.source,
+            target_station: event.target,
+            bytes,
+        })?;
+        self.stats.events_sent = self.stats.events_sent.saturating_add(1);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(byte_len);
+        Ok(())
+    }
+
+    /// Receives up to `max_packets` for `target_station`, decodes station
+    /// events, and routes them into `router`.
+    pub fn pump_target(
+        &mut self,
+        transport: &mut InMemoryStationTransport,
+        router: &mut EventRouter,
+        target_station: StationId,
+        max_packets: usize,
+    ) -> Result<StationEventPumpReport, StationEventTransportError> {
+        let mut report = StationEventPumpReport {
+            target_station,
+            ..StationEventPumpReport::default()
+        };
+        for _ in 0..max_packets {
+            let Some(packet) = transport.try_recv_station(target_station)? else {
+                break;
+            };
+            report.packets_received = report.packets_received.saturating_add(1);
+            report.bytes_received = report.bytes_received.saturating_add(packet.bytes.len());
+
+            let decoded = BinaryFrameDecoder.decode(&packet.bytes)?;
+            let RuntimeFrame::StationEvent(frame) = decoded else {
+                return Err(StationEventTransportError::UnexpectedFrame);
+            };
+            if frame.source_station != packet.source_station
+                || frame.target_station != packet.target_station
+            {
+                return Err(StationEventTransportError::EndpointMismatch {
+                    packet_source: packet.source_station,
+                    packet_target: packet.target_station,
+                    event_source: frame.source_station,
+                    event_target: frame.target_station,
+                });
+            }
+
+            router.route(frame.into_event())?;
+            report.events_routed = report.events_routed.saturating_add(1);
+        }
+
+        self.stats.packets_received = self
+            .stats
+            .packets_received
+            .saturating_add(report.packets_received);
+        self.stats.bytes_received = self
+            .stats
+            .bytes_received
+            .saturating_add(report.bytes_received);
+        self.stats.events_routed = self
+            .stats
+            .events_routed
+            .saturating_add(report.events_routed);
+        Ok(report)
+    }
+}
+
 /// Basic in-process station scheduler.
 #[derive(Clone, Debug, Default)]
 pub struct StationScheduler {
@@ -1216,6 +1426,51 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(router.stats().routed_events, 1);
         assert_eq!(router.stats().drained_events, 1);
+    }
+
+    #[test]
+    fn station_event_transport_bridge_routes_events_through_bounded_packets() {
+        let mut stations = StationSet::default();
+        stations.push(station(1, 10));
+        stations.push(station(2, 10));
+
+        let mut router = EventRouter::default();
+        router.register_stations(&stations);
+        let mut transport = InMemoryStationTransport::default();
+        transport.register_station(StationId::new(2));
+        let mut bridge = StationEventTransportBridge::default();
+        let event = StationEvent {
+            id: EventId::new(7),
+            source: StationId::new(1),
+            target: StationId::new(2),
+            source_tick: Tick::new(0),
+            target_tick: Tick::new(1),
+            priority: EventPriority::Important,
+            kind: EventKind::Custom(99),
+        };
+
+        bridge
+            .send_event(&mut transport, &event)
+            .expect("event should encode and send");
+        assert_eq!(transport.queued_len(StationId::new(2)), Some(1));
+
+        let report = bridge
+            .pump_target(&mut transport, &mut router, StationId::new(2), 4)
+            .expect("event should pump into router");
+        assert_eq!(report.packets_received, 1);
+        assert_eq!(report.events_routed, 1);
+        assert_eq!(router.queued_len(StationId::new(2)), Some(1));
+
+        let mut scheduler = StationScheduler::default();
+        scheduler.advance_all(&mut stations);
+        let drained = scheduler
+            .drain_ready_events(&stations, &mut router)
+            .expect("drain should work");
+        assert_eq!(drained, vec![event]);
+        assert_eq!(bridge.stats().events_sent, 1);
+        assert_eq!(bridge.stats().events_routed, 1);
+        assert_eq!(transport.stats().packets_sent, 1);
+        assert_eq!(transport.stats().packets_received, 1);
     }
 
     #[test]

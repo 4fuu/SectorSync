@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 sectorsync-core = { path = "../sectorsync-core" }
 sectorsync-transport = { path = "../sectorsync-transport" }
+sectorsync-wire = { path = "../sectorsync-wire" }
 
 [lints]
 workspace = true

@@ -22,6 +22,7 @@ version = "0.1.0"
 dependencies = [
  "sectorsync-core",
  "sectorsync-transport",
+ "sectorsync-wire",
 ]
 
 [[package]]
