@@ -21,6 +21,9 @@
   changing station event frames, station transport, or event router bridging.
 - Use `cargo run -p sectorsync-bench --example udp_station_event` when changing
   UDP station transport or generic station event bridge behavior.
+- Use `cargo run -p sectorsync-bench --example reliable_station_event` when
+  changing reliable station packet helpers, station event reliability examples,
+  or ACK/retry/duplicate-suppression behavior.
 - Use `cargo run -p sectorsync-bench --example generated_schema` when changing
   component schema helpers, generated layout descriptors, or schema hashes.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
@@ -91,6 +94,10 @@ The core library does not own:
   queues. Do not reuse client transport abstractions for station event routing.
 - Station event transport bridges must validate packet endpoints against decoded
   frames before routing events into target queues.
+- Reliable station packet helpers must preserve bounded in-flight windows,
+  payload budgets, retry attempts, timeout accounting, and bounded duplicate
+  suppression history. Do not introduce unbounded replay buffers, hidden
+  blocking waits, or per-entity reliability work in transport hot paths.
 - UDP station transport instances represent one local station. They must reject
   source/target station mismatches instead of silently forwarding malformed
   station packets.
@@ -101,7 +108,8 @@ The core library does not own:
   queues, or hidden per-entity network work in core transport adapters.
 - The standard UDP adapter is a low-level packet adapter only. Reliability,
   encryption, authentication, reconnect, NAT traversal, and gateway/session
-  semantics belong in outer integration layers unless explicitly scoped later.
+  semantics must not be hidden inside the UDP adapter. Use explicit reliable
+  station packet helpers or outer integration layers when reliability is needed.
 - UDP examples/tests must stay localhost-only, use bounded retry loops, and
   avoid long sleeps or external network dependencies.
 - Replication frame changes must preserve entity/component delta payload support

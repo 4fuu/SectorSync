@@ -73,6 +73,9 @@ Current crates:
   in-memory station-to-station packet transport, a non-blocking
   `std::net::UdpSocket` client packet adapter, and a non-blocking UDP
   station-to-station packet adapter with explicit station address registration.
+  It also provides low-level reliable station packet helpers with bounded
+  in-flight windows, ACKs, retries, timeout accounting, and duplicate
+  suppression history.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
@@ -95,6 +98,7 @@ cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --example udp_station_event
+cargo run -p sectorsync-bench --example reliable_station_event
 cargo run -p sectorsync-bench --example generated_schema
 cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
@@ -182,6 +186,9 @@ Initial status:
 - Runtime station event transport bridge encodes typed station events into wire
   frames, moves them through bounded station packet transport, validates packet
   endpoints, and routes decoded events into the target station router.
+- Reliable station packet helpers wrap arbitrary station packet payloads with a
+  bounded ACK/retry envelope, per-target in-flight limits, payload budgets,
+  timeout counters, and bounded duplicate suppression history.
 - Hotspot planner evaluates station/cell load samples and proposes high-pressure
   cells for external schedulers to move.
 - Cell ownership table and cell migration executor can apply split proposals and
@@ -217,6 +224,10 @@ Initial status:
   at the target tick.
 - `cargo run -p sectorsync-bench --example udp_station_event` demonstrates the
   same station event bridge over localhost UDP station transports.
+- `cargo run -p sectorsync-bench --example reliable_station_event`
+  demonstrates a typed cross-station event encoded as a wire frame, wrapped in
+  a reliable station packet envelope, retried once, duplicate-suppressed at the
+  target, acknowledged, routed, and drained at the target tick.
 - `cargo run -p sectorsync-bench --example generated_schema` demonstrates an
   externally generated component schema descriptor registering into the core
   registry, writing a typed component, and materializing a replication frame.
@@ -225,8 +236,8 @@ Not complete yet:
 
 - Long-running split scheduler calibration against production telemetry and
   heavier workload profiles.
-- Reliable station transport policies, authentication/encryption, reconnects,
-  deployment-level routing, and production cluster integration beyond the
-  low-level in-memory and UDP packet adapters.
+- Authentication/encryption, reconnects, deployment-level routing, production
+  cluster integration, and long-running reliability calibration beyond the
+  low-level reliable station packet helpers and in-memory/UDP packet adapters.
 - Reliable transport/session/gateway layers for production client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.
