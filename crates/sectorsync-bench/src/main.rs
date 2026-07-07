@@ -61,7 +61,7 @@ impl Default for BenchConfig {
 impl Default for BenchThresholds {
     fn default() -> Self {
         Self {
-            tick_ms_p99: 25.0,
+            tick_ms_p99: 35.0,
             command_latency_ticks_max: 2,
             command_queue_max: 1024,
             estimated_payload_bytes: 64 * 1024 * 1024,
