@@ -51,6 +51,10 @@ The core library does not own:
   downgrade the old owner to a short-lived ghost after commit.
 - Runtime barrier work must preserve the sequence: request, align to tick
   boundary, freeze, snapshot or migrate, resume.
+- Command queues must remain bounded and barrier-aware. Do not add unbounded
+  command buffers on hot paths.
+- Custom component work should keep SectorSync as a low-level SDK. Do not turn
+  it into a mandatory ECS framework; expose descriptors, storage, and hooks.
 - Station-local APIs may be low-level and high-performance, but they must not
   bypass owner, dirty, replication-budget, barrier, or event-ordering invariants.
 - Station internals should favor single-owner, lock-minimal execution.

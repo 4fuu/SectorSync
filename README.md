@@ -56,14 +56,15 @@ Current crates:
 
 - `crates/sectorsync-core`: IDs, command envelopes, 3D spatial primitives,
   station-local entity storage, ghost/owner roles, dirty masks, compiled sync
-  policies, cell indexing, interest queries, replication planning, event queues,
-  handoff transfer types, hotspot planning, barrier metadata, and snapshot
-  metadata.
+  policies, custom component registry/storage, cell indexing, interest queries,
+  replication planning, bounded command/event queues, handoff transfer types,
+  hotspot planning, barrier metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes and a default binary frame encoder.
 - `crates/sectorsync-transport`: transport sink trait and fake transport for
   tests/benchmarks.
-- `crates/sectorsync-runtime`: in-process station collection helpers and a full
-  runtime barrier controller for tick-boundary freeze/snapshot/resume flows.
+- `crates/sectorsync-runtime`: in-process station collection helpers, a full
+  runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
+  an in-process entity migration executor built on two-phase handoff.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -121,17 +122,23 @@ Initial status:
   alignment, freeze, export snapshots, and resume.
 - Two-phase owner handoff primitives support target ghost prewarming, incoming
   owner commit, and source downgrade to short-lived ghost.
+- Runtime migration executor can move an authoritative entity between in-process
+  stations while leaving the old station with a short-lived ghost.
+- Bounded command queues support priority ordering and barrier-aware
+  buffer/reject/drain behavior.
+- Custom component registry and sparse blob storage allow external systems to
+  register game-owned data without forcing a full ECS framework.
 - Hotspot planner evaluates station/cell load samples and proposes high-pressure
   cells for external schedulers to move.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
-  hotspot report fields.
+  hotspot report fields. It also reports command enqueue/apply counts,
+  command latency in ticks, max queue depth, and tick timing estimates.
 
 Not complete yet:
 
-- Full command queue integration with runtime barrier modes.
 - Automatic station ownership split execution and migration scheduling.
 - Multi-station scheduler and bounded cross-station transport integration beyond
   core queue primitives.
-- Component registry and custom component codecs.
+- Typed component codecs and generated schema helpers.
 - Real transport adapters.
 - Large-scale benchmark validation against the stated hard metrics.
