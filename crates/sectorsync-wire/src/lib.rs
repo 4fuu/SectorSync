@@ -4,7 +4,8 @@
 
 use sectorsync_core::prelude::{
     BarrierId, BarrierState, ClientId, CommandEnvelope, CommandId, CommandPriority, ComponentId,
-    ComponentStore, EntityId, OwnerEpoch, ReplicationPlan, Station, Tick,
+    ComponentStore, EntityId, EventId, EventKind, EventPriority, OwnerEpoch, ReplicationPlan,
+    Station, StationEvent, StationId, Tick,
 };
 
 /// Runtime frame kind.
@@ -18,6 +19,8 @@ pub enum FrameKind {
     Barrier = 2,
     /// Client command ingress frame.
     Command = 3,
+    /// Cross-station event frame.
+    StationEvent = 4,
 }
 
 impl FrameKind {
@@ -28,6 +31,7 @@ impl FrameKind {
             1 => Some(Self::CommandAck),
             2 => Some(Self::Barrier),
             3 => Some(Self::Command),
+            4 => Some(Self::StationEvent),
             _ => None,
         }
     }
@@ -288,6 +292,53 @@ impl CommandFrame {
     }
 }
 
+/// Cross-station event frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StationEventFrame {
+    /// Idempotency key.
+    pub event_id: EventId,
+    /// Source station.
+    pub source_station: StationId,
+    /// Target station.
+    pub target_station: StationId,
+    /// Tick observed at source.
+    pub source_tick: Tick,
+    /// Tick at which target should apply the event.
+    pub target_tick: Tick,
+    /// Priority class.
+    pub priority: EventPriority,
+    /// Event payload kind.
+    pub kind: EventKind,
+}
+
+impl StationEventFrame {
+    /// Converts a runtime station event into a wire frame.
+    pub fn from_event(event: &StationEvent) -> Self {
+        Self {
+            event_id: event.id,
+            source_station: event.source,
+            target_station: event.target,
+            source_tick: event.source_tick,
+            target_tick: event.target_tick,
+            priority: event.priority,
+            kind: event.kind.clone(),
+        }
+    }
+
+    /// Converts a wire frame into a runtime station event.
+    pub fn into_event(self) -> StationEvent {
+        StationEvent {
+            id: self.event_id,
+            source: self.source_station,
+            target: self.target_station,
+            source_tick: self.source_tick,
+            target_tick: self.target_tick,
+            priority: self.priority,
+            kind: self.kind,
+        }
+    }
+}
+
 /// Runtime barrier notification frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BarrierFrame {
@@ -312,6 +363,8 @@ pub enum RuntimeFrame {
     CommandAck(CommandAckFrame),
     /// Barrier notification.
     Barrier(BarrierFrame),
+    /// Cross-station event.
+    StationEvent(StationEventFrame),
 }
 
 /// Encodes frames into bytes.
@@ -337,6 +390,13 @@ pub trait FrameEncoder {
     fn encode_command(
         &mut self,
         frame: &CommandFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error>;
+
+    /// Encodes a cross-station event frame into `out`.
+    fn encode_station_event(
+        &mut self,
+        frame: &StationEventFrame,
         out: &mut Vec<u8>,
     ) -> Result<(), Self::Error>;
 
@@ -375,6 +435,10 @@ pub enum BinaryDecodeError {
     InvalidBarrierState(u8),
     /// Command priority byte is invalid.
     InvalidCommandPriority(u8),
+    /// Event priority byte is invalid.
+    InvalidEventPriority(u8),
+    /// Event kind byte is invalid.
+    InvalidEventKind(u8),
     /// Trailing bytes were present after a complete frame.
     TrailingBytes(usize),
 }
@@ -391,6 +455,8 @@ impl core::fmt::Display for BinaryDecodeError {
             Self::InvalidCommandPriority(priority) => {
                 write!(f, "invalid command priority {priority}")
             }
+            Self::InvalidEventPriority(priority) => write!(f, "invalid event priority {priority}"),
+            Self::InvalidEventKind(kind) => write!(f, "invalid event kind {kind}"),
             Self::TrailingBytes(bytes) => write!(f, "frame has {bytes} trailing bytes"),
         }
     }
@@ -505,6 +571,15 @@ impl FrameDecoder for BinaryFrameDecoder {
                 server_tick: Tick::new(cursor.read_u64()?),
                 state: decode_barrier_state(cursor.read_u8()?)?,
             }),
+            FrameKind::StationEvent => RuntimeFrame::StationEvent(StationEventFrame {
+                event_id: EventId::new(cursor.read_u64()?),
+                source_station: StationId::new(cursor.read_u32()?),
+                target_station: StationId::new(cursor.read_u32()?),
+                source_tick: Tick::new(cursor.read_u64()?),
+                target_tick: Tick::new(cursor.read_u64()?),
+                priority: decode_event_priority(cursor.read_u8()?)?,
+                kind: decode_event_kind(&mut cursor)?,
+            }),
         };
         cursor.finish()?;
         Ok(frame)
@@ -574,6 +649,22 @@ impl FrameEncoder for BinaryFrameEncoder {
         out.extend_from_slice(&frame.kind.to_le_bytes());
         out.push(encode_command_priority(frame.priority));
         write_bytes("command.payload", &frame.payload, out)?;
+        Ok(())
+    }
+
+    fn encode_station_event(
+        &mut self,
+        frame: &StationEventFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        out.push(FrameKind::StationEvent as u8);
+        out.extend_from_slice(&frame.event_id.get().to_le_bytes());
+        out.extend_from_slice(&frame.source_station.get().to_le_bytes());
+        out.extend_from_slice(&frame.target_station.get().to_le_bytes());
+        out.extend_from_slice(&frame.source_tick.get().to_le_bytes());
+        out.extend_from_slice(&frame.target_tick.get().to_le_bytes());
+        out.push(encode_event_priority(frame.priority));
+        encode_event_kind(&frame.kind, out);
         Ok(())
     }
 
@@ -662,6 +753,58 @@ fn decode_command_priority(priority: u8) -> Result<CommandPriority, BinaryDecode
         1 => Ok(CommandPriority::High),
         2 => Ok(CommandPriority::Low),
         _ => Err(BinaryDecodeError::InvalidCommandPriority(priority)),
+    }
+}
+
+fn encode_event_priority(priority: EventPriority) -> u8 {
+    match priority {
+        EventPriority::Critical => 0,
+        EventPriority::Important => 1,
+        EventPriority::BestEffort => 2,
+    }
+}
+
+fn decode_event_priority(priority: u8) -> Result<EventPriority, BinaryDecodeError> {
+    match priority {
+        0 => Ok(EventPriority::Critical),
+        1 => Ok(EventPriority::Important),
+        2 => Ok(EventPriority::BestEffort),
+        _ => Err(BinaryDecodeError::InvalidEventPriority(priority)),
+    }
+}
+
+fn encode_event_kind(kind: &EventKind, out: &mut Vec<u8>) {
+    match kind {
+        EventKind::Custom(kind) => {
+            out.push(0);
+            out.extend_from_slice(&kind.to_le_bytes());
+        }
+        EventKind::HandoffPrepare { entity_id } => {
+            out.push(1);
+            out.extend_from_slice(&entity_id.get().to_le_bytes());
+        }
+        EventKind::HandoffCommit {
+            entity_id,
+            owner_epoch,
+        } => {
+            out.push(2);
+            out.extend_from_slice(&entity_id.get().to_le_bytes());
+            out.extend_from_slice(&owner_epoch.get().to_le_bytes());
+        }
+    }
+}
+
+fn decode_event_kind(cursor: &mut Cursor<'_>) -> Result<EventKind, BinaryDecodeError> {
+    match cursor.read_u8()? {
+        0 => Ok(EventKind::Custom(cursor.read_u32()?)),
+        1 => Ok(EventKind::HandoffPrepare {
+            entity_id: EntityId::new(cursor.read_u64()?),
+        }),
+        2 => Ok(EventKind::HandoffCommit {
+            entity_id: EntityId::new(cursor.read_u64()?),
+            owner_epoch: OwnerEpoch::new(cursor.read_u64()?),
+        }),
+        kind => Err(BinaryDecodeError::InvalidEventKind(kind)),
     }
 }
 
@@ -849,6 +992,76 @@ mod tests {
             .decode(&bytes)
             .expect("decode should work");
         assert_eq!(decoded, RuntimeFrame::Barrier(frame));
+    }
+
+    #[test]
+    fn binary_codec_roundtrips_station_event_frame() {
+        let frames = [
+            StationEventFrame {
+                event_id: EventId::new(1),
+                source_station: StationId::new(10),
+                target_station: StationId::new(11),
+                source_tick: Tick::new(2),
+                target_tick: Tick::new(3),
+                priority: EventPriority::Critical,
+                kind: EventKind::Custom(7),
+            },
+            StationEventFrame {
+                event_id: EventId::new(2),
+                source_station: StationId::new(10),
+                target_station: StationId::new(11),
+                source_tick: Tick::new(2),
+                target_tick: Tick::new(3),
+                priority: EventPriority::Important,
+                kind: EventKind::HandoffPrepare {
+                    entity_id: EntityId::new(99),
+                },
+            },
+            StationEventFrame {
+                event_id: EventId::new(3),
+                source_station: StationId::new(10),
+                target_station: StationId::new(11),
+                source_tick: Tick::new(2),
+                target_tick: Tick::new(3),
+                priority: EventPriority::BestEffort,
+                kind: EventKind::HandoffCommit {
+                    entity_id: EntityId::new(99),
+                    owner_epoch: OwnerEpoch::new(5),
+                },
+            },
+        ];
+
+        for frame in frames {
+            let mut encoder = BinaryFrameEncoder;
+            let mut bytes = Vec::new();
+            encoder
+                .encode_station_event(&frame, &mut bytes)
+                .expect("encoder is infallible");
+
+            let decoded = BinaryFrameDecoder
+                .decode(&bytes)
+                .expect("decode should work");
+            assert_eq!(decoded, RuntimeFrame::StationEvent(frame));
+        }
+    }
+
+    #[test]
+    fn station_event_frame_converts_to_runtime_event() {
+        let event = StationEvent {
+            id: EventId::new(1),
+            source: StationId::new(10),
+            target: StationId::new(11),
+            source_tick: Tick::new(2),
+            target_tick: Tick::new(3),
+            priority: EventPriority::Critical,
+            kind: EventKind::HandoffPrepare {
+                entity_id: EntityId::new(99),
+            },
+        };
+
+        let frame = StationEventFrame::from_event(&event);
+        assert_eq!(frame.event_id, event.id);
+        assert_eq!(frame.clone().into_event(), event);
     }
 
     #[test]
