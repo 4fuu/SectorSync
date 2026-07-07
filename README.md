@@ -59,12 +59,14 @@ Current crates:
   policies, custom component registry/storage, cell indexing, interest queries,
   replication planning, bounded command/event queues, handoff transfer types,
   hotspot planning, barrier metadata, and snapshot metadata.
-- `crates/sectorsync-wire`: frame shapes and a default binary frame encoder.
-- `crates/sectorsync-transport`: transport sink trait and fake transport for
-  tests/benchmarks.
+- `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
+  replication frames, command acknowledgements, and barrier notifications.
+- `crates/sectorsync-transport`: transport sink trait, batch packet API,
+  byte-budget transport wrapper, and fake transport for tests/benchmarks.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
-  an in-process entity migration executor built on two-phase handoff.
+  an in-process entity migration executor built on two-phase handoff. It also
+  includes a station event router and simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -73,10 +75,14 @@ Useful commands:
 cargo test --workspace
 cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
+cargo run -p sectorsync-bench -- --profile=large --allow-heavy
 ```
 
 The default smoke profile is intentionally small. Larger benchmark profiles must
-be requested explicitly, for example `--profile=medium` or `--profile=large`.
+be requested explicitly with `--allow-heavy`, for example `--profile=medium
+--allow-heavy` or `--profile=large --allow-heavy`. Without `--allow-heavy`, a
+heavy profile request stays on smoke-sized data and reports
+`heavy_profile_denied=true`.
 
 ## Performance Targets
 
@@ -128,11 +134,17 @@ Initial status:
   buffer/reject/drain behavior.
 - Custom component registry and sparse blob storage allow external systems to
   register game-owned data without forcing a full ECS framework.
+- Wire codec supports binary encode/decode for replication, command ACK, and
+  barrier frames.
+- Transport SDK supports packet batches and byte-budget enforcement wrappers.
+- Runtime event router queues cross-station events by target station and drains
+  events once their target tick is ready.
 - Hotspot planner evaluates station/cell load samples and proposes high-pressure
   cells for external schedulers to move.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
-  command latency in ticks, max queue depth, and tick timing estimates.
+  command latency in ticks, max queue depth, tick timing estimates, threshold
+  checks, and an aggregate `benchmark_ok` verdict.
 
 Not complete yet:
 

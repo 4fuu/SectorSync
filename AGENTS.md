@@ -15,6 +15,8 @@
   benchmark smoke test.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
+- Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
+  that runs heavy profiles implicitly.
 
 ## Project Boundary
 
@@ -61,6 +63,8 @@ The core library does not own:
 - Multiple stations may run in parallel and communicate by bounded messages.
 - Cross-station events should be tick-boundary ordered and idempotent where
   needed. Do not introduce distributed transactions in the core.
+- Wire and transport abstractions must stay at frame/packet/batch boundaries.
+  Avoid per-entity transport abstraction on hot paths.
 - Runtime-configurable sync policies must compile into compact hot-path data.
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.
