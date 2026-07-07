@@ -24,6 +24,11 @@ impl Position3 {
         let dz = self.z - other.z;
         dx.mul_add(dx, dy.mul_add(dy, dz * dz))
     }
+
+    /// Returns this position as a vector from the origin.
+    pub const fn to_vec3(self) -> Vec3 {
+        Vec3::new(self.x, self.y, self.z)
+    }
 }
 
 /// 3D vector used for extents and offsets.
@@ -41,6 +46,12 @@ impl Vec3 {
     /// Creates a new vector.
     pub const fn new(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
+    }
+
+    /// Dot product with another vector.
+    pub fn dot(self, other: Self) -> f32 {
+        self.x
+            .mul_add(other.x, self.y.mul_add(other.y, self.z * other.z))
     }
 }
 
@@ -83,6 +94,93 @@ impl Aabb3 {
             && self.max.y >= other.min.y
             && self.min.z <= other.max.z
             && self.max.z >= other.min.z
+    }
+}
+
+/// Plane represented as `normal dot position + distance >= 0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plane3 {
+    /// Inward-facing plane normal.
+    pub normal: Vec3,
+    /// Signed distance term.
+    pub distance: f32,
+}
+
+impl Plane3 {
+    /// Creates a plane from a normal and distance term.
+    pub const fn new(normal: Vec3, distance: f32) -> Self {
+        Self { normal, distance }
+    }
+
+    /// Creates a plane passing through a point.
+    pub fn from_normal_and_point(normal: Vec3, point: Position3) -> Self {
+        Self {
+            normal,
+            distance: -normal.dot(point.to_vec3()),
+        }
+    }
+
+    /// Signed distance from a position to this plane.
+    pub fn signed_distance_to_position(self, position: Position3) -> f32 {
+        self.normal.dot(position.to_vec3()) + self.distance
+    }
+
+    /// Returns whether an AABB intersects this plane's positive half-space.
+    pub fn intersects_aabb(self, aabb: Aabb3) -> bool {
+        let positive = Position3::new(
+            if self.normal.x >= 0.0 {
+                aabb.max.x
+            } else {
+                aabb.min.x
+            },
+            if self.normal.y >= 0.0 {
+                aabb.max.y
+            } else {
+                aabb.min.y
+            },
+            if self.normal.z >= 0.0 {
+                aabb.max.z
+            } else {
+                aabb.min.z
+            },
+        );
+        self.signed_distance_to_position(positive) >= 0.0
+    }
+}
+
+/// Six-plane 3D visibility volume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frustum3 {
+    /// Inward-facing clipping planes.
+    pub planes: [Plane3; 6],
+}
+
+impl Frustum3 {
+    /// Creates a frustum from six inward-facing planes.
+    pub const fn from_planes(planes: [Plane3; 6]) -> Self {
+        Self { planes }
+    }
+
+    /// Creates an axis-aligned six-plane volume from an AABB.
+    pub fn from_aabb(aabb: Aabb3) -> Self {
+        Self::from_planes([
+            Plane3::new(Vec3::new(1.0, 0.0, 0.0), -aabb.min.x),
+            Plane3::new(Vec3::new(-1.0, 0.0, 0.0), aabb.max.x),
+            Plane3::new(Vec3::new(0.0, 1.0, 0.0), -aabb.min.y),
+            Plane3::new(Vec3::new(0.0, -1.0, 0.0), aabb.max.y),
+            Plane3::new(Vec3::new(0.0, 0.0, 1.0), -aabb.min.z),
+            Plane3::new(Vec3::new(0.0, 0.0, -1.0), aabb.max.z),
+        ])
+    }
+
+    /// Returns whether an AABB intersects every clipping half-space.
+    pub fn intersects_aabb(self, aabb: Aabb3) -> bool {
+        self.planes.iter().all(|plane| plane.intersects_aabb(aabb))
+    }
+
+    /// Returns whether bounds at a position intersect this frustum.
+    pub fn intersects_bounds(self, position: Position3, bounds: Bounds) -> bool {
+        self.intersects_aabb(bounds.to_aabb(position))
     }
 }
 
@@ -213,3 +311,24 @@ impl core::fmt::Display for GridSpecError {
 }
 
 impl std::error::Error for GridSpecError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frustum_from_aabb_accepts_intersecting_bounds_and_rejects_outside() {
+        let frustum = Frustum3::from_aabb(Aabb3::new(
+            Position3::new(0.0, -10.0, -10.0),
+            Position3::new(50.0, 10.0, 10.0),
+        ));
+
+        assert!(frustum.intersects_bounds(Position3::new(25.0, 0.0, 0.0), Bounds::Point));
+        assert!(frustum.intersects_bounds(
+            Position3::new(55.0, 0.0, 0.0),
+            Bounds::Sphere { radius: 8.0 }
+        ));
+        assert!(!frustum.intersects_bounds(Position3::new(-5.0, 0.0, 0.0), Bounds::Point));
+        assert!(!frustum.intersects_bounds(Position3::new(25.0, 20.0, 0.0), Bounds::Point));
+    }
+}

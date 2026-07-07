@@ -108,3 +108,75 @@ impl ReplicationPlanner {
         plan
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{ClientId, EntityId, InstanceId, NodeId, PolicyId, StationId};
+    use crate::interest::{AndVisibility, FrustumVisibility, RangeOnlyVisibility};
+    use crate::policy::CompiledSyncPolicy;
+    use crate::spatial::{Aabb3, Bounds, Frustum3, GridSpec, Position3};
+    use crate::station::{Station, StationConfig};
+
+    #[test]
+    fn planner_applies_composed_frustum_visibility_filter() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let grid = GridSpec::new(16.0).expect("grid is valid");
+        let mut index = CellIndex::new(grid);
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 128.0));
+
+        let visible = station
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(10.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn visible");
+        let outside_frustum = station
+            .spawn_owned(
+                EntityId::new(2),
+                Position3::new(-10.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn outside frustum");
+        index.upsert(visible, Position3::new(10.0, 0.0, 0.0), Bounds::Point);
+        index.upsert(
+            outside_frustum,
+            Position3::new(-10.0, 0.0, 0.0),
+            Bounds::Point,
+        );
+
+        let viewer = ViewerQuery {
+            client_id: ClientId::new(7),
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: 128.0,
+            max_entities: 8,
+        };
+        let frustum = Frustum3::from_aabb(Aabb3::new(
+            Position3::new(0.0, -20.0, -20.0),
+            Position3::new(80.0, 20.0, 20.0),
+        ));
+        let filter = AndVisibility::new(RangeOnlyVisibility, FrustumVisibility::new(frustum));
+
+        let plan = ReplicationPlanner::plan_for_viewer(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &filter,
+            ReplicationBudget::default(),
+        );
+
+        assert_eq!(plan.entities, vec![visible]);
+        assert_eq!(plan.stats.selected, 1);
+        assert_eq!(plan.stats.considered, 2);
+    }
+}

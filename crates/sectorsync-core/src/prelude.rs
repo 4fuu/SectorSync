@@ -31,12 +31,14 @@ pub use crate::ids::{
     BarrierId, ClientId, CommandId, ComponentId, EntityHandle, EntityId, EventId, InstanceId,
     NodeId, OwnerEpoch, PolicyId, StationId, Tick,
 };
-pub use crate::interest::{RangeOnlyVisibility, ViewerQuery, VisibilityFilter};
+pub use crate::interest::{
+    AndVisibility, FrustumVisibility, RangeOnlyVisibility, ViewerQuery, VisibilityFilter,
+};
 pub use crate::policy::{CompiledSyncPolicy, PolicyTable};
 pub use crate::replication::{
     ReplicationBudget, ReplicationPlan, ReplicationPlanner, ReplicationStats,
 };
 pub use crate::snapshot::{RuntimeUpgradeHook, SnapshotMeta, SnapshotVersion, StationSnapshot};
-pub use crate::spatial::{Aabb3, Bounds, CellCoord3, GridSpec, Position3, Vec3};
+pub use crate::spatial::{Aabb3, Bounds, CellCoord3, Frustum3, GridSpec, Plane3, Position3, Vec3};
 pub use crate::spatial_index::{CellIndex, CellOccupancy};
 pub use crate::station::{Station, StationConfig, StationError};

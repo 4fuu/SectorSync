@@ -65,6 +65,9 @@
 - Use `cargo run -p sectorsync-bench --example load_scheduler` when changing
   station scheduler behavior, load-aware scheduling, or station advancement
   planning.
+- Use `cargo run -p sectorsync-bench --example frustum_visibility` when changing
+  3D spatial frustum primitives, visibility filters, or replication-planner
+  visibility integration.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -130,6 +133,11 @@ The core library does not own:
   bypass frozen-barrier checks.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded
   command buffers on hot paths.
+- Visibility filters may provide range, frustum, tag, or integration-defined
+  acceptance checks for replication planning. They must stay pure and
+  allocation-light on hot paths, and they must not own camera systems,
+  rendering, occlusion pipelines, client world state, or game-specific
+  perception rules.
 - Gateway/session primitives must remain low-level and bounded: session tables,
   route epochs, reconnect generations, replay/stale sequence checks, expiry,
   and per-client command admission limits are allowed; sockets, auth providers,

@@ -61,9 +61,9 @@ Current crates:
   station-local entity storage, ghost/owner roles, dirty masks, compiled sync
   policies, custom component registry/storage, typed component codecs, schema
   helpers, generated-schema-friendly layout descriptors, cell indexing,
-  interest queries, replication planning, bounded command/event queues, handoff
-  transfer types, hotspot planning, gateway session/routing primitives, barrier
-  metadata, and snapshot metadata.
+  interest queries, range/frustum visibility filters, replication planning,
+  bounded command/event queues, handoff transfer types, hotspot planning,
+  gateway session/routing primitives, barrier metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, client command
   ingress frames, internal gateway-to-station command dispatch frames, command
@@ -105,6 +105,7 @@ cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example load_scheduler
+cargo run -p sectorsync-bench --example frustum_visibility
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example barrier_transport
@@ -174,8 +175,9 @@ Initial status:
 - Git repository initialized on branch `main`.
 - Rust workspace scaffolded.
 - Core low-level SDK types exist for station ownership, 3D spatial indexing,
-  interest queries, policy tables, replication planning, event queues, barriers,
-  snapshots, commands, and fake transport integration.
+  interest queries, range/frustum visibility filtering, policy tables,
+  replication planning, event queues, barriers, snapshots, commands, and fake
+  transport integration.
 - Runtime barrier controller can request scoped barriers, wait for station tick
   alignment, freeze, export snapshots, and resume.
 - Runtime barrier notification bridge encodes barrier states into bounded client
@@ -228,6 +230,9 @@ Initial status:
   barrier frames. Replication frames can carry concrete entity/component deltas.
 - Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
   concrete wire payloads with bounded entity/component materialization.
+- Built-in visibility filters support range-only culling, six-plane 3D frustum
+  culling, and composable filter conjunctions for replication planning without
+  adding camera, rendering, occlusion, or client-world ownership to SectorSync.
 - Runtime replication transport bridge plans AOI for a viewer, builds a concrete
   replication frame from component storage, skips empty frames by default,
   encodes the frame, and submits it to bounded client packet transport.
@@ -304,6 +309,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example load_scheduler` demonstrates a
   bounded load-aware station scheduler pass that prioritizes high-pressure
   stations without owning thread pools, processes, or GPU execution.
+- `cargo run -p sectorsync-bench --example frustum_visibility` demonstrates a
+  low-level 3D frustum visibility filter composed with range culling before
+  replication planning.
 - `cargo run -p sectorsync-bench --example replication_bridge` demonstrates a
   low-level downlink path: viewer AOI planning, replication frame building,
   bounded in-memory client transport send, receive, source/target validation,
