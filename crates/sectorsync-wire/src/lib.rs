@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use sectorsync_core::prelude::{BarrierId, BarrierState, ClientId, CommandId, Tick};
+use sectorsync_core::prelude::{
+    BarrierId, BarrierState, ClientId, CommandId, ComponentId, EntityId, OwnerEpoch, Tick,
+};
 
 /// Runtime frame kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +40,32 @@ pub struct ReplicationFrame {
     pub entity_count: u32,
     /// Estimated payload bytes before transport overhead.
     pub estimated_payload_bytes: u32,
+    /// Concrete entity/component deltas included in this frame.
+    pub entities: Vec<EntityDelta>,
+}
+
+/// Entity delta included in a replication frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityDelta {
+    /// Entity being updated.
+    pub entity_id: EntityId,
+    /// Owner epoch observed by the sender.
+    pub owner_epoch: OwnerEpoch,
+    /// Component deltas for this entity.
+    pub components: Vec<ComponentDelta>,
+}
+
+/// Component delta included in an entity delta.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentDelta {
+    /// Component id.
+    pub component_id: ComponentId,
+    /// Component version.
+    pub version: u64,
+    /// Runtime-defined flags.
+    pub flags: u8,
+    /// Encoded component bytes.
+    pub bytes: Vec<u8>,
 }
 
 /// Command acknowledgement frame.
@@ -151,6 +179,40 @@ impl core::fmt::Display for BinaryDecodeError {
 
 impl std::error::Error for BinaryDecodeError {}
 
+/// Binary encode error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BinaryEncodeError {
+    /// A list length exceeded `u32::MAX`.
+    TooManyItems {
+        /// Field being encoded.
+        field: &'static str,
+        /// Actual item count.
+        actual: usize,
+    },
+    /// A byte payload exceeded `u32::MAX`.
+    PayloadTooLarge {
+        /// Field being encoded.
+        field: &'static str,
+        /// Actual byte count.
+        actual: usize,
+    },
+}
+
+impl core::fmt::Display for BinaryEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooManyItems { field, actual } => {
+                write!(f, "{field} has too many items: {actual}")
+            }
+            Self::PayloadTooLarge { field, actual } => {
+                write!(f, "{field} payload is too large: {actual} bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BinaryEncodeError {}
+
 /// Simple little-endian binary frame decoder.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinaryFrameDecoder;
@@ -169,6 +231,35 @@ impl FrameDecoder for BinaryFrameDecoder {
                 server_tick: Tick::new(cursor.read_u64()?),
                 entity_count: cursor.read_u32()?,
                 estimated_payload_bytes: cursor.read_u32()?,
+                entities: {
+                    let entity_delta_count = cursor.read_u32()? as usize;
+                    let mut entities = Vec::with_capacity(entity_delta_count);
+                    for _ in 0..entity_delta_count {
+                        let entity_id = EntityId::new(cursor.read_u64()?);
+                        let owner_epoch = OwnerEpoch::new(cursor.read_u64()?);
+                        let component_count = cursor.read_u16()? as usize;
+                        let mut components = Vec::with_capacity(component_count);
+                        for _ in 0..component_count {
+                            let component_id = ComponentId::new(cursor.read_u16()?);
+                            let version = cursor.read_u64()?;
+                            let flags = cursor.read_u8()?;
+                            let byte_len = cursor.read_u32()? as usize;
+                            let bytes = cursor.read_bytes(byte_len)?;
+                            components.push(ComponentDelta {
+                                component_id,
+                                version,
+                                flags,
+                                bytes,
+                            });
+                        }
+                        entities.push(EntityDelta {
+                            entity_id,
+                            owner_epoch,
+                            components,
+                        });
+                    }
+                    entities
+                },
             }),
             FrameKind::CommandAck => RuntimeFrame::CommandAck(CommandAckFrame {
                 client_id: ClientId::new(cursor.read_u64()?),
@@ -194,7 +285,7 @@ impl FrameDecoder for BinaryFrameDecoder {
 pub struct BinaryFrameEncoder;
 
 impl FrameEncoder for BinaryFrameEncoder {
-    type Error = core::convert::Infallible;
+    type Error = BinaryEncodeError;
 
     fn encode_replication(
         &mut self,
@@ -206,6 +297,22 @@ impl FrameEncoder for BinaryFrameEncoder {
         out.extend_from_slice(&frame.server_tick.get().to_le_bytes());
         out.extend_from_slice(&frame.entity_count.to_le_bytes());
         out.extend_from_slice(&frame.estimated_payload_bytes.to_le_bytes());
+        write_len_u32("replication.entities", frame.entities.len(), out)?;
+        for entity in &frame.entities {
+            out.extend_from_slice(&entity.entity_id.get().to_le_bytes());
+            out.extend_from_slice(&entity.owner_epoch.get().to_le_bytes());
+            write_len_u16(
+                "replication.entity.components",
+                entity.components.len(),
+                out,
+            )?;
+            for component in &entity.components {
+                out.extend_from_slice(&component.component_id.get().to_le_bytes());
+                out.extend_from_slice(&component.version.to_le_bytes());
+                out.push(component.flags);
+                write_bytes("replication.component.bytes", &component.bytes, out)?;
+            }
+        }
         Ok(())
     }
 
@@ -235,6 +342,42 @@ impl FrameEncoder for BinaryFrameEncoder {
         out.push(encode_barrier_state(frame.state));
         Ok(())
     }
+}
+
+fn write_len_u16(
+    field: &'static str,
+    len: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), BinaryEncodeError> {
+    let len =
+        u16::try_from(len).map_err(|_| BinaryEncodeError::TooManyItems { field, actual: len })?;
+    out.extend_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+fn write_len_u32(
+    field: &'static str,
+    len: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), BinaryEncodeError> {
+    let len =
+        u32::try_from(len).map_err(|_| BinaryEncodeError::TooManyItems { field, actual: len })?;
+    out.extend_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+fn write_bytes(
+    field: &'static str,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), BinaryEncodeError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| BinaryEncodeError::PayloadTooLarge {
+        field,
+        actual: bytes.len(),
+    })?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn encode_barrier_state(state: BarrierState) -> u8 {
@@ -298,6 +441,13 @@ impl<'a> Cursor<'a> {
         Ok(out)
     }
 
+    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, BinaryDecodeError> {
+        self.require(len)?;
+        let bytes = self.input[self.offset..self.offset + len].to_vec();
+        self.offset += len;
+        Ok(bytes)
+    }
+
     fn require(&self, count: usize) -> Result<(), BinaryDecodeError> {
         let needed = self.offset.saturating_add(count);
         if needed > self.input.len() {
@@ -332,6 +482,16 @@ mod tests {
             server_tick: Tick::new(42),
             entity_count: 17,
             estimated_payload_bytes: 544,
+            entities: vec![EntityDelta {
+                entity_id: EntityId::new(100),
+                owner_epoch: OwnerEpoch::new(2),
+                components: vec![ComponentDelta {
+                    component_id: ComponentId::new(1),
+                    version: 9,
+                    flags: 0,
+                    bytes: vec![1, 2, 3, 4],
+                }],
+            }],
         };
         let mut encoder = BinaryFrameEncoder;
         let mut bytes = Vec::new();

@@ -5,13 +5,15 @@ use std::time::Instant;
 
 use sectorsync_core::prelude::{
     Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
-    CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, EntityId, GridSpec,
-    HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, PolicyId, PolicyTable,
-    Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig,
-    StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
+    CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
+    GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, OwnerEpoch,
+    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
+    Station, StationConfig, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
 };
 use sectorsync_transport::{FakeTransport, OutboundPacket, TransportSink};
-use sectorsync_wire::{BinaryFrameEncoder, FrameEncoder, ReplicationFrame};
+use sectorsync_wire::{
+    BinaryFrameEncoder, ComponentDelta, EntityDelta, FrameEncoder, ReplicationFrame,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Baseline {
@@ -73,6 +75,8 @@ struct BenchStats {
     estimated_payload_bytes: usize,
     encoded_packets: usize,
     encoded_bytes: usize,
+    payload_entity_deltas: usize,
+    payload_component_deltas: usize,
     commands_enqueued: usize,
     commands_applied: usize,
     command_latency_ticks_total: u64,
@@ -103,6 +107,11 @@ fn main() {
     println!("estimated_payload_bytes={}", stats.estimated_payload_bytes);
     println!("encoded_packets={}", stats.encoded_packets);
     println!("encoded_bytes={}", stats.encoded_bytes);
+    println!("payload_entity_deltas={}", stats.payload_entity_deltas);
+    println!(
+        "payload_component_deltas={}",
+        stats.payload_component_deltas
+    );
     println!("commands_enqueued={}", stats.commands_enqueued);
     println!("commands_applied={}", stats.commands_applied);
     println!(
@@ -319,12 +328,19 @@ fn run(config: BenchConfig) -> BenchStats {
 
             stats.updates += updates;
             stats.estimated_payload_bytes += updates * 32;
+            let entity_deltas = build_sample_deltas(updates, client_index, station.tick());
+            stats.payload_entity_deltas += entity_deltas.len();
+            stats.payload_component_deltas += entity_deltas
+                .iter()
+                .map(|delta| delta.components.len())
+                .sum::<usize>();
 
             let frame = ReplicationFrame {
                 client_id: ClientId::new(client_index as u64),
                 server_tick: station.tick(),
                 entity_count: updates.min(u32::MAX as usize) as u32,
                 estimated_payload_bytes: (updates * 32).min(u32::MAX as usize) as u32,
+                entities: entity_deltas,
             };
             let mut bytes = Vec::with_capacity(32);
             encoder
@@ -347,6 +363,26 @@ fn run(config: BenchConfig) -> BenchStats {
     stats.encoded_packets = transport.packets_sent();
     stats.encoded_bytes = transport.bytes_sent();
     stats
+}
+
+fn build_sample_deltas(update_count: usize, client_index: usize, tick: Tick) -> Vec<EntityDelta> {
+    let sample_count = update_count.min(16);
+    (0..sample_count)
+        .map(|offset| {
+            let entity_id = EntityId::new(((client_index * 31) + offset) as u64);
+            let tick_value = tick.get() as u32;
+            EntityDelta {
+                entity_id,
+                owner_epoch: OwnerEpoch::new(0),
+                components: vec![ComponentDelta {
+                    component_id: ComponentId::new(1),
+                    version: tick.get(),
+                    flags: 0,
+                    bytes: tick_value.to_le_bytes().to_vec(),
+                }],
+            }
+        })
+        .collect()
 }
 
 fn percentile_ms(values: &[f64], percentile: f64) -> f64 {
