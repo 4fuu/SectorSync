@@ -327,8 +327,9 @@ Initial status:
   gateway/deployment command dispatch transport counts, low-level
   client/gateway transport command/ACK/replication roundtrip counts, command
   latency in ticks, max queue depth, payload entity/component delta counts,
-  tick timing estimates, host parallelism, default resource guard limits,
-  threshold checks, and an aggregate `benchmark_ok` verdict.
+  replication scratch query/candidate counts, tick timing estimates, host
+  parallelism, default resource guard limits, threshold checks, and an
+  aggregate `benchmark_ok` verdict.
 - `cargo run -p sectorsync-bench --example sdk_flow` demonstrates an
   end-to-end embeddable SDK path: station, cell index, component store,
   replication plan, frame builder, binary codec, and fake transport.

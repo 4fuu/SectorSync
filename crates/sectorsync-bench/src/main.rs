@@ -9,8 +9,8 @@ use sectorsync_core::prelude::{
     CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
     GatewayConfig, GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity,
     HotspotThresholds, InstanceId, NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3,
-    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig, StationId,
-    StationLoadSample, Tick, Vec3, ViewerQuery,
+    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station,
+    StationConfig, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
@@ -101,6 +101,8 @@ struct BenchStats {
     encoded_bytes: usize,
     payload_entity_deltas: usize,
     payload_component_deltas: usize,
+    replication_scratch_queries: usize,
+    replication_scratch_candidates: usize,
     commands_enqueued: usize,
     commands_applied: usize,
     gateway_commands_dispatched: usize,
@@ -164,6 +166,14 @@ fn main() {
     println!(
         "payload_component_deltas={}",
         stats.payload_component_deltas
+    );
+    println!(
+        "replication_scratch_queries={}",
+        stats.replication_scratch_queries
+    );
+    println!(
+        "replication_scratch_candidates={}",
+        stats.replication_scratch_candidates
     );
     println!("commands_enqueued={}", stats.commands_enqueued);
     println!("commands_applied={}", stats.commands_applied);
@@ -462,6 +472,7 @@ fn run(config: BenchConfig) -> BenchStats {
     let mut command_queues = create_command_queues(config.stations);
     let mut dispatch = DispatchBench::new(config);
     let mut client_bridge = ClientBridgeBench::new(config);
+    let mut replication_scratch = ReplicationScratch::default();
     let mut next_command_id = 1_u64;
 
     for tick_index in 0..config.ticks {
@@ -510,14 +521,20 @@ fn run(config: BenchConfig) -> BenchStats {
                         radius: 256.0,
                         max_entities: 300,
                     };
-                    let plan = ReplicationPlanner::plan_for_viewer(
+                    let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
                         station,
                         &indexes[station_index],
                         &policies,
                         &viewer,
                         &RangeOnlyVisibility,
                         ReplicationBudget::default(),
+                        &mut replication_scratch,
                     );
+                    stats.replication_scratch_queries =
+                        stats.replication_scratch_queries.saturating_add(1);
+                    stats.replication_scratch_candidates = stats
+                        .replication_scratch_candidates
+                        .saturating_add(replication_scratch.candidate_count());
                     plan.stats.selected
                 }
             };

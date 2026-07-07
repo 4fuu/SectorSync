@@ -14,7 +14,9 @@
 - Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
   benchmark smoke test, including the lightweight gateway/deployment command
   dispatch transport workload and bounded low-level client/gateway bridge
-  roundtrip workload.
+  roundtrip workload. The default SectorSync replication benchmark path should
+  exercise reusable replication planning scratch and report scratch query
+  counters.
 - Use `cargo run -p sectorsync-bench --example replication_bridge` when changing
   runtime replication transport send/receive bridges, AOI-to-frame downlink
   flow, or client replication transport integration.
