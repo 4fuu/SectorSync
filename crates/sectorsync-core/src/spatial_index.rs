@@ -5,6 +5,15 @@ use std::collections::{HashMap, HashSet};
 use crate::ids::EntityHandle;
 use crate::spatial::{Aabb3, Bounds, CellCoord3, GridSpec, Position3};
 
+/// Occupancy count for one non-empty cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellOccupancy {
+    /// Cell coordinate.
+    pub cell: CellCoord3,
+    /// Number of indexed entity handles in the cell.
+    pub entities: usize,
+}
+
 /// Station-local 3D cell index.
 #[derive(Clone, Debug)]
 pub struct CellIndex {
@@ -88,5 +97,19 @@ impl CellIndex {
     /// Number of non-empty cells.
     pub fn occupied_cell_count(&self) -> usize {
         self.cells.len()
+    }
+
+    /// Returns deterministic occupancy counts for all non-empty cells.
+    pub fn cell_occupancy(&self) -> Vec<CellOccupancy> {
+        let mut cells = self
+            .cells
+            .iter()
+            .map(|(cell, handles)| CellOccupancy {
+                cell: *cell,
+                entities: handles.len(),
+            })
+            .collect::<Vec<_>>();
+        cells.sort_by_key(|occupancy| occupancy.cell);
+        cells
     }
 }

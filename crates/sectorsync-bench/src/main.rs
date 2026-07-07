@@ -4,9 +4,10 @@ use std::env;
 use std::time::Instant;
 
 use sectorsync_core::prelude::{
-    Bounds, CellIndex, ClientId, CompiledSyncPolicy, EntityId, GridSpec, InstanceId, NodeId,
-    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
-    Station, StationConfig, StationId, Vec3, ViewerQuery,
+    Bounds, CellIndex, CellLoadSample, ClientId, CompiledSyncPolicy, EntityId, GridSpec,
+    HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, PolicyId, PolicyTable,
+    Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig,
+    StationId, StationLoadSample, Vec3, ViewerQuery,
 };
 use sectorsync_transport::{FakeTransport, OutboundPacket, TransportSink};
 use sectorsync_wire::{BinaryFrameEncoder, FrameEncoder, ReplicationFrame};
@@ -46,6 +47,10 @@ struct BenchStats {
     estimated_payload_bytes: usize,
     encoded_packets: usize,
     encoded_bytes: usize,
+    max_cell_entities: usize,
+    warm_stations: usize,
+    hotspot_stations: usize,
+    split_candidate_cells: usize,
 }
 
 fn main() {
@@ -64,6 +69,10 @@ fn main() {
     println!("estimated_payload_bytes={}", stats.estimated_payload_bytes);
     println!("encoded_packets={}", stats.encoded_packets);
     println!("encoded_bytes={}", stats.encoded_bytes);
+    println!("max_cell_entities={}", stats.max_cell_entities);
+    println!("warm_stations={}", stats.warm_stations);
+    println!("hotspot_stations={}", stats.hotspot_stations);
+    println!("split_candidate_cells={}", stats.split_candidate_cells);
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
 }
 
@@ -118,6 +127,7 @@ fn run(config: BenchConfig) -> BenchStats {
     let clients = create_clients(config.clients);
 
     let mut stats = BenchStats::default();
+    apply_hotspot_report(&mut stats, config, &stations, &indexes);
     let mut encoder = BinaryFrameEncoder;
     let mut transport = FakeTransport::default();
 
@@ -230,6 +240,75 @@ fn populate_entities(count: usize, stations: &mut [Station], indexes: &mut [Cell
             )
             .expect("entity ids are unique");
         indexes[station_index].upsert(handle, position, bounds);
+    }
+}
+
+fn apply_hotspot_report(
+    stats: &mut BenchStats,
+    config: BenchConfig,
+    stations: &[Station],
+    indexes: &[CellIndex],
+) {
+    let thresholds = hotspot_thresholds(config);
+    let subscribers_per_station = config.clients.div_ceil(config.stations);
+
+    for (station, index) in stations.iter().zip(indexes) {
+        let cells = index
+            .cell_occupancy()
+            .into_iter()
+            .map(|occupancy| {
+                stats.max_cell_entities = stats.max_cell_entities.max(occupancy.entities);
+                CellLoadSample {
+                    cell: occupancy.cell,
+                    owned_entities: occupancy.entities,
+                    estimated_updates: occupancy.entities,
+                    estimated_bytes: occupancy.entities * 32,
+                    subscribers: subscribers_per_station,
+                    ..CellLoadSample::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let owned_entities = station.iter().filter(|entity| entity.is_owned()).count();
+        let sample = StationLoadSample {
+            station_id: station.config().station_id,
+            owned_entities,
+            subscribers: subscribers_per_station,
+            estimated_bytes: owned_entities * subscribers_per_station * 32,
+            tick_cost_units: owned_entities as u64,
+            cells,
+            ..StationLoadSample::default()
+        };
+
+        let decision = HotspotPlanner::evaluate(&sample, thresholds);
+        match decision.severity {
+            HotspotSeverity::Normal => {}
+            HotspotSeverity::Warm => {
+                stats.warm_stations += 1;
+                stats.split_candidate_cells += HotspotPlanner::propose_cell_split(&sample, 2)
+                    .cells_to_move
+                    .len();
+            }
+            HotspotSeverity::Hot => {
+                stats.hotspot_stations += 1;
+                stats.split_candidate_cells += HotspotPlanner::propose_cell_split(&sample, 4)
+                    .cells_to_move
+                    .len();
+            }
+        }
+    }
+}
+
+fn hotspot_thresholds(config: BenchConfig) -> HotspotThresholds {
+    let average_entities = config.entities.div_ceil(config.stations).max(1);
+    let average_subscribers = config.clients.div_ceil(config.stations).max(1);
+    HotspotThresholds {
+        max_station_entities: average_entities + average_entities / 2,
+        max_station_subscribers: average_subscribers + average_subscribers / 2,
+        max_estimated_bytes: average_entities * average_subscribers * 48,
+        max_tick_cost_units: (average_entities as u64).saturating_mul(2),
+        max_cell_pressure: 512,
+        ..HotspotThresholds::default()
     }
 }
 

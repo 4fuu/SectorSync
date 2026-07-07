@@ -7,6 +7,10 @@ pub use crate::event::{
     EventKind, EventPriority, EventQueueLimits, EventQueues, PushOutcome, StationEvent,
 };
 pub use crate::handoff::{HandoffCommitHandles, HandoffTransfer};
+pub use crate::hotspot::{
+    CellLoadSample, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotThresholds,
+    SplitProposal, StationLoadSample,
+};
 pub use crate::ids::{
     BarrierId, ClientId, CommandId, ComponentId, EntityHandle, EntityId, EventId, InstanceId,
     NodeId, OwnerEpoch, PolicyId, StationId, Tick,
@@ -18,5 +22,5 @@ pub use crate::replication::{
 };
 pub use crate::snapshot::{RuntimeUpgradeHook, SnapshotMeta, SnapshotVersion, StationSnapshot};
 pub use crate::spatial::{Aabb3, Bounds, CellCoord3, GridSpec, Position3, Vec3};
-pub use crate::spatial_index::CellIndex;
+pub use crate::spatial_index::{CellIndex, CellOccupancy};
 pub use crate::station::{Station, StationConfig, StationError};

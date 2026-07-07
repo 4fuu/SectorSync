@@ -7,6 +7,7 @@ pub mod command;
 pub mod entity;
 pub mod event;
 pub mod handoff;
+pub mod hotspot;
 pub mod ids;
 pub mod interest;
 pub mod policy;
