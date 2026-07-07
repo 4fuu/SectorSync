@@ -18,11 +18,11 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
-    TransportSink,
+    TransportReceiver, TransportSink,
 };
 use sectorsync_wire::{
     BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
-    CommandDispatchFrame, ComponentSelection, FrameDecoder, FrameEncoder,
+    CommandDispatchFrame, ComponentSelection, FrameDecoder, FrameEncoder, ReplicationFrame,
     ReplicationFrameBuildStats, ReplicationFrameBuilder, RuntimeFrame, StationEventFrame,
 };
 
@@ -273,6 +273,264 @@ const fn replication_report(
         estimated_plan_bytes,
         bytes_sent,
         sent,
+    }
+}
+
+/// Replication receive bridge configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationReceiveConfig {
+    /// Local client id expected inside replication frames.
+    pub client_id: ClientId,
+    /// Expected remote sender identity when the transport can identify it.
+    pub expected_source: Option<ClientId>,
+}
+
+impl ReplicationReceiveConfig {
+    /// Creates receive configuration for a local client.
+    pub const fn new(client_id: ClientId) -> Self {
+        Self {
+            client_id,
+            expected_source: None,
+        }
+    }
+
+    /// Returns a copy that expects packets from `source`.
+    pub const fn with_expected_source(mut self, source: ClientId) -> Self {
+        self.expected_source = Some(source);
+        self
+    }
+}
+
+/// Replication receive bridge statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationReceiveStats {
+    /// Packets consumed from client transport.
+    pub packets_received: usize,
+    /// Bytes consumed from client transport.
+    pub bytes_received: usize,
+    /// Replication frames decoded and accepted.
+    pub frames_received: usize,
+    /// Packets rejected by wire decoding.
+    pub frames_rejected_decode: usize,
+    /// Packets rejected because they were not replication frames.
+    pub frames_rejected_unexpected: usize,
+    /// Packets rejected because the transport source did not match.
+    pub frames_rejected_source: usize,
+    /// Packets rejected because the frame target did not match this client.
+    pub frames_rejected_target: usize,
+    /// Entity deltas received.
+    pub entities_received: usize,
+    /// Component deltas received.
+    pub components_received: usize,
+}
+
+/// Result of pumping replication packets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationReceivePump {
+    /// Packets consumed from client transport.
+    pub packets_received: usize,
+    /// Bytes consumed from client transport.
+    pub bytes_received: usize,
+    /// Decoded replication frames.
+    pub frames: Vec<ReplicationFrame>,
+}
+
+impl ReplicationReceivePump {
+    /// Returns accepted frame count.
+    pub fn frames_received(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Returns received entity delta count.
+    pub fn entities_received(&self) -> usize {
+        self.frames.iter().map(|frame| frame.entities.len()).sum()
+    }
+
+    /// Returns received component delta count.
+    pub fn components_received(&self) -> usize {
+        self.frames
+            .iter()
+            .flat_map(|frame| &frame.entities)
+            .map(|entity| entity.components.len())
+            .sum()
+    }
+}
+
+/// Error produced while receiving replication frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicationReceiveError<E> {
+    /// Underlying client transport failed.
+    Transport(E),
+    /// Wire decoding failed.
+    Decode(BinaryDecodeError),
+    /// Packet decoded as a non-replication frame.
+    UnexpectedFrame,
+    /// Packet source did not match expected remote.
+    SourceMismatch {
+        /// Expected source.
+        expected: ClientId,
+        /// Actual source if transport identified one.
+        actual: Option<ClientId>,
+    },
+    /// Replication frame targeted another client.
+    TargetMismatch {
+        /// Expected local client id.
+        expected: ClientId,
+        /// Actual frame target.
+        actual: ClientId,
+    },
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for ReplicationReceiveError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::UnexpectedFrame => f.write_str("client packet was not a replication frame"),
+            Self::SourceMismatch { expected, actual } => write!(
+                f,
+                "replication source mismatch: expected {}, actual {:?}",
+                expected.get(),
+                actual.map(ClientId::get)
+            ),
+            Self::TargetMismatch { expected, actual } => write!(
+                f,
+                "replication target mismatch: expected {}, actual {}",
+                expected.get(),
+                actual.get()
+            ),
+        }
+    }
+}
+
+impl<E> std::error::Error for ReplicationReceiveError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::UnexpectedFrame | Self::SourceMismatch { .. } | Self::TargetMismatch { .. } => {
+                None
+            }
+        }
+    }
+}
+
+impl<E> From<BinaryDecodeError> for ReplicationReceiveError<E> {
+    fn from(value: BinaryDecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+/// Bridge between client packet transport and decoded replication frames.
+#[derive(Clone, Debug)]
+pub struct ReplicationReceiveBridge {
+    config: ReplicationReceiveConfig,
+    stats: ReplicationReceiveStats,
+}
+
+impl ReplicationReceiveBridge {
+    /// Creates a receive bridge.
+    pub const fn new(config: ReplicationReceiveConfig) -> Self {
+        Self {
+            config,
+            stats: ReplicationReceiveStats {
+                packets_received: 0,
+                bytes_received: 0,
+                frames_received: 0,
+                frames_rejected_decode: 0,
+                frames_rejected_unexpected: 0,
+                frames_rejected_source: 0,
+                frames_rejected_target: 0,
+                entities_received: 0,
+                components_received: 0,
+            },
+        }
+    }
+
+    /// Returns configuration.
+    pub const fn config(&self) -> ReplicationReceiveConfig {
+        self.config
+    }
+
+    /// Returns accumulated statistics.
+    pub const fn stats(&self) -> ReplicationReceiveStats {
+        self.stats
+    }
+
+    /// Receives and decodes up to `max_packets` replication frames.
+    pub fn pump<T>(
+        &mut self,
+        transport: &mut T,
+        max_packets: usize,
+    ) -> Result<ReplicationReceivePump, ReplicationReceiveError<T::Error>>
+    where
+        T: TransportReceiver,
+    {
+        let mut pump = ReplicationReceivePump::default();
+        for _ in 0..max_packets {
+            let Some(packet) = transport
+                .try_recv()
+                .map_err(ReplicationReceiveError::Transport)?
+            else {
+                break;
+            };
+            self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+            self.stats.bytes_received =
+                self.stats.bytes_received.saturating_add(packet.bytes.len());
+            pump.packets_received = pump.packets_received.saturating_add(1);
+            pump.bytes_received = pump.bytes_received.saturating_add(packet.bytes.len());
+
+            if let Some(expected) = self.config.expected_source {
+                if packet.client_id != Some(expected) {
+                    self.stats.frames_rejected_source =
+                        self.stats.frames_rejected_source.saturating_add(1);
+                    return Err(ReplicationReceiveError::SourceMismatch {
+                        expected,
+                        actual: packet.client_id,
+                    });
+                }
+            }
+
+            let decoded = match BinaryFrameDecoder.decode(&packet.bytes) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.stats.frames_rejected_decode =
+                        self.stats.frames_rejected_decode.saturating_add(1);
+                    return Err(ReplicationReceiveError::Decode(error));
+                }
+            };
+            let RuntimeFrame::Replication(frame) = decoded else {
+                self.stats.frames_rejected_unexpected =
+                    self.stats.frames_rejected_unexpected.saturating_add(1);
+                return Err(ReplicationReceiveError::UnexpectedFrame);
+            };
+            if frame.client_id != self.config.client_id {
+                self.stats.frames_rejected_target =
+                    self.stats.frames_rejected_target.saturating_add(1);
+                return Err(ReplicationReceiveError::TargetMismatch {
+                    expected: self.config.client_id,
+                    actual: frame.client_id,
+                });
+            }
+
+            self.stats.frames_received = self.stats.frames_received.saturating_add(1);
+            self.stats.entities_received = self
+                .stats
+                .entities_received
+                .saturating_add(frame.entities.len());
+            let components = frame
+                .entities
+                .iter()
+                .map(|entity| entity.components.len())
+                .sum::<usize>();
+            self.stats.components_received =
+                self.stats.components_received.saturating_add(components);
+            pump.frames.push(frame);
+        }
+        Ok(pump)
     }
 }
 
@@ -2460,11 +2718,12 @@ mod tests {
         StationConfig, StationLoadSample, U32LeCodec,
     };
     use sectorsync_transport::{
-        FakeTransport, InMemoryStationTransport, StationOutboundPacket, StationTransportSink,
+        ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportHub,
+        OutboundPacket, StationOutboundPacket, StationTransportSink, TransportSink,
     };
     use sectorsync_wire::{
-        BinaryFrameDecoder, BinaryFrameEncoder, CommandDispatchFrame, CommandFrame, FrameDecoder,
-        FrameEncoder,
+        BinaryFrameDecoder, BinaryFrameEncoder, CommandDispatchFrame, CommandFrame, ComponentDelta,
+        EntityDelta, FrameDecoder, FrameEncoder, ReplicationFrame,
     };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
@@ -2657,6 +2916,120 @@ mod tests {
         assert_eq!(transport.packets_sent(), 0);
         assert_eq!(bridge.stats().frames_skipped_empty, 1);
         assert_eq!(bridge.stats().entities_selected, 1);
+    }
+
+    #[test]
+    fn replication_receive_bridge_decodes_target_frames() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 4,
+            max_packet_bytes: 512,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, "127.0.0.1:23007".parse().expect("client addr"))
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23000".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let frame = ReplicationFrame {
+            client_id,
+            server_tick: Tick::new(12),
+            entity_count: 1,
+            estimated_payload_bytes: 4,
+            entities: vec![EntityDelta {
+                entity_id: EntityId::new(100),
+                owner_epoch: OwnerEpoch::new(1),
+                components: vec![ComponentDelta {
+                    component_id: ComponentId::new(1),
+                    version: 1,
+                    flags: 0,
+                    bytes: 100_u32.to_le_bytes().to_vec(),
+                }],
+            }],
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_replication(&frame, &mut bytes)
+            .expect("replication should encode");
+        server_transport
+            .send(OutboundPacket { client_id, bytes })
+            .expect("replication packet should send");
+
+        let mut receive = ReplicationReceiveBridge::new(
+            ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
+        );
+        let pump = receive
+            .pump(&mut client_transport, 4)
+            .expect("replication packet should receive");
+
+        assert_eq!(pump.frames_received(), 1);
+        assert_eq!(pump.entities_received(), 1);
+        assert_eq!(pump.components_received(), 1);
+        assert_eq!(pump.frames[0].client_id, client_id);
+        assert_eq!(receive.stats().packets_received, 1);
+        assert_eq!(receive.stats().frames_received, 1);
+        assert_eq!(receive.stats().entities_received, 1);
+        assert_eq!(receive.stats().components_received, 1);
+        assert!(receive.stats().bytes_received > 0);
+    }
+
+    #[test]
+    fn replication_receive_bridge_rejects_wrong_target() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let wrong_client_id = ClientId::new(99);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 4,
+            max_packet_bytes: 512,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, "127.0.0.1:23107".parse().expect("client addr"))
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23100".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let frame = ReplicationFrame {
+            client_id: wrong_client_id,
+            server_tick: Tick::new(12),
+            entity_count: 1,
+            estimated_payload_bytes: 4,
+            entities: vec![EntityDelta {
+                entity_id: EntityId::new(100),
+                owner_epoch: OwnerEpoch::new(1),
+                components: vec![ComponentDelta {
+                    component_id: ComponentId::new(1),
+                    version: 1,
+                    flags: 0,
+                    bytes: 100_u32.to_le_bytes().to_vec(),
+                }],
+            }],
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_replication(&frame, &mut bytes)
+            .expect("replication should encode");
+        server_transport
+            .send(OutboundPacket { client_id, bytes })
+            .expect("replication packet should send");
+
+        let mut receive = ReplicationReceiveBridge::new(
+            ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
+        );
+        let error = receive
+            .pump(&mut client_transport, 4)
+            .expect_err("wrong target should be rejected");
+
+        assert!(matches!(
+            error,
+            ReplicationReceiveError::TargetMismatch {
+                expected,
+                actual,
+            } if expected == client_id && actual == wrong_client_id
+        ));
+        assert_eq!(receive.stats().packets_received, 1);
+        assert_eq!(receive.stats().frames_received, 0);
+        assert_eq!(receive.stats().frames_rejected_target, 1);
     }
 
     #[test]

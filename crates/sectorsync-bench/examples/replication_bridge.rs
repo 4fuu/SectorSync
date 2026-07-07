@@ -6,9 +6,11 @@ use sectorsync_core::prelude::{
     NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, Station, StationConfig,
     StationId, U32LeCodec, ViewerQuery,
 };
-use sectorsync_runtime::ReplicationTransportBridge;
-use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub, TransportReceiver};
-use sectorsync_wire::{BinaryFrameDecoder, ComponentSelection, FrameDecoder, RuntimeFrame};
+use sectorsync_runtime::{
+    ReplicationReceiveBridge, ReplicationReceiveConfig, ReplicationTransportBridge,
+};
+use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub};
+use sectorsync_wire::ComponentSelection;
 
 fn main() {
     let client_id = ClientId::new(7);
@@ -81,27 +83,25 @@ fn main() {
         .expect("replication should send");
     assert!(report.sent);
 
-    let inbound = client_transport
-        .try_recv()
-        .expect("client receive should work")
-        .expect("replication packet should arrive");
-    assert_eq!(inbound.client_id, Some(server_id));
-    let RuntimeFrame::Replication(frame) = BinaryFrameDecoder
-        .decode(&inbound.bytes)
-        .expect("replication should decode")
-    else {
-        panic!("expected replication frame");
-    };
+    let mut receive_bridge = ReplicationReceiveBridge::new(
+        ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
+    );
+    let pump = receive_bridge
+        .pump(&mut client_transport, 4)
+        .expect("replication should receive");
+    assert_eq!(pump.frames_received(), 1);
+    let frame = &pump.frames[0];
     assert_eq!(frame.client_id, client_id);
     assert_eq!(frame.entities.len(), 1);
     assert_eq!(frame.entities[0].components.len(), 1);
 
     println!(
-        "replication_bridge sent={} bytes={} selected={} entities={} components={}",
+        "replication_bridge sent={} recv={} bytes={} selected={} entities={} components={}",
         bridge.stats().frames_sent,
+        receive_bridge.stats().frames_received,
         bridge.stats().bytes_sent,
         report.selected_entities,
-        report.encoded_entities,
-        report.encoded_components
+        pump.entities_received(),
+        pump.components_received()
     );
 }

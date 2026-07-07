@@ -88,8 +88,8 @@ Current crates:
   scheduling with cooldown/capacity/improvement guards, cell-level migration
   execution, a low-level deployment node/station route table, a station event
   router, bounded station event and command dispatch transport bridges, a
-  bounded client replication transport bridge, a business-agnostic gateway
-  command pipeline, and a simple station scheduler.
+  bounded client replication send/receive transport bridge, a business-agnostic
+  gateway command pipeline, and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -211,6 +211,9 @@ Initial status:
 - Runtime replication transport bridge plans AOI for a viewer, builds a concrete
   replication frame from component storage, skips empty frames by default,
   encodes the frame, and submits it to bounded client packet transport.
+- Runtime replication receive bridge consumes bounded client packet transport,
+  validates optional source client metadata and target client id, decodes
+  replication frames, and reports received entity/component counts.
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
 - Packet security helpers support bounded security envelopes, key ids, nonces,
   authentication tags, pluggable authenticator/cipher traits, explicit
@@ -271,7 +274,8 @@ Initial status:
   benchmark profile.
 - `cargo run -p sectorsync-bench --example replication_bridge` demonstrates a
   low-level downlink path: viewer AOI planning, replication frame building,
-  bounded in-memory client transport send, receive, and decode.
+  bounded in-memory client transport send, receive, source/target validation,
+  and decode.
 - `cargo run -p sectorsync-bench --example gateway_session` demonstrates a
   low-level gateway session table connecting a client, routing commands into
   station command queues, rerouting to another station, rate-limiting a command,

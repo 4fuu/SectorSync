@@ -15,8 +15,8 @@
   benchmark smoke test, including the lightweight gateway/deployment command
   dispatch transport workload.
 - Use `cargo run -p sectorsync-bench --example replication_bridge` when changing
-  runtime replication transport bridges, AOI-to-frame downlink flow, or client
-  replication transport integration.
+  runtime replication transport send/receive bridges, AOI-to-frame downlink
+  flow, or client replication transport integration.
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
@@ -188,9 +188,10 @@ The core library does not own:
 - Replication frame changes must preserve entity/component delta payload support
   and maintain binary encode/decode roundtrip tests.
 - Replication transport bridges may plan AOI, build bounded replication frames,
-  encode wire bytes, and submit packets to client transport. They must not add
-  hidden persistence, blocking client IO, unbounded per-client buffers, or game
-  payload interpretation.
+  encode wire bytes, submit packets to client transport, receive packets,
+  validate source/target metadata, and decode replication frames. They must not
+  add hidden persistence, blocking client IO, unbounded per-client buffers,
+  client state storage, or game payload interpretation.
 - SDK-level changes should include or update an example/integration test when
   they affect the expected external usage flow.
 - Split/migration changes should keep `cargo run -p sectorsync-bench --example
