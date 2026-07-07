@@ -12,7 +12,8 @@ pub use crate::component::{
 };
 pub use crate::entity::{DirtyMask, EntityRecord, EntityRole, EntityTags};
 pub use crate::event::{
-    EventKind, EventPriority, EventQueueLimits, EventQueues, PushOutcome, StationEvent,
+    EventKind, EventPriority, EventQueueError, EventQueueLimits, EventQueues, PushOutcome,
+    StationEvent,
 };
 pub use crate::handoff::{HandoffCommitHandles, HandoffTransfer};
 pub use crate::hotspot::{

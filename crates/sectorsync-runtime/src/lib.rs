@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use sectorsync_core::prelude::{
     BarrierId, BarrierScope, BarrierState, CommandQueueMode, EntityHandle, EntityId,
-    HandoffTransfer, OwnerEpoch, RuntimeBarrier, SnapshotVersion, Station, StationError, StationId,
+    EventQueueError, EventQueueLimits, EventQueues, HandoffTransfer, OwnerEpoch, PushOutcome,
+    RuntimeBarrier, SnapshotVersion, Station, StationError, StationEvent, StationId,
     StationSnapshot, Tick,
 };
 
@@ -192,6 +193,164 @@ impl EntityMigrationExecutor {
 
 fn next_target_epoch(station: &mut Station) -> OwnerEpoch {
     station.next_owner_epoch()
+}
+
+/// Event router statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventRouterStats {
+    /// Events accepted by target queues.
+    pub routed_events: usize,
+    /// Ready events drained for station application.
+    pub drained_events: usize,
+    /// Best-effort events dropped by bounded target queues.
+    pub dropped_best_effort_events: usize,
+}
+
+/// Event router error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventRouterError {
+    /// Target station was not registered with the router.
+    MissingTarget(StationId),
+    /// Underlying target queue rejected the event.
+    Queue(EventQueueError),
+}
+
+impl core::fmt::Display for EventRouterError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingTarget(id) => write!(f, "event target station {} is missing", id.get()),
+            Self::Queue(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for EventRouterError {}
+
+impl From<EventQueueError> for EventRouterError {
+    fn from(value: EventQueueError) -> Self {
+        Self::Queue(value)
+    }
+}
+
+/// In-process station event router.
+#[derive(Clone, Debug)]
+pub struct EventRouter {
+    limits: EventQueueLimits,
+    queues: BTreeMap<StationId, EventQueues>,
+    stats: EventRouterStats,
+}
+
+impl EventRouter {
+    /// Creates an empty event router.
+    pub fn new(limits: EventQueueLimits) -> Self {
+        Self {
+            limits,
+            queues: BTreeMap::new(),
+            stats: EventRouterStats::default(),
+        }
+    }
+
+    /// Registers a station target queue.
+    pub fn register_station(&mut self, station_id: StationId) {
+        self.queues
+            .entry(station_id)
+            .or_insert_with(|| EventQueues::new(self.limits));
+    }
+
+    /// Registers all stations in a set.
+    pub fn register_stations(&mut self, stations: &StationSet) {
+        for station in stations.iter() {
+            self.register_station(station.config().station_id);
+        }
+    }
+
+    /// Routes an event to its target station queue.
+    pub fn route(&mut self, event: StationEvent) -> Result<PushOutcome, EventRouterError> {
+        let queue = self
+            .queues
+            .get_mut(&event.target)
+            .ok_or(EventRouterError::MissingTarget(event.target))?;
+        let outcome = queue.push(event)?;
+        self.stats.routed_events += 1;
+        if outcome == PushOutcome::DroppedOldestBestEffort {
+            self.stats.dropped_best_effort_events += 1;
+        }
+        Ok(outcome)
+    }
+
+    /// Drains events whose `target_tick` is ready for application.
+    pub fn drain_ready(
+        &mut self,
+        station_id: StationId,
+        current_tick: Tick,
+    ) -> Result<Vec<StationEvent>, EventRouterError> {
+        let queue = self
+            .queues
+            .get_mut(&station_id)
+            .ok_or(EventRouterError::MissingTarget(station_id))?;
+        let mut ready = Vec::new();
+        let mut delayed = Vec::new();
+
+        while let Some(event) = queue.pop_next() {
+            if event.target_tick <= current_tick {
+                ready.push(event);
+            } else {
+                delayed.push(event);
+            }
+        }
+
+        for event in delayed {
+            queue.push(event)?;
+        }
+        self.stats.drained_events += ready.len();
+        Ok(ready)
+    }
+
+    /// Returns queued event count for one station.
+    pub fn queued_len(&self, station_id: StationId) -> Option<usize> {
+        self.queues.get(&station_id).map(EventQueues::len)
+    }
+
+    /// Returns router statistics.
+    pub const fn stats(&self) -> EventRouterStats {
+        self.stats
+    }
+}
+
+impl Default for EventRouter {
+    fn default() -> Self {
+        Self::new(EventQueueLimits::default())
+    }
+}
+
+/// Basic in-process station scheduler.
+#[derive(Clone, Debug, Default)]
+pub struct StationScheduler {
+    /// Total station ticks advanced by this scheduler.
+    pub advanced_ticks: u64,
+}
+
+impl StationScheduler {
+    /// Advances every station by one tick.
+    pub fn advance_all(&mut self, stations: &mut StationSet) {
+        for station in stations.iter_mut() {
+            station.advance_tick();
+            self.advanced_ticks = self.advanced_ticks.saturating_add(1);
+        }
+    }
+
+    /// Drains router events ready for each station's current tick.
+    pub fn drain_ready_events(
+        &mut self,
+        stations: &StationSet,
+        router: &mut EventRouter,
+    ) -> Result<Vec<StationEvent>, EventRouterError> {
+        let mut events = Vec::new();
+        for station in stations.iter() {
+            events.extend(router.drain_ready(station.config().station_id, station.tick())?);
+        }
+        Ok(events)
+    }
 }
 
 /// Per-station progress inside a full runtime barrier.
@@ -427,7 +586,8 @@ impl BarrierController {
 mod tests {
     use super::*;
     use sectorsync_core::prelude::{
-        Bounds, InstanceId, NodeId, PolicyId, Position3, StationConfig,
+        Bounds, EventId, EventKind, EventPriority, InstanceId, NodeId, PolicyId, Position3,
+        StationConfig,
     };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
@@ -518,5 +678,41 @@ mod tests {
                 .expect("target owner")
                 .is_owned()
         );
+    }
+
+    #[test]
+    fn event_router_delays_until_target_tick_and_scheduler_drains() {
+        let mut stations = StationSet::default();
+        stations.push(station(1, 10));
+        stations.push(station(2, 10));
+
+        let mut router = EventRouter::default();
+        router.register_stations(&stations);
+        router
+            .route(StationEvent {
+                id: EventId::new(1),
+                source: StationId::new(1),
+                target: StationId::new(2),
+                source_tick: Tick::new(0),
+                target_tick: Tick::new(2),
+                priority: EventPriority::Critical,
+                kind: EventKind::Custom(7),
+            })
+            .expect("route should work");
+
+        let mut scheduler = StationScheduler::default();
+        scheduler.advance_all(&mut stations);
+        let drained = scheduler
+            .drain_ready_events(&stations, &mut router)
+            .expect("drain should work");
+        assert!(drained.is_empty());
+
+        scheduler.advance_all(&mut stations);
+        let drained = scheduler
+            .drain_ready_events(&stations, &mut router)
+            .expect("drain should work");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(router.stats().routed_events, 1);
+        assert_eq!(router.stats().drained_events, 1);
     }
 }
