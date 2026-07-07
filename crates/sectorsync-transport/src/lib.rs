@@ -3,10 +3,11 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
-use sectorsync_core::prelude::ClientId;
+use sectorsync_core::prelude::{ClientId, StationId};
 
 /// Default maximum UDP datagram bytes read by `UdpTransport`.
 pub const DEFAULT_UDP_RECV_BUFFER_SIZE: usize = 16 * 1024;
@@ -29,6 +30,64 @@ pub struct InboundPacket {
     pub remote_addr: SocketAddr,
     /// Encoded bytes.
     pub bytes: Vec<u8>,
+}
+
+/// Outbound station-to-station packet after wire encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StationOutboundPacket {
+    /// Source station.
+    pub source_station: StationId,
+    /// Target station.
+    pub target_station: StationId,
+    /// Encoded bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Inbound station-to-station packet before wire decoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StationInboundPacket {
+    /// Source station.
+    pub source_station: StationId,
+    /// Target station.
+    pub target_station: StationId,
+    /// Encoded bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Batch of outbound station-to-station packets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StationPacketBatch {
+    /// Packets to send together.
+    pub packets: Vec<StationOutboundPacket>,
+}
+
+impl StationPacketBatch {
+    /// Creates an empty station packet batch.
+    pub const fn new() -> Self {
+        Self {
+            packets: Vec::new(),
+        }
+    }
+
+    /// Adds one packet to the batch.
+    pub fn push(&mut self, packet: StationOutboundPacket) {
+        self.packets.push(packet);
+    }
+
+    /// Returns packet count.
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    /// Returns whether the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    /// Returns total byte count.
+    pub fn bytes_len(&self) -> usize {
+        self.packets.iter().map(|packet| packet.bytes.len()).sum()
+    }
 }
 
 /// Batch of outbound packets.
@@ -95,6 +154,224 @@ pub trait TransportReceiver {
     /// Implementations should return `Ok(None)` when no packet is currently
     /// available instead of blocking the caller's station tick.
     fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error>;
+}
+
+/// Station-to-station packet sink abstraction.
+pub trait StationTransportSink {
+    /// Transport error type.
+    type Error;
+
+    /// Sends one encoded station packet.
+    fn send_station(&mut self, packet: StationOutboundPacket) -> Result<(), Self::Error>;
+
+    /// Sends a station packet batch.
+    fn send_station_batch(&mut self, batch: StationPacketBatch) -> Result<(), Self::Error> {
+        for packet in batch.packets {
+            self.send_station(packet)?;
+        }
+        Ok(())
+    }
+}
+
+/// Non-blocking station-to-station receive abstraction.
+pub trait StationTransportReceiver {
+    /// Transport error type.
+    type Error;
+
+    /// Attempts to receive one encoded packet for `target_station`.
+    fn try_recv_station(
+        &mut self,
+        target_station: StationId,
+    ) -> Result<Option<StationInboundPacket>, Self::Error>;
+}
+
+/// Bounded in-memory station transport limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationTransportLimits {
+    /// Maximum queued packets per target station.
+    pub max_queued_packets_per_station: usize,
+    /// Maximum bytes accepted per packet.
+    pub max_packet_bytes: usize,
+}
+
+impl Default for StationTransportLimits {
+    fn default() -> Self {
+        Self {
+            max_queued_packets_per_station: 4096,
+            max_packet_bytes: 16 * 1024,
+        }
+    }
+}
+
+/// Statistics for the bounded in-memory station transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InMemoryStationTransportStats {
+    /// Packets accepted for delivery.
+    pub packets_sent: usize,
+    /// Packets received by target stations.
+    pub packets_received: usize,
+    /// Bytes accepted for delivery.
+    pub bytes_sent: usize,
+    /// Bytes received by target stations.
+    pub bytes_received: usize,
+    /// Packets rejected because the target station queue was full.
+    pub packets_rejected_full: usize,
+    /// Packets rejected because they exceeded the packet byte budget.
+    pub packets_rejected_bytes: usize,
+}
+
+/// Error produced by bounded in-memory station transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationTransportError {
+    /// Target station was not registered.
+    MissingTarget(StationId),
+    /// Target station queue is full.
+    QueueFull {
+        /// Target station.
+        station_id: StationId,
+        /// Configured queue capacity.
+        capacity: usize,
+    },
+    /// Packet exceeded the byte budget.
+    PacketTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+}
+
+impl core::fmt::Display for StationTransportError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingTarget(station_id) => {
+                write!(
+                    f,
+                    "station transport target {} is missing",
+                    station_id.get()
+                )
+            }
+            Self::QueueFull {
+                station_id,
+                capacity,
+            } => write!(
+                f,
+                "station transport target {} queue is full at capacity {capacity}",
+                station_id.get()
+            ),
+            Self::PacketTooLarge { budget, actual } => {
+                write!(
+                    f,
+                    "station transport packet exceeded byte budget: budget {budget}, actual {actual}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StationTransportError {}
+
+/// Bounded in-memory station-to-station packet transport.
+#[derive(Clone, Debug)]
+pub struct InMemoryStationTransport {
+    limits: StationTransportLimits,
+    queues: BTreeMap<StationId, VecDeque<StationInboundPacket>>,
+    stats: InMemoryStationTransportStats,
+}
+
+impl InMemoryStationTransport {
+    /// Creates an empty bounded station transport.
+    pub fn new(limits: StationTransportLimits) -> Self {
+        Self {
+            limits,
+            queues: BTreeMap::new(),
+            stats: InMemoryStationTransportStats::default(),
+        }
+    }
+
+    /// Registers a target station queue.
+    pub fn register_station(&mut self, station_id: StationId) {
+        self.queues
+            .entry(station_id)
+            .or_insert_with(|| VecDeque::with_capacity(self.limits.max_queued_packets_per_station));
+    }
+
+    /// Returns queued packet count for a station.
+    pub fn queued_len(&self, station_id: StationId) -> Option<usize> {
+        self.queues.get(&station_id).map(VecDeque::len)
+    }
+
+    /// Returns configured limits.
+    pub const fn limits(&self) -> StationTransportLimits {
+        self.limits
+    }
+
+    /// Returns transport statistics.
+    pub const fn stats(&self) -> InMemoryStationTransportStats {
+        self.stats
+    }
+}
+
+impl Default for InMemoryStationTransport {
+    fn default() -> Self {
+        Self::new(StationTransportLimits::default())
+    }
+}
+
+impl StationTransportSink for InMemoryStationTransport {
+    type Error = StationTransportError;
+
+    fn send_station(&mut self, packet: StationOutboundPacket) -> Result<(), Self::Error> {
+        let actual = packet.bytes.len();
+        if actual > self.limits.max_packet_bytes {
+            self.stats.packets_rejected_bytes = self.stats.packets_rejected_bytes.saturating_add(1);
+            return Err(StationTransportError::PacketTooLarge {
+                budget: self.limits.max_packet_bytes,
+                actual,
+            });
+        }
+
+        let queue = self
+            .queues
+            .get_mut(&packet.target_station)
+            .ok_or(StationTransportError::MissingTarget(packet.target_station))?;
+        if queue.len() >= self.limits.max_queued_packets_per_station {
+            self.stats.packets_rejected_full = self.stats.packets_rejected_full.saturating_add(1);
+            return Err(StationTransportError::QueueFull {
+                station_id: packet.target_station,
+                capacity: self.limits.max_queued_packets_per_station,
+            });
+        }
+
+        self.stats.packets_sent = self.stats.packets_sent.saturating_add(1);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(actual);
+        queue.push_back(StationInboundPacket {
+            source_station: packet.source_station,
+            target_station: packet.target_station,
+            bytes: packet.bytes,
+        });
+        Ok(())
+    }
+}
+
+impl StationTransportReceiver for InMemoryStationTransport {
+    type Error = StationTransportError;
+
+    fn try_recv_station(
+        &mut self,
+        target_station: StationId,
+    ) -> Result<Option<StationInboundPacket>, Self::Error> {
+        let queue = self
+            .queues
+            .get_mut(&target_station)
+            .ok_or(StationTransportError::MissingTarget(target_station))?;
+        let Some(packet) = queue.pop_front() else {
+            return Ok(None);
+        };
+        self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+        self.stats.bytes_received = self.stats.bytes_received.saturating_add(packet.bytes.len());
+        Ok(Some(packet))
+    }
 }
 
 /// Error produced by the standard UDP transport adapter.
@@ -179,11 +456,7 @@ impl UdpTransport {
     }
 
     /// Registers or replaces the address for a client.
-    pub fn register_client(
-        &mut self,
-        client_id: ClientId,
-        addr: SocketAddr,
-    ) -> Option<SocketAddr> {
+    pub fn register_client(&mut self, client_id: ClientId, addr: SocketAddr) -> Option<SocketAddr> {
         let old_addr = self.clients.insert(client_id, addr);
         if let Some(old_addr) = old_addr {
             self.addr_to_client.remove(&old_addr);
@@ -413,6 +686,14 @@ mod tests {
         }
     }
 
+    fn station_packet(bytes: usize) -> StationOutboundPacket {
+        StationOutboundPacket {
+            source_station: StationId::new(1),
+            target_station: StationId::new(2),
+            bytes: vec![1; bytes],
+        }
+    }
+
     fn recv_with_retry(transport: &mut UdpTransport) -> InboundPacket {
         for _ in 0..50 {
             if let Some(packet) = transport.try_recv().expect("udp receive should work") {
@@ -457,6 +738,66 @@ mod tests {
             }
         );
         assert_eq!(transport.inner().packets_sent(), 0);
+    }
+
+    #[test]
+    fn in_memory_station_transport_delivers_bounded_packets() {
+        let mut transport = InMemoryStationTransport::new(StationTransportLimits {
+            max_queued_packets_per_station: 2,
+            max_packet_bytes: 8,
+        });
+        transport.register_station(StationId::new(2));
+
+        transport
+            .send_station(station_packet(4))
+            .expect("station packet should send");
+        assert_eq!(transport.queued_len(StationId::new(2)), Some(1));
+
+        let packet = transport
+            .try_recv_station(StationId::new(2))
+            .expect("receive should work")
+            .expect("packet should exist");
+        assert_eq!(packet.source_station, StationId::new(1));
+        assert_eq!(packet.target_station, StationId::new(2));
+        assert_eq!(packet.bytes, vec![1; 4]);
+        assert_eq!(transport.stats().packets_sent, 1);
+        assert_eq!(transport.stats().packets_received, 1);
+    }
+
+    #[test]
+    fn in_memory_station_transport_rejects_full_queue_and_large_packet() {
+        let mut transport = InMemoryStationTransport::new(StationTransportLimits {
+            max_queued_packets_per_station: 1,
+            max_packet_bytes: 4,
+        });
+        transport.register_station(StationId::new(2));
+        transport
+            .send_station(station_packet(4))
+            .expect("first packet should send");
+
+        let full = transport
+            .send_station(station_packet(4))
+            .expect_err("queue should be full");
+        assert_eq!(
+            full,
+            StationTransportError::QueueFull {
+                station_id: StationId::new(2),
+                capacity: 1
+            }
+        );
+
+        let large = transport
+            .send_station(station_packet(5))
+            .expect_err("packet should exceed budget");
+        assert_eq!(
+            large,
+            StationTransportError::PacketTooLarge {
+                budget: 4,
+                actual: 5
+            }
+        );
+        assert_eq!(transport.stats().packets_rejected_full, 1);
+        assert_eq!(transport.stats().packets_rejected_bytes, 1);
     }
 
     #[test]
