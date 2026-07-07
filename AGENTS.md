@@ -47,6 +47,10 @@ The core library does not own:
 - Every entity has exactly one authoritative owner station at a time.
 - Ghost entities are read-only. They can support AOI, visibility, prewarming,
   and candidate queries, but cannot make final state changes.
+- Two-phase handoff must prewarm target ghosts before owner commit and must
+  downgrade the old owner to a short-lived ghost after commit.
+- Runtime barrier work must preserve the sequence: request, align to tick
+  boundary, freeze, snapshot or migrate, resume.
 - Station-local APIs may be low-level and high-performance, but they must not
   bypass owner, dirty, replication-budget, barrier, or event-ordering invariants.
 - Station internals should favor single-owner, lock-minimal execution.

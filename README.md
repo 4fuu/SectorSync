@@ -57,11 +57,13 @@ Current crates:
 - `crates/sectorsync-core`: IDs, command envelopes, 3D spatial primitives,
   station-local entity storage, ghost/owner roles, dirty masks, compiled sync
   policies, cell indexing, interest queries, replication planning, event queues,
-  barrier metadata, and snapshot metadata.
+  handoff transfer types, hotspot planning, barrier metadata, and snapshot
+  metadata.
 - `crates/sectorsync-wire`: frame shapes and a default binary frame encoder.
 - `crates/sectorsync-transport`: transport sink trait and fake transport for
   tests/benchmarks.
-- `crates/sectorsync-runtime`: in-process station collection helpers.
+- `crates/sectorsync-runtime`: in-process station collection helpers and a full
+  runtime barrier controller for tick-boundary freeze/snapshot/resume flows.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -115,15 +117,21 @@ Initial status:
 - Core low-level SDK types exist for station ownership, 3D spatial indexing,
   interest queries, policy tables, replication planning, event queues, barriers,
   snapshots, commands, and fake transport integration.
-- Smoke benchmark runs through planning, frame encoding, and fake transport.
+- Runtime barrier controller can request scoped barriers, wait for station tick
+  alignment, freeze, export snapshots, and resume.
+- Two-phase owner handoff primitives support target ghost prewarming, incoming
+  owner commit, and source downgrade to short-lived ghost.
+- Hotspot planner evaluates station/cell load samples and proposes high-pressure
+  cells for external schedulers to move.
+- Smoke benchmark runs through planning, frame encoding, fake transport, and
+  hotspot report fields.
 
 Not complete yet:
 
-- Full runtime barrier execution semantics.
-- Two-phase owner handoff implementation.
-- Hotspot detection and station ownership split execution.
-- Multi-station scheduler and bounded cross-station queues beyond core queue
-  primitives.
+- Full command queue integration with runtime barrier modes.
+- Automatic station ownership split execution and migration scheduling.
+- Multi-station scheduler and bounded cross-station transport integration beyond
+  core queue primitives.
 - Component registry and custom component codecs.
 - Real transport adapters.
 - Large-scale benchmark validation against the stated hard metrics.
