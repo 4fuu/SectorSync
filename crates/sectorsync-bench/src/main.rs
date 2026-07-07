@@ -14,15 +14,14 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
-    DeploymentRouteTable, GATEWAY_COMMAND_ACK_ACCEPTED, GatewayCommandPipeline,
+    DeploymentRouteTable, GatewayClientTransportBridge, GatewayCommandPipeline,
 };
 use sectorsync_transport::{
     ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportEndpoint,
-    InMemoryTransportHub, OutboundPacket, StationTransportLimits, TransportReceiver, TransportSink,
+    InMemoryTransportHub, OutboundPacket, StationTransportLimits, TransportSink,
 };
 use sectorsync_wire::{
-    BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame, CommandFrame, ComponentDelta,
-    EntityDelta, FrameDecoder, FrameEncoder, ReplicationFrame, RuntimeFrame,
+    BinaryFrameEncoder, CommandFrame, ComponentDelta, EntityDelta, FrameEncoder, ReplicationFrame,
 };
 
 const DEFAULT_GUARD_MAX_ENTITIES: usize = 4_000;
@@ -112,6 +111,10 @@ struct BenchStats {
     command_dispatch_latency_ticks_max: u64,
     client_bridge_commands_sent: usize,
     client_bridge_command_bytes: usize,
+    client_bridge_gateway_packets_received: usize,
+    client_bridge_gateway_commands_accepted: usize,
+    client_bridge_gateway_acks_sent: usize,
+    client_bridge_gateway_commands_applied: usize,
     client_bridge_packets_received: usize,
     client_bridge_bytes_received: usize,
     client_bridge_acks_received: usize,
@@ -192,6 +195,22 @@ fn main() {
     println!(
         "client_bridge_command_bytes={}",
         stats.client_bridge_command_bytes
+    );
+    println!(
+        "client_bridge_gateway_packets_received={}",
+        stats.client_bridge_gateway_packets_received
+    );
+    println!(
+        "client_bridge_gateway_commands_accepted={}",
+        stats.client_bridge_gateway_commands_accepted
+    );
+    println!(
+        "client_bridge_gateway_acks_sent={}",
+        stats.client_bridge_gateway_acks_sent
+    );
+    println!(
+        "client_bridge_gateway_commands_applied={}",
+        stats.client_bridge_gateway_commands_applied
     );
     println!(
         "client_bridge_packets_received={}",
@@ -290,7 +309,11 @@ impl BenchVerdict {
                 <= thresholds.command_latency_ticks_max,
             command_queue_ok: stats.command_queue_max <= thresholds.command_queue_max,
             payload_ok: stats.estimated_payload_bytes <= thresholds.estimated_payload_bytes,
-            client_bridge_ok: stats.client_bridge_acks_received == expected_client_bridge_frames
+            client_bridge_ok: stats.client_bridge_gateway_commands_accepted
+                == expected_client_bridge_frames
+                && stats.client_bridge_gateway_acks_sent == expected_client_bridge_frames
+                && stats.client_bridge_gateway_commands_applied == expected_client_bridge_frames
+                && stats.client_bridge_acks_received == expected_client_bridge_frames
                 && stats.client_bridge_replication_frames_received == expected_client_bridge_frames,
         }
     }
@@ -673,12 +696,17 @@ struct ClientBridgeBench {
     server_transport: InMemoryTransportEndpoint,
     client_endpoints: Vec<InMemoryTransportEndpoint>,
     client_bridges: Vec<ClientTransportBridge>,
+    gateway: GatewaySessionTable,
+    station_queues: BTreeMap<StationId, CommandQueues>,
+    pipeline: GatewayCommandPipeline,
+    gateway_bridge: GatewayClientTransportBridge,
 }
 
 impl ClientBridgeBench {
     fn new(config: BenchConfig) -> Self {
         let server_id = ClientId::new(u64::MAX);
         let sampled_clients = config.clients.min(CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK);
+        let station_id = StationId::new(0);
         let hub = InMemoryTransportHub::new(ClientTransportLimits {
             max_queued_packets_per_client: CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK * 2,
             max_packet_bytes: 1024,
@@ -704,11 +732,33 @@ impl ClientBridgeBench {
                 ClientTransportConfig::new(client_id, server_id).with_expected_source(server_id),
             ));
         }
+        let mut gateway = GatewaySessionTable::new(GatewayConfig {
+            max_sessions: sampled_clients.max(1),
+            reconnect_grace_ticks: 20,
+            max_commands_per_tick: CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK,
+        });
+        for client_index in 0..sampled_clients {
+            gateway
+                .connect(ClientId::new(client_index as u64), station_id, Tick::new(0))
+                .expect("benchmark client bridge gateway session should connect");
+        }
+        let station_queues = BTreeMap::from([(
+            station_id,
+            CommandQueues::new(CommandQueueLimits {
+                high: CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK,
+                normal: CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK * 4,
+                low: CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK,
+            }),
+        )]);
 
         Self {
             server_transport,
             client_endpoints,
             client_bridges,
+            gateway,
+            station_queues,
+            pipeline: GatewayCommandPipeline::default(),
+            gateway_bridge: GatewayClientTransportBridge::default(),
         }
     }
 }
@@ -754,48 +804,41 @@ fn exercise_client_bridge(
             .saturating_add(report.bytes_sent);
     }
 
+    let gateway_pump = bench
+        .gateway_bridge
+        .pump_ingress(
+            &mut bench.server_transport,
+            &mut bench.pipeline,
+            &mut bench.gateway,
+            &mut bench.station_queues,
+            tick,
+            CommandIngress::RUNNING,
+            command_count,
+        )
+        .expect("benchmark gateway client bridge should pump");
+    stats.client_bridge_gateway_packets_received = stats
+        .client_bridge_gateway_packets_received
+        .saturating_add(gateway_pump.packets_received);
+    stats.client_bridge_gateway_commands_accepted = stats
+        .client_bridge_gateway_commands_accepted
+        .saturating_add(gateway_pump.commands_accepted());
+    stats.client_bridge_gateway_acks_sent = stats
+        .client_bridge_gateway_acks_sent
+        .saturating_add(gateway_pump.acks_sent);
+
+    for queue in bench.station_queues.values_mut() {
+        while queue.pop_next().is_some() {
+            stats.client_bridge_gateway_commands_applied = stats
+                .client_bridge_gateway_commands_applied
+                .saturating_add(1);
+        }
+    }
+
     let mut encoder = BinaryFrameEncoder;
-    let mut decoder = BinaryFrameDecoder;
-    for _ in 0..command_count {
-        let Some(packet) = bench
-            .server_transport
-            .try_recv()
-            .expect("benchmark server receive should work")
-        else {
-            break;
-        };
-        let Some(source) = packet.client_id else {
-            continue;
-        };
-        let RuntimeFrame::Command(command) = decoder
-            .decode(&packet.bytes)
-            .expect("benchmark client command should decode")
-        else {
-            continue;
-        };
-
-        let ack = CommandAckFrame {
-            client_id: source,
-            command_id: command.command_id,
-            server_tick: tick,
-            accepted: true,
-            reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
-        };
-        let mut ack_bytes = Vec::new();
-        encoder
-            .encode_command_ack(&ack, &mut ack_bytes)
-            .expect("benchmark ACK should encode");
-        bench
-            .server_transport
-            .send(OutboundPacket {
-                client_id: source,
-                bytes: ack_bytes,
-            })
-            .expect("benchmark ACK should send");
-
-        let client_index = source.get().min(usize::MAX as u64) as usize;
+    for client_index in 0..command_count {
+        let client_id = ClientId::new(client_index as u64);
         let replication = ReplicationFrame {
-            client_id: source,
+            client_id,
             server_tick: tick,
             entity_count: 1,
             estimated_payload_bytes: 4,
@@ -808,7 +851,7 @@ fn exercise_client_bridge(
         bench
             .server_transport
             .send(OutboundPacket {
-                client_id: source,
+                client_id,
                 bytes: replication_bytes,
             })
             .expect("benchmark replication should send");
