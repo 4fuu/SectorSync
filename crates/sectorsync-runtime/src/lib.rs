@@ -484,6 +484,14 @@ pub struct SplitSchedulerConfig {
     pub max_cells_per_action: usize,
     /// Source ghost TTL used during migration execution.
     pub ghost_ttl_ticks: u64,
+    /// Minimum load-score gap required between source and target.
+    pub min_score_improvement: u64,
+    /// Maximum permitted target load score after moved cell pressure is added.
+    pub max_target_score_after_move: u64,
+    /// Ticks a source station must wait before another split can be planned.
+    pub split_cooldown_ticks: u64,
+    /// Whether warm target stations may receive split cells.
+    pub allow_warm_targets: bool,
 }
 
 impl Default for SplitSchedulerConfig {
@@ -493,6 +501,10 @@ impl Default for SplitSchedulerConfig {
             max_actions_per_pass: 4,
             max_cells_per_action: 4,
             ghost_ttl_ticks: 4,
+            min_score_improvement: 1,
+            max_target_score_after_move: u64::MAX,
+            split_cooldown_ticks: 0,
+            allow_warm_targets: true,
         }
     }
 }
@@ -506,6 +518,12 @@ pub struct SplitAction {
     pub target_station: StationId,
     /// Cell split proposal.
     pub proposal: SplitProposal,
+    /// Source load score observed when planning.
+    pub source_score: u64,
+    /// Target load score observed when planning.
+    pub target_score: u64,
+    /// Estimated target score after moving proposed cell pressure.
+    pub estimated_target_score_after_move: u64,
 }
 
 /// Split schedule produced from a load snapshot.
@@ -519,6 +537,55 @@ pub struct SplitSchedule {
     pub skipped_no_target: usize,
     /// Hot stations skipped because no cells were proposed.
     pub skipped_no_cells: usize,
+    /// Hot stations skipped because source station is inside split cooldown.
+    pub skipped_cooldown: usize,
+    /// Hot stations skipped because all targets were too warm or hot.
+    pub skipped_target_severity: usize,
+    /// Hot stations skipped because target capacity would be exceeded.
+    pub skipped_target_capacity: usize,
+    /// Hot stations skipped because target score improvement was too small.
+    pub skipped_insufficient_improvement: usize,
+}
+
+/// Mutable planning state for conservative split scheduling.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitSchedulerState {
+    last_split_at: BTreeMap<StationId, Tick>,
+}
+
+impl SplitSchedulerState {
+    /// Returns the last split tick for a source station.
+    pub fn last_split_at(&self, station_id: StationId) -> Option<Tick> {
+        self.last_split_at.get(&station_id).copied()
+    }
+
+    /// Records one executed or externally accepted split action.
+    pub fn record_action(&mut self, action: &SplitAction, tick: Tick) {
+        self.last_split_at.insert(action.source_station, tick);
+    }
+
+    /// Records all actions in a schedule at the same tick.
+    pub fn record_schedule(&mut self, schedule: &SplitSchedule, tick: Tick) {
+        for action in &schedule.actions {
+            self.record_action(action, tick);
+        }
+    }
+
+    /// Returns whether a station is inside split cooldown.
+    pub fn is_in_cooldown(
+        &self,
+        station_id: StationId,
+        current_tick: Tick,
+        cooldown_ticks: u64,
+    ) -> bool {
+        if cooldown_ticks == 0 {
+            return false;
+        }
+        let Some(last_split) = self.last_split_at(station_id) else {
+            return false;
+        };
+        current_tick.get().saturating_sub(last_split.get()) < cooldown_ticks
+    }
 }
 
 /// Result of executing a split schedule.
@@ -574,6 +641,16 @@ impl SplitScheduler {
 
     /// Plans split actions from station load samples.
     pub fn plan(&self, samples: &[StationLoadSample]) -> SplitSchedule {
+        self.plan_with_state(samples, None, Tick::new(0))
+    }
+
+    /// Plans split actions using optional cooldown state.
+    pub fn plan_with_state(
+        &self,
+        samples: &[StationLoadSample],
+        state: Option<&SplitSchedulerState>,
+        current_tick: Tick,
+    ) -> SplitSchedule {
         let decisions = samples
             .iter()
             .map(|sample| HotspotPlanner::evaluate(sample, self.config.thresholds))
@@ -597,22 +674,48 @@ impl SplitScheduler {
             if source_decision.severity != HotspotSeverity::Hot {
                 continue;
             }
-
-            let Some(target) = select_split_target(source.station_id, samples, &schedule.decisions)
-            else {
-                schedule.skipped_no_target += 1;
+            if state.is_some_and(|state| {
+                state.is_in_cooldown(
+                    source.station_id,
+                    current_tick,
+                    self.config.split_cooldown_ticks,
+                )
+            }) {
+                schedule.skipped_cooldown += 1;
                 continue;
-            };
+            }
+
             let proposal =
                 HotspotPlanner::propose_cell_split(source, self.config.max_cells_per_action);
             if proposal.cells_to_move.is_empty() {
                 schedule.skipped_no_cells += 1;
                 continue;
             }
+            let target_selection =
+                select_split_target(source, &proposal, samples, &schedule.decisions, self.config);
+            let Some(target) = target_selection.target else {
+                if target_selection.considered_targets == 0 {
+                    schedule.skipped_no_target += 1;
+                } else {
+                    schedule.skipped_target_severity +=
+                        usize::from(target_selection.rejected_by_severity > 0);
+                    schedule.skipped_target_capacity +=
+                        usize::from(target_selection.rejected_by_capacity > 0);
+                    schedule.skipped_insufficient_improvement +=
+                        usize::from(target_selection.rejected_by_improvement > 0);
+                }
+                continue;
+            };
+            let target_score = station_load_score(target);
+            let estimated_target_score_after_move =
+                target_score.saturating_add(proposal.moved_pressure_score);
             schedule.actions.push(SplitAction {
                 source_station: source.station_id,
                 target_station: target.station_id,
                 proposal,
+                source_score: station_load_score(source),
+                target_score,
+                estimated_target_score_after_move,
             });
         }
 
@@ -668,28 +771,84 @@ impl Default for SplitScheduler {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SplitTargetSelection<'a> {
+    target: Option<&'a StationLoadSample>,
+    considered_targets: usize,
+    rejected_by_severity: usize,
+    rejected_by_capacity: usize,
+    rejected_by_improvement: usize,
+}
+
 fn select_split_target<'a>(
-    source_station: StationId,
+    source: &StationLoadSample,
+    proposal: &SplitProposal,
     samples: &'a [StationLoadSample],
     decisions: &[HotspotDecision],
-) -> Option<&'a StationLoadSample> {
-    let normal_target = samples
-        .iter()
-        .filter(|sample| sample.station_id != source_station)
-        .filter(|sample| {
-            decisions
-                .iter()
-                .find(|decision| decision.station_id == sample.station_id)
-                .is_some_and(|decision| decision.severity == HotspotSeverity::Normal)
-        })
-        .min_by_key(|sample| station_load_score(sample));
+    config: SplitSchedulerConfig,
+) -> SplitTargetSelection<'a> {
+    let mut selection = SplitTargetSelection::default();
+    let source_score = station_load_score(source);
 
-    normal_target.or_else(|| {
-        samples
+    for target in samples {
+        if target.station_id == source.station_id {
+            continue;
+        }
+        selection.considered_targets += 1;
+
+        let severity = decisions
             .iter()
-            .filter(|sample| sample.station_id != source_station)
-            .min_by_key(|sample| station_load_score(sample))
-    })
+            .find(|decision| decision.station_id == target.station_id)
+            .map_or(HotspotSeverity::Normal, |decision| decision.severity);
+        if severity == HotspotSeverity::Hot
+            || (severity == HotspotSeverity::Warm && !config.allow_warm_targets)
+        {
+            selection.rejected_by_severity += 1;
+            continue;
+        }
+
+        let target_score = station_load_score(target);
+        if source_score.saturating_sub(target_score) < config.min_score_improvement {
+            selection.rejected_by_improvement += 1;
+            continue;
+        }
+        if target_score.saturating_add(proposal.moved_pressure_score)
+            > config.max_target_score_after_move
+        {
+            selection.rejected_by_capacity += 1;
+            continue;
+        }
+
+        let target_key = (
+            severity_rank(severity),
+            target_score,
+            target.station_id.get(),
+        );
+        let current_key = selection.target.map(|current| {
+            let current_severity = decisions
+                .iter()
+                .find(|decision| decision.station_id == current.station_id)
+                .map_or(HotspotSeverity::Normal, |decision| decision.severity);
+            (
+                severity_rank(current_severity),
+                station_load_score(current),
+                current.station_id.get(),
+            )
+        });
+        if current_key.is_none_or(|current_key| target_key < current_key) {
+            selection.target = Some(target);
+        }
+    }
+
+    selection
+}
+
+fn severity_rank(severity: HotspotSeverity) -> u8 {
+    match severity {
+        HotspotSeverity::Normal => 0,
+        HotspotSeverity::Warm => 1,
+        HotspotSeverity::Hot => 2,
+    }
 }
 
 fn station_load_score(sample: &StationLoadSample) -> u64 {
@@ -1612,6 +1771,7 @@ mod tests {
             max_actions_per_pass: 1,
             max_cells_per_action: 1,
             ghost_ttl_ticks: 4,
+            ..SplitSchedulerConfig::default()
         });
         let schedule = scheduler.plan(&samples);
         assert_eq!(schedule.actions.len(), 1);
@@ -1633,5 +1793,96 @@ mod tests {
                 .entity_count(),
             1
         );
+    }
+
+    #[test]
+    fn split_scheduler_respects_source_cooldown() {
+        let hot_cell = CellCoord3::new(0, 0, 0);
+        let samples = split_test_samples(hot_cell);
+        let scheduler = SplitScheduler::new(SplitSchedulerConfig {
+            thresholds: split_test_thresholds(),
+            max_actions_per_pass: 1,
+            max_cells_per_action: 1,
+            split_cooldown_ticks: 10,
+            ..SplitSchedulerConfig::default()
+        });
+        let mut state = SplitSchedulerState::default();
+
+        let initial = scheduler.plan_with_state(&samples, Some(&state), Tick::new(5));
+        assert_eq!(initial.actions.len(), 1);
+        state.record_schedule(&initial, Tick::new(5));
+
+        let cooled_down = scheduler.plan_with_state(&samples, Some(&state), Tick::new(8));
+        assert!(cooled_down.actions.is_empty());
+        assert_eq!(cooled_down.skipped_cooldown, 1);
+
+        let after_cooldown = scheduler.plan_with_state(&samples, Some(&state), Tick::new(16));
+        assert_eq!(after_cooldown.actions.len(), 1);
+    }
+
+    #[test]
+    fn split_scheduler_reports_capacity_and_improvement_skips() {
+        let hot_cell = CellCoord3::new(0, 0, 0);
+        let samples = split_test_samples(hot_cell);
+
+        let capacity_guard = SplitScheduler::new(SplitSchedulerConfig {
+            thresholds: split_test_thresholds(),
+            max_actions_per_pass: 1,
+            max_cells_per_action: 1,
+            max_target_score_after_move: 1,
+            ..SplitSchedulerConfig::default()
+        });
+        let capacity_schedule = capacity_guard.plan(&samples);
+        assert!(capacity_schedule.actions.is_empty());
+        assert_eq!(capacity_schedule.skipped_target_capacity, 1);
+
+        let improvement_guard = SplitScheduler::new(SplitSchedulerConfig {
+            thresholds: split_test_thresholds(),
+            max_actions_per_pass: 1,
+            max_cells_per_action: 1,
+            min_score_improvement: u64::MAX,
+            ..SplitSchedulerConfig::default()
+        });
+        let improvement_schedule = improvement_guard.plan(&samples);
+        assert!(improvement_schedule.actions.is_empty());
+        assert_eq!(improvement_schedule.skipped_insufficient_improvement, 1);
+    }
+
+    fn split_test_thresholds() -> HotspotThresholds {
+        HotspotThresholds {
+            max_station_entities: 10,
+            max_station_subscribers: 10,
+            max_cell_pressure: 10,
+            ..HotspotThresholds::default()
+        }
+    }
+
+    fn split_test_samples(hot_cell: CellCoord3) -> Vec<StationLoadSample> {
+        vec![
+            StationLoadSample {
+                station_id: StationId::new(1),
+                owned_entities: 100,
+                subscribers: 100,
+                tick_cost_units: 1000,
+                cells: vec![CellLoadSample {
+                    cell: hot_cell,
+                    owned_entities: 100,
+                    subscribers: 100,
+                    event_pressure: 10,
+                    ..CellLoadSample::default()
+                }],
+                ..StationLoadSample::default()
+            },
+            StationLoadSample {
+                station_id: StationId::new(2),
+                owned_entities: 1,
+                cells: vec![CellLoadSample {
+                    cell: CellCoord3::new(10, 0, 0),
+                    owned_entities: 1,
+                    ..CellLoadSample::default()
+                }],
+                ..StationLoadSample::default()
+            },
+        ]
     }
 }

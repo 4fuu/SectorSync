@@ -74,6 +74,7 @@ fn main() {
         max_actions_per_pass: 1,
         max_cells_per_action: 1,
         ghost_ttl_ticks: 4,
+        ..SplitSchedulerConfig::default()
     });
     let schedule = scheduler.plan(&samples);
     let report = scheduler
