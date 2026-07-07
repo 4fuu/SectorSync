@@ -45,6 +45,10 @@
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
   that runs heavy profiles implicitly.
+- Manual benchmark scale overrides must remain guarded by default. If
+  `--entities`, `--clients`, `--stations`, or `--ticks` can exceed smoke-safe
+  values, keep them clamped unless `--allow-heavy` is present, and print the
+  applied guard metadata.
 
 ## Project Boundary
 

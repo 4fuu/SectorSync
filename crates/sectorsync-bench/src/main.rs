@@ -15,6 +15,11 @@ use sectorsync_wire::{
     BinaryFrameEncoder, ComponentDelta, EntityDelta, FrameEncoder, ReplicationFrame,
 };
 
+const DEFAULT_GUARD_MAX_ENTITIES: usize = 4_000;
+const DEFAULT_GUARD_MAX_CLIENTS: usize = 150;
+const DEFAULT_GUARD_MAX_STATIONS: usize = 8;
+const DEFAULT_GUARD_MAX_TICKS: usize = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Baseline {
     FullBroadcast,
@@ -30,8 +35,12 @@ struct BenchConfig {
     stations: usize,
     ticks: usize,
     baseline: Baseline,
+    requested_profile: &'static str,
     profile_name: &'static str,
+    allow_heavy: bool,
     heavy_profile_denied: bool,
+    default_resource_guard_applied: bool,
+    host_parallelism: usize,
     thresholds: BenchThresholds,
 }
 
@@ -51,8 +60,12 @@ impl Default for BenchConfig {
             stations: 4,
             ticks: 5,
             baseline: Baseline::SectorSync,
+            requested_profile: "smoke",
             profile_name: "smoke",
+            allow_heavy: false,
             heavy_profile_denied: false,
+            default_resource_guard_applied: false,
+            host_parallelism: 1,
             thresholds: BenchThresholds::default(),
         }
     }
@@ -97,8 +110,19 @@ fn main() {
 
     println!("SectorSync benchmark");
     println!("baseline={:?}", config.baseline);
+    println!("requested_profile={}", config.requested_profile);
     println!("profile={}", config.profile_name);
+    println!("allow_heavy={}", config.allow_heavy);
     println!("heavy_profile_denied={}", config.heavy_profile_denied);
+    println!(
+        "default_resource_guard_applied={}",
+        config.default_resource_guard_applied
+    );
+    println!("host_parallelism={}", config.host_parallelism);
+    println!("guard_max_entities={}", DEFAULT_GUARD_MAX_ENTITIES);
+    println!("guard_max_clients={}", DEFAULT_GUARD_MAX_CLIENTS);
+    println!("guard_max_stations={}", DEFAULT_GUARD_MAX_STATIONS);
+    println!("guard_max_ticks={}", DEFAULT_GUARD_MAX_TICKS);
     println!("entities={}", config.entities);
     println!("clients={}", config.clients);
     println!("stations={}", config.stations);
@@ -194,9 +218,13 @@ impl BenchVerdict {
 
 impl BenchConfig {
     fn from_args(args: impl Iterator<Item = String>) -> Self {
+        Self::from_args_with_host(args, HostResources::detect())
+    }
+
+    fn from_args_with_host(args: impl Iterator<Item = String>, host: HostResources) -> Self {
         let args = args.collect::<Vec<_>>();
         let allow_heavy = args.iter().any(|arg| arg == "--allow-heavy");
-        let mut config = Self::default();
+        let mut config = Self::smoke(host, allow_heavy);
         for arg in args {
             if let Some(value) = arg.strip_prefix("--entities=") {
                 config.entities = value.parse().unwrap_or(config.entities);
@@ -217,10 +245,11 @@ impl BenchConfig {
             } else if let Some(value) = arg.strip_prefix("--profile=") {
                 match value {
                     "smoke" => {
-                        config = Self::default();
-                        config.profile_name = "smoke";
+                        config = Self::smoke(host, allow_heavy);
+                        config.requested_profile = "smoke";
                     }
                     "medium" => {
+                        config.requested_profile = "medium";
                         if allow_heavy {
                             config.profile_name = "medium";
                             config.entities = 50_000;
@@ -234,6 +263,7 @@ impl BenchConfig {
                         }
                     }
                     "large" => {
+                        config.requested_profile = "large";
                         if allow_heavy {
                             config.profile_name = "large";
                             config.entities = 1_000_000;
@@ -265,7 +295,45 @@ impl BenchConfig {
                     .unwrap_or(config.thresholds.estimated_payload_bytes);
             }
         }
+        config.apply_default_resource_guard();
         config
+    }
+
+    fn smoke(host: HostResources, allow_heavy: bool) -> Self {
+        Self {
+            allow_heavy,
+            host_parallelism: host.parallelism,
+            ..Self::default()
+        }
+    }
+
+    fn apply_default_resource_guard(&mut self) {
+        if self.allow_heavy {
+            return;
+        }
+
+        let before = (self.entities, self.clients, self.stations, self.ticks);
+        self.entities = self.entities.min(DEFAULT_GUARD_MAX_ENTITIES);
+        self.clients = self.clients.min(DEFAULT_GUARD_MAX_CLIENTS);
+        self.stations = self.stations.min(DEFAULT_GUARD_MAX_STATIONS).max(1);
+        self.ticks = self.ticks.min(DEFAULT_GUARD_MAX_TICKS);
+        self.default_resource_guard_applied =
+            before != (self.entities, self.clients, self.stations, self.ticks);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostResources {
+    parallelism: usize,
+}
+
+impl HostResources {
+    fn detect() -> Self {
+        Self {
+            parallelism: std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+        }
     }
 }
 
@@ -625,5 +693,68 @@ impl Lcg {
     fn next_range(&mut self, min: f32, max: f32) -> f32 {
         let unit = self.next_u32() as f32 / u32::MAX as f32;
         min + (max - min) * unit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> std::vec::IntoIter<String> {
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn large_profile_without_allow_heavy_is_denied() {
+        let config = BenchConfig::from_args_with_host(
+            args(&["--profile=large"]),
+            HostResources { parallelism: 2 },
+        );
+
+        assert_eq!(config.requested_profile, "large");
+        assert_eq!(config.profile_name, "smoke");
+        assert!(!config.allow_heavy);
+        assert!(config.heavy_profile_denied);
+        assert!(!config.default_resource_guard_applied);
+        assert_eq!(config.host_parallelism, 2);
+    }
+
+    #[test]
+    fn custom_scale_is_clamped_without_allow_heavy() {
+        let config = BenchConfig::from_args_with_host(
+            args(&[
+                "--entities=1000000",
+                "--clients=100000",
+                "--stations=100",
+                "--ticks=100",
+            ]),
+            HostResources { parallelism: 4 },
+        );
+
+        assert_eq!(config.entities, DEFAULT_GUARD_MAX_ENTITIES);
+        assert_eq!(config.clients, DEFAULT_GUARD_MAX_CLIENTS);
+        assert_eq!(config.stations, DEFAULT_GUARD_MAX_STATIONS);
+        assert_eq!(config.ticks, DEFAULT_GUARD_MAX_TICKS);
+        assert!(config.default_resource_guard_applied);
+    }
+
+    #[test]
+    fn allow_heavy_admits_large_profile() {
+        let config = BenchConfig::from_args_with_host(
+            args(&["--profile=large", "--allow-heavy"]),
+            HostResources { parallelism: 16 },
+        );
+
+        assert_eq!(config.requested_profile, "large");
+        assert_eq!(config.profile_name, "large");
+        assert!(config.allow_heavy);
+        assert!(!config.heavy_profile_denied);
+        assert!(!config.default_resource_guard_applied);
+        assert_eq!(config.entities, 1_000_000);
+        assert_eq!(config.clients, 10_000);
     }
 }

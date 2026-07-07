@@ -117,7 +117,10 @@ The default smoke profile is intentionally small. Larger benchmark profiles must
 be requested explicitly with `--allow-heavy`, for example `--profile=medium
 --allow-heavy` or `--profile=large --allow-heavy`. Without `--allow-heavy`, a
 heavy profile request stays on smoke-sized data and reports
-`heavy_profile_denied=true`.
+`heavy_profile_denied=true`. Custom entity/client/station/tick values are also
+clamped to a default-safe resource guard unless `--allow-heavy` is present; the
+benchmark output reports `host_parallelism`, guard limits, and whether
+`default_resource_guard_applied=true`.
 
 ## Performance Targets
 
@@ -232,8 +235,8 @@ Initial status:
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
   command latency in ticks, max queue depth, payload entity/component delta
-  counts, tick timing estimates, threshold checks, and an aggregate
-  `benchmark_ok` verdict.
+  counts, tick timing estimates, host parallelism, default resource guard
+  limits, threshold checks, and an aggregate `benchmark_ok` verdict.
 - `cargo run -p sectorsync-bench --example sdk_flow` demonstrates an
   end-to-end embeddable SDK path: station, cell index, component store,
   replication plan, frame builder, binary codec, and fake transport.
