@@ -62,10 +62,10 @@ Current crates:
   policies, custom component registry/storage, typed component codecs, schema
   helpers, generated-schema-friendly layout descriptors, cell indexing,
   interest queries, range/frustum/tag visibility filters, adaptive replication
-  cadence helpers, budget-aware priority selection, bounded replication
-  send/ACK trackers, replication planning, bounded command/event queues,
-  handoff transfer types, hotspot planning, gateway session/routing primitives,
-  barrier metadata, and snapshot metadata.
+  cadence helpers, budget-aware priority selection, reusable AOI/planning
+  scratch buffers, bounded replication send/ACK trackers, replication planning,
+  bounded command/event queues, handoff transfer types, hotspot planning,
+  gateway session/routing primitives, barrier metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, client command
   ingress frames, internal gateway-to-station command dispatch frames, command
@@ -111,6 +111,7 @@ cargo run -p sectorsync-bench --example frustum_visibility
 cargo run -p sectorsync-bench --example tag_visibility
 cargo run -p sectorsync-bench --example adaptive_cadence
 cargo run -p sectorsync-bench --example priority_budget
+cargo run -p sectorsync-bench --example scratch_planning
 cargo run -p sectorsync-bench --example replication_tracker
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example replication_bridge_priority
@@ -184,8 +185,8 @@ Initial status:
 - Core low-level SDK types exist for station ownership, 3D spatial indexing,
   interest queries, range/frustum/tag visibility filtering, policy tables,
   adaptive replication cadence planning, budget-aware priority selection,
-  bounded replication tracking, event queues, barriers, snapshots, commands,
-  and fake transport integration.
+  reusable AOI/planning scratch buffers, bounded replication tracking, event
+  queues, barriers, snapshots, commands, and fake transport integration.
 - Runtime barrier controller can request scoped barriers, wait for station tick
   alignment, freeze, export snapshots, and resume.
 - Runtime barrier notification bridge encodes barrier states into bounded client
@@ -253,6 +254,9 @@ Initial status:
   compiled policy `priority_weight` and viewer distance when per-client entity
   or byte budgets are tight. This remains a stateless hot-path selection helper,
   not a gameplay priority system.
+- `CellQueryScratch` and `ReplicationScratch` let high-frequency AOI and
+  replication planning loops reuse candidate/dedup/sort buffers instead of
+  allocating fresh temporary collections for every viewer query.
 - Bounded replication trackers record per-client/entity last-sent and ACK ticks
   for caller-managed cadence and delivery bookkeeping. They do not define a
   wire ACK protocol or automatically clear global dirty flags; explicit station
@@ -348,6 +352,8 @@ Initial status:
 - `cargo run -p sectorsync-bench --example priority_budget` demonstrates
   budget-aware replication selection preferring a higher-priority entity even
   when it is farther away.
+- `cargo run -p sectorsync-bench --example scratch_planning` demonstrates
+  reusable replication planning scratch across multiple viewer queries.
 - `cargo run -p sectorsync-bench --example replication_tracker` demonstrates a
   bounded low-level send/ACK tracker feeding cadence lookups and explicit dirty
   cleanup after caller-confirmed delivery.

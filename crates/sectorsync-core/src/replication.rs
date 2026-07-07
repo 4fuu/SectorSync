@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::ids::{ClientId, EntityHandle, Tick};
 use crate::interest::{ViewerQuery, VisibilityFilter};
 use crate::policy::{CompiledSyncPolicy, PolicyTable};
-use crate::spatial_index::CellIndex;
+use crate::spatial_index::{CellIndex, CellQueryScratch};
 use crate::station::Station;
 
 /// Per-client replication budget.
@@ -382,6 +382,31 @@ struct PrioritizedReplicationCandidate {
     distance_squared: f32,
 }
 
+/// Reusable scratch storage for allocation-aware replication planning.
+#[derive(Clone, Debug, Default)]
+pub struct ReplicationScratch {
+    cell_query: CellQueryScratch,
+    prioritized: Vec<PrioritizedReplicationCandidate>,
+}
+
+impl ReplicationScratch {
+    /// Clears retained planning results while keeping allocated capacity.
+    pub fn clear(&mut self) {
+        self.cell_query.clear();
+        self.prioritized.clear();
+    }
+
+    /// Number of spatial candidates retained from the last query.
+    pub fn candidate_count(&self) -> usize {
+        self.cell_query.len()
+    }
+
+    /// Capacity retained for priority candidate sorting.
+    pub fn prioritized_capacity(&self) -> usize {
+        self.prioritized.capacity()
+    }
+}
+
 /// Simple range/visibility-based replication planner.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReplicationPlanner;
@@ -396,9 +421,33 @@ impl ReplicationPlanner {
         filter: &F,
         budget: ReplicationBudget,
     ) -> ReplicationPlan {
-        Self::plan_for_viewer_inner(
+        let candidates = index.query_sphere(viewer.position, viewer.radius);
+        Self::plan_for_candidates_inner(
             station,
-            index,
+            &candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            |_, _, _| true,
+        )
+    }
+
+    /// Plans a frame using caller-provided scratch storage.
+    pub fn plan_for_viewer_with_scratch<F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationPlan {
+        let candidates =
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        Self::plan_for_candidates_inner(
+            station,
+            candidates,
             policies,
             viewer,
             filter,
@@ -423,9 +472,48 @@ impl ReplicationPlanner {
     {
         let tick_rate_hz = station.config().tick_rate_hz;
         let now = station.tick();
-        Self::plan_for_viewer_inner(
+        let candidates = index.query_sphere(viewer.position, viewer.radius);
+        Self::plan_for_candidates_inner(
             station,
-            index,
+            &candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            |handle, policy, distance_squared| {
+                ReplicationCadence::should_send(
+                    policy,
+                    tick_rate_hz,
+                    distance_squared,
+                    now,
+                    last_sent(handle),
+                )
+            },
+        )
+    }
+
+    /// Plans a cadence-aware frame using caller-provided scratch storage.
+    pub fn plan_for_viewer_with_cadence_and_scratch<F, L>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        last_sent: L,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationPlan
+    where
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
+        let tick_rate_hz = station.config().tick_rate_hz;
+        let now = station.tick();
+        let candidates =
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        Self::plan_for_candidates_inner(
+            station,
+            candidates,
             policies,
             viewer,
             filter,
@@ -451,13 +539,40 @@ impl ReplicationPlanner {
         filter: &F,
         budget: ReplicationBudget,
     ) -> ReplicationPlan {
-        Self::plan_for_viewer_prioritized_inner(
+        let candidates = index.query_sphere(viewer.position, viewer.radius);
+        let mut prioritized = Vec::new();
+        Self::plan_for_candidates_prioritized_inner(
             station,
-            index,
+            &candidates,
             policies,
             viewer,
             filter,
             budget,
+            &mut prioritized,
+            |_, _, _| true,
+        )
+    }
+
+    /// Plans a budgeted priority frame using caller-provided scratch storage.
+    pub fn plan_for_viewer_prioritized_with_scratch<F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationPlan {
+        let candidates =
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        Self::plan_for_candidates_prioritized_inner(
+            station,
+            candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            &mut scratch.prioritized,
             |_, _, _| true,
         )
     }
@@ -478,13 +593,16 @@ impl ReplicationPlanner {
     {
         let tick_rate_hz = station.config().tick_rate_hz;
         let now = station.tick();
-        Self::plan_for_viewer_prioritized_inner(
+        let candidates = index.query_sphere(viewer.position, viewer.radius);
+        let mut prioritized = Vec::new();
+        Self::plan_for_candidates_prioritized_inner(
             station,
-            index,
+            &candidates,
             policies,
             viewer,
             filter,
             budget,
+            &mut prioritized,
             |handle, policy, distance_squared| {
                 ReplicationCadence::should_send(
                     policy,
@@ -497,9 +615,48 @@ impl ReplicationPlanner {
         )
     }
 
-    fn plan_for_viewer_inner<F, C>(
+    /// Plans a priority/cadence frame using caller-provided scratch storage.
+    pub fn plan_for_viewer_prioritized_with_cadence_and_scratch<F, L>(
         station: &Station,
         index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        last_sent: L,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationPlan
+    where
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
+        let tick_rate_hz = station.config().tick_rate_hz;
+        let now = station.tick();
+        let candidates =
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        Self::plan_for_candidates_prioritized_inner(
+            station,
+            candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            &mut scratch.prioritized,
+            |handle, policy, distance_squared| {
+                ReplicationCadence::should_send(
+                    policy,
+                    tick_rate_hz,
+                    distance_squared,
+                    now,
+                    last_sent(handle),
+                )
+            },
+        )
+    }
+
+    fn plan_for_candidates_inner<F, C>(
+        station: &Station,
+        candidates: &[EntityHandle],
         policies: &PolicyTable,
         viewer: &ViewerQuery,
         filter: &F,
@@ -510,7 +667,6 @@ impl ReplicationPlanner {
         F: VisibilityFilter,
         C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
     {
-        let candidates = index.query_sphere(viewer.position, viewer.radius);
         let max_entities = viewer.max_entities.min(budget.max_entities);
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
@@ -524,7 +680,7 @@ impl ReplicationPlanner {
         };
 
         for handle in candidates {
-            let Some(entity) = station.get(handle) else {
+            let Some(entity) = station.get(*handle) else {
                 continue;
             };
             plan.stats.considered += 1;
@@ -540,7 +696,7 @@ impl ReplicationPlanner {
             if !filter.is_visible(viewer, entity) {
                 continue;
             }
-            if !cadence_allows(handle, policy, distance_squared) {
+            if !cadence_allows(*handle, policy, distance_squared) {
                 plan.stats.skipped_by_cadence += 1;
                 continue;
             }
@@ -550,7 +706,7 @@ impl ReplicationPlanner {
                 continue;
             }
 
-            plan.entities.push(handle);
+            plan.entities.push(*handle);
         }
 
         plan.stats.selected = plan.entities.len();
@@ -558,20 +714,20 @@ impl ReplicationPlanner {
         plan
     }
 
-    fn plan_for_viewer_prioritized_inner<F, C>(
+    fn plan_for_candidates_prioritized_inner<F, C>(
         station: &Station,
-        index: &CellIndex,
+        candidates: &[EntityHandle],
         policies: &PolicyTable,
         viewer: &ViewerQuery,
         filter: &F,
         budget: ReplicationBudget,
+        eligible: &mut Vec<PrioritizedReplicationCandidate>,
         cadence_allows: C,
     ) -> ReplicationPlan
     where
         F: VisibilityFilter,
         C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
     {
-        let candidates = index.query_sphere(viewer.position, viewer.radius);
         let max_entities = viewer.max_entities.min(budget.max_entities);
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
@@ -582,10 +738,10 @@ impl ReplicationPlanner {
                 ..ReplicationStats::default()
             },
         };
-        let mut eligible = Vec::new();
+        eligible.clear();
 
         for handle in candidates {
-            let Some(entity) = station.get(handle) else {
+            let Some(entity) = station.get(*handle) else {
                 continue;
             };
             plan.stats.considered += 1;
@@ -601,13 +757,13 @@ impl ReplicationPlanner {
             if !filter.is_visible(viewer, entity) {
                 continue;
             }
-            if !cadence_allows(handle, policy, distance_squared) {
+            if !cadence_allows(*handle, policy, distance_squared) {
                 plan.stats.skipped_by_cadence += 1;
                 continue;
             }
 
             eligible.push(PrioritizedReplicationCandidate {
-                handle,
+                handle: *handle,
                 score: ReplicationPriority::score(policy, distance_squared),
                 distance_squared,
             });
@@ -624,7 +780,7 @@ impl ReplicationPlanner {
         plan.stats.skipped_by_budget = eligible.len().saturating_sub(hard_limit);
         plan.entities.extend(
             eligible
-                .into_iter()
+                .iter()
                 .take(hard_limit)
                 .map(|candidate| candidate.handle),
         );
@@ -916,6 +1072,25 @@ mod tests {
         assert_eq!(plan.entities, vec![far_high]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.skipped_by_budget, 1);
+
+        let mut scratch = ReplicationScratch::default();
+        let scratch_plan = ReplicationPlanner::plan_for_viewer_prioritized_with_scratch(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &RangeOnlyVisibility,
+            ReplicationBudget {
+                max_entities: 1,
+                max_bytes: 32,
+                estimated_entity_bytes: 32,
+            },
+            &mut scratch,
+        );
+        assert_eq!(scratch_plan.entities, plan.entities);
+        assert_eq!(scratch_plan.stats, plan.stats);
+        assert_eq!(scratch.candidate_count(), 2);
+        assert!(scratch.prioritized_capacity() >= 2);
     }
 
     #[test]

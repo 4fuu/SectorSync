@@ -80,6 +80,9 @@
 - Use `cargo run -p sectorsync-bench --example priority_budget` when changing
   replication priority scoring, policy `priority_weight` behavior, or
   budget-aware replication selection.
+- Use `cargo run -p sectorsync-bench --example scratch_planning` when changing
+  reusable cell-query scratch buffers, replication scratch buffers, or
+  allocation-aware AOI/planning paths.
 - Use `cargo run -p sectorsync-bench --example replication_tracker` when
   changing replication send/ACK tracking, last-sent lookup helpers, or explicit
   dirty cleanup APIs.
@@ -215,6 +218,10 @@ The core library does not own:
   distance for stateless hot-path selection. It must not encode gameplay
   threat rules, inventory/combat semantics, or client-specific business
   priority systems inside the core planner.
+- Scratch-buffer APIs may expose reusable candidate, deduplication, and sorting
+  storage for high-frequency AOI/replication planning. They must remain
+  caller-owned, explicit, and bounded by caller use; do not hide thread-local
+  scratch state, global caches, or implicit cross-client state.
 - Replication trackers must stay bounded and explicit. They may record
   per-client/entity sent and ACK ticks, but they must not invent a wire ACK
   protocol, clear global dirty flags implicitly, own client world state, or keep
