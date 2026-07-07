@@ -157,6 +157,636 @@ pub trait TransportReceiver {
     fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error>;
 }
 
+const PACKET_SECURITY_MAGIC: [u8; 4] = *b"SSEC";
+/// Packet security envelope header bytes before payload and tag.
+pub const PACKET_SECURITY_HEADER_BYTES: usize = 22;
+/// Default packet security payload budget aligned to the default packet budget
+/// after envelope overhead.
+pub const DEFAULT_PACKET_SECURITY_MAX_PAYLOAD_BYTES: usize =
+    (16 * 1024) - PACKET_SECURITY_HEADER_BYTES;
+/// Default maximum authentication tag bytes.
+pub const DEFAULT_PACKET_SECURITY_MAX_TAG_BYTES: usize = 128;
+/// Default replay history retained per security box.
+pub const DEFAULT_PACKET_SECURITY_REPLAY_HISTORY: usize = 4096;
+
+/// Packet security framing configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketSecurityConfig {
+    /// Maximum encrypted/authenticated payload bytes.
+    pub max_payload_bytes: usize,
+    /// Maximum authentication tag bytes.
+    pub max_tag_bytes: usize,
+    /// Maximum accepted `(key_id, nonce)` pairs retained for replay checks.
+    pub max_replay_history: usize,
+}
+
+impl Default for PacketSecurityConfig {
+    fn default() -> Self {
+        Self {
+            max_payload_bytes: DEFAULT_PACKET_SECURITY_MAX_PAYLOAD_BYTES,
+            max_tag_bytes: DEFAULT_PACKET_SECURITY_MAX_TAG_BYTES,
+            max_replay_history: DEFAULT_PACKET_SECURITY_REPLAY_HISTORY,
+        }
+    }
+}
+
+/// Encoded packet security envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PacketSecurityEnvelope {
+    /// External key identifier chosen by the embedder.
+    pub key_id: u32,
+    /// Nonce scoped to `key_id`.
+    pub nonce: u64,
+    /// Ciphertext or plaintext payload, depending on the configured cipher.
+    pub payload: Vec<u8>,
+    /// Authentication tag produced by the configured authenticator.
+    pub tag: Vec<u8>,
+}
+
+impl PacketSecurityEnvelope {
+    /// Encodes a packet security envelope.
+    pub fn encode(
+        &self,
+        config: PacketSecurityConfig,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PacketSecurityEncodeError> {
+        if self.payload.len() > config.max_payload_bytes {
+            return Err(PacketSecurityEncodeError::PayloadTooLarge {
+                budget: config.max_payload_bytes,
+                actual: self.payload.len(),
+            });
+        }
+        if self.tag.len() > config.max_tag_bytes {
+            return Err(PacketSecurityEncodeError::TagTooLarge {
+                budget: config.max_tag_bytes,
+                actual: self.tag.len(),
+            });
+        }
+
+        out.extend_from_slice(&PACKET_SECURITY_MAGIC);
+        out.extend_from_slice(&self.key_id.to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        let payload_len = u32::try_from(self.payload.len()).map_err(|_| {
+            PacketSecurityEncodeError::PayloadTooLarge {
+                budget: config.max_payload_bytes,
+                actual: self.payload.len(),
+            }
+        })?;
+        let tag_len =
+            u16::try_from(self.tag.len()).map_err(|_| PacketSecurityEncodeError::TagTooLarge {
+                budget: config.max_tag_bytes,
+                actual: self.tag.len(),
+            })?;
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&tag_len.to_le_bytes());
+        out.extend_from_slice(&self.payload);
+        out.extend_from_slice(&self.tag);
+        Ok(())
+    }
+
+    /// Decodes a packet security envelope.
+    pub fn decode(
+        config: PacketSecurityConfig,
+        input: &[u8],
+    ) -> Result<Self, PacketSecurityDecodeError> {
+        let mut cursor = SecurityCursor::new(input);
+        let magic = cursor.read_array::<4>()?;
+        if magic != PACKET_SECURITY_MAGIC {
+            return Err(PacketSecurityDecodeError::BadMagic);
+        }
+        let key_id = cursor.read_u32()?;
+        let nonce = cursor.read_u64()?;
+        let payload_len = cursor.read_u32()? as usize;
+        let tag_len = cursor.read_u16()? as usize;
+        if payload_len > config.max_payload_bytes {
+            return Err(PacketSecurityDecodeError::PayloadTooLarge {
+                budget: config.max_payload_bytes,
+                actual: payload_len,
+            });
+        }
+        if tag_len > config.max_tag_bytes {
+            return Err(PacketSecurityDecodeError::TagTooLarge {
+                budget: config.max_tag_bytes,
+                actual: tag_len,
+            });
+        }
+        let payload = cursor.read_bytes(payload_len)?;
+        let tag = cursor.read_bytes(tag_len)?;
+        cursor.finish()?;
+        Ok(Self {
+            key_id,
+            nonce,
+            payload,
+            tag,
+        })
+    }
+}
+
+/// Packet security encode error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketSecurityEncodeError {
+    /// Payload exceeded configured budget.
+    PayloadTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+    /// Authentication tag exceeded configured budget.
+    TagTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+}
+
+impl core::fmt::Display for PacketSecurityEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PayloadTooLarge { budget, actual } => write!(
+                f,
+                "packet security payload exceeded byte budget: budget {budget}, actual {actual}"
+            ),
+            Self::TagTooLarge { budget, actual } => write!(
+                f,
+                "packet security tag exceeded byte budget: budget {budget}, actual {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PacketSecurityEncodeError {}
+
+/// Packet security decode error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PacketSecurityDecodeError {
+    /// Frame magic did not match.
+    BadMagic,
+    /// Frame ended before all fields were available.
+    Truncated {
+        /// Required bytes.
+        needed: usize,
+        /// Available bytes.
+        available: usize,
+    },
+    /// Payload exceeded configured budget.
+    PayloadTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+    /// Authentication tag exceeded configured budget.
+    TagTooLarge {
+        /// Configured byte budget.
+        budget: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+    /// Frame had trailing bytes after a complete envelope.
+    TrailingBytes(usize),
+}
+
+impl core::fmt::Display for PacketSecurityDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadMagic => f.write_str("bad packet security envelope magic"),
+            Self::Truncated { needed, available } => {
+                write!(
+                    f,
+                    "truncated packet security envelope: needed {needed}, available {available}"
+                )
+            }
+            Self::PayloadTooLarge { budget, actual } => write!(
+                f,
+                "packet security payload exceeded byte budget: budget {budget}, actual {actual}"
+            ),
+            Self::TagTooLarge { budget, actual } => write!(
+                f,
+                "packet security tag exceeded byte budget: budget {budget}, actual {actual}"
+            ),
+            Self::TrailingBytes(bytes) => {
+                write!(f, "packet security envelope has {bytes} trailing bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PacketSecurityDecodeError {}
+
+/// Packet authenticator hook. Embedders should provide a real MAC/signature
+/// implementation and key management outside SectorSync.
+pub trait PacketAuthenticator {
+    /// Authenticator error type.
+    type Error;
+
+    /// Produces an authentication tag over `key_id`, `nonce`, and `payload`.
+    fn sign(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), Self::Error>;
+
+    /// Verifies an authentication tag over `key_id`, `nonce`, and `payload`.
+    fn verify(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        tag: &[u8],
+    ) -> Result<bool, Self::Error>;
+}
+
+/// Packet cipher hook. Embedders should provide real encryption outside
+/// SectorSync when confidentiality is needed.
+pub trait PacketCipher {
+    /// Cipher error type.
+    type Error;
+
+    /// Seals a payload in place before authentication.
+    fn seal(&mut self, key_id: u32, nonce: u64, payload: &mut Vec<u8>) -> Result<(), Self::Error>;
+
+    /// Opens a payload in place after authentication.
+    fn open(&mut self, key_id: u32, nonce: u64, payload: &mut Vec<u8>) -> Result<(), Self::Error>;
+}
+
+/// Explicit plaintext cipher for tests and integrations that only need
+/// authentication framing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlaintextPacketCipher;
+
+impl PacketCipher for PlaintextPacketCipher {
+    type Error = core::convert::Infallible;
+
+    fn seal(
+        &mut self,
+        _key_id: u32,
+        _nonce: u64,
+        _payload: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn open(
+        &mut self,
+        _key_id: u32,
+        _nonce: u64,
+        _payload: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Bounded replay window for security envelopes.
+#[derive(Clone, Debug)]
+pub struct PacketReplayWindow {
+    max_seen: usize,
+    seen: BTreeSet<(u32, u64)>,
+    order: VecDeque<(u32, u64)>,
+}
+
+impl PacketReplayWindow {
+    /// Creates an empty replay window.
+    pub fn new(max_seen: usize) -> Self {
+        Self {
+            max_seen,
+            seen: BTreeSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Returns retained nonce count.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Returns whether no nonces are retained.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// Returns whether a `(key_id, nonce)` pair was already accepted.
+    pub fn contains(&self, key_id: u32, nonce: u64) -> bool {
+        self.seen.contains(&(key_id, nonce))
+    }
+
+    /// Records a `(key_id, nonce)` pair if it has not been seen.
+    pub fn accept(&mut self, key_id: u32, nonce: u64) -> bool {
+        if self.max_seen == 0 {
+            return true;
+        }
+
+        let key = (key_id, nonce);
+        if self.seen.contains(&key) {
+            return false;
+        }
+        self.seen.insert(key);
+        self.order.push_back(key);
+        while self.order.len() > self.max_seen {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+impl Default for PacketReplayWindow {
+    fn default() -> Self {
+        Self::new(DEFAULT_PACKET_SECURITY_REPLAY_HISTORY)
+    }
+}
+
+/// Packet security box statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketSecurityStats {
+    /// Packets sealed.
+    pub sealed: usize,
+    /// Packets opened.
+    pub opened: usize,
+    /// Packets rejected because authentication failed.
+    pub auth_failed: usize,
+    /// Packets rejected because the nonce was replayed.
+    pub replay_rejected: usize,
+}
+
+/// Error produced by packet security helpers.
+#[derive(Debug)]
+pub enum PacketSecurityError<A, C> {
+    /// Envelope encode failed.
+    Encode(PacketSecurityEncodeError),
+    /// Envelope decode failed.
+    Decode(PacketSecurityDecodeError),
+    /// Authenticator failed.
+    Authenticator(A),
+    /// Cipher failed.
+    Cipher(C),
+    /// Authenticator returned false.
+    AuthenticationFailed {
+        /// Key id.
+        key_id: u32,
+        /// Nonce.
+        nonce: u64,
+    },
+    /// Replay window rejected the nonce.
+    Replay {
+        /// Key id.
+        key_id: u32,
+        /// Nonce.
+        nonce: u64,
+    },
+}
+
+impl<A: core::fmt::Display, C: core::fmt::Display> core::fmt::Display
+    for PacketSecurityError<A, C>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Encode(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::Authenticator(error) => write!(f, "{error}"),
+            Self::Cipher(error) => write!(f, "{error}"),
+            Self::AuthenticationFailed { key_id, nonce } => write!(
+                f,
+                "packet authentication failed for key {key_id} nonce {nonce}"
+            ),
+            Self::Replay { key_id, nonce } => {
+                write!(f, "packet replay rejected for key {key_id} nonce {nonce}")
+            }
+        }
+    }
+}
+
+impl<A, C> std::error::Error for PacketSecurityError<A, C>
+where
+    A: std::error::Error + 'static,
+    C: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::Authenticator(error) => Some(error),
+            Self::Cipher(error) => Some(error),
+            Self::AuthenticationFailed { .. } | Self::Replay { .. } => None,
+        }
+    }
+}
+
+/// Bounded packet security helper combining nonce allocation, authentication,
+/// optional encryption, and replay checks.
+#[derive(Clone, Debug)]
+pub struct PacketSecurityBox<A, C> {
+    config: PacketSecurityConfig,
+    authenticator: A,
+    cipher: C,
+    replay: PacketReplayWindow,
+    next_nonce: BTreeMap<u32, u64>,
+    stats: PacketSecurityStats,
+}
+
+impl<A, C> PacketSecurityBox<A, C> {
+    /// Creates a packet security box.
+    pub fn new(config: PacketSecurityConfig, authenticator: A, cipher: C) -> Self {
+        Self {
+            config,
+            authenticator,
+            cipher,
+            replay: PacketReplayWindow::new(config.max_replay_history),
+            next_nonce: BTreeMap::new(),
+            stats: PacketSecurityStats::default(),
+        }
+    }
+
+    /// Returns configuration.
+    pub const fn config(&self) -> PacketSecurityConfig {
+        self.config
+    }
+
+    /// Returns statistics.
+    pub const fn stats(&self) -> PacketSecurityStats {
+        self.stats
+    }
+
+    /// Borrows the replay window.
+    pub const fn replay(&self) -> &PacketReplayWindow {
+        &self.replay
+    }
+
+    /// Consumes the box and returns its components.
+    pub fn into_inner(self) -> (A, C, PacketReplayWindow) {
+        (self.authenticator, self.cipher, self.replay)
+    }
+}
+
+impl<A, C> PacketSecurityBox<A, C>
+where
+    A: PacketAuthenticator,
+    C: PacketCipher,
+{
+    /// Seals and encodes one payload.
+    pub fn seal(
+        &mut self,
+        key_id: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        let nonce = self.allocate_nonce(key_id);
+        self.seal_with_nonce(key_id, nonce, payload)
+    }
+
+    /// Seals and encodes one payload with an explicit nonce.
+    pub fn seal_with_nonce(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        if payload.len() > self.config.max_payload_bytes {
+            return Err(PacketSecurityError::Encode(
+                PacketSecurityEncodeError::PayloadTooLarge {
+                    budget: self.config.max_payload_bytes,
+                    actual: payload.len(),
+                },
+            ));
+        }
+        let mut sealed_payload = payload.to_vec();
+        self.cipher
+            .seal(key_id, nonce, &mut sealed_payload)
+            .map_err(PacketSecurityError::Cipher)?;
+        let mut tag = Vec::new();
+        self.authenticator
+            .sign(key_id, nonce, &sealed_payload, &mut tag)
+            .map_err(PacketSecurityError::Authenticator)?;
+        let envelope = PacketSecurityEnvelope {
+            key_id,
+            nonce,
+            payload: sealed_payload,
+            tag,
+        };
+        let mut out = Vec::with_capacity(
+            PACKET_SECURITY_HEADER_BYTES
+                .saturating_add(envelope.payload.len())
+                .saturating_add(envelope.tag.len()),
+        );
+        envelope
+            .encode(self.config, &mut out)
+            .map_err(PacketSecurityError::Encode)?;
+        self.stats.sealed = self.stats.sealed.saturating_add(1);
+        Ok(out)
+    }
+
+    /// Decodes, authenticates, replay-checks, and opens one payload.
+    pub fn open(
+        &mut self,
+        input: &[u8],
+    ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        let envelope = PacketSecurityEnvelope::decode(self.config, input)
+            .map_err(PacketSecurityError::Decode)?;
+        let verified = self
+            .authenticator
+            .verify(
+                envelope.key_id,
+                envelope.nonce,
+                &envelope.payload,
+                &envelope.tag,
+            )
+            .map_err(PacketSecurityError::Authenticator)?;
+        if !verified {
+            self.stats.auth_failed = self.stats.auth_failed.saturating_add(1);
+            return Err(PacketSecurityError::AuthenticationFailed {
+                key_id: envelope.key_id,
+                nonce: envelope.nonce,
+            });
+        }
+        if !self.replay.accept(envelope.key_id, envelope.nonce) {
+            self.stats.replay_rejected = self.stats.replay_rejected.saturating_add(1);
+            return Err(PacketSecurityError::Replay {
+                key_id: envelope.key_id,
+                nonce: envelope.nonce,
+            });
+        }
+        let mut payload = envelope.payload;
+        self.cipher
+            .open(envelope.key_id, envelope.nonce, &mut payload)
+            .map_err(PacketSecurityError::Cipher)?;
+        self.stats.opened = self.stats.opened.saturating_add(1);
+        Ok(payload)
+    }
+
+    fn allocate_nonce(&mut self, key_id: u32) -> u64 {
+        let next = self.next_nonce.entry(key_id).or_insert(1);
+        let nonce = *next;
+        *next = next.saturating_add(1);
+        nonce
+    }
+}
+
+struct SecurityCursor<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SecurityCursor<'a> {
+    const fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn read_u16(&mut self) -> Result<u16, PacketSecurityDecodeError> {
+        let bytes = self.read_array::<2>()?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, PacketSecurityDecodeError> {
+        let bytes = self.read_array::<4>()?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, PacketSecurityDecodeError> {
+        let bytes = self.read_array::<8>()?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], PacketSecurityDecodeError> {
+        self.require(N)?;
+        let mut out = [0_u8; N];
+        out.copy_from_slice(&self.input[self.offset..self.offset + N]);
+        self.offset += N;
+        Ok(out)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, PacketSecurityDecodeError> {
+        self.require(len)?;
+        let bytes = self.input[self.offset..self.offset + len].to_vec();
+        self.offset += len;
+        Ok(bytes)
+    }
+
+    fn require(&self, count: usize) -> Result<(), PacketSecurityDecodeError> {
+        let needed = self.offset.saturating_add(count);
+        if needed > self.input.len() {
+            Err(PacketSecurityDecodeError::Truncated {
+                needed,
+                available: self.input.len(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish(&self) -> Result<(), PacketSecurityDecodeError> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err(PacketSecurityDecodeError::TrailingBytes(
+                self.input.len().saturating_sub(self.offset),
+            ))
+        }
+    }
+}
+
 /// Bounded in-memory client transport limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientTransportLimits {
@@ -2624,6 +3254,45 @@ mod tests {
         panic!("udp station packet was not received");
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct TestAuthenticator;
+
+    impl PacketAuthenticator for TestAuthenticator {
+        type Error = core::convert::Infallible;
+
+        fn sign(
+            &mut self,
+            key_id: u32,
+            nonce: u64,
+            payload: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), Self::Error> {
+            out.extend_from_slice(&test_tag(key_id, nonce, payload));
+            Ok(())
+        }
+
+        fn verify(
+            &mut self,
+            key_id: u32,
+            nonce: u64,
+            payload: &[u8],
+            tag: &[u8],
+        ) -> Result<bool, Self::Error> {
+            Ok(tag == test_tag(key_id, nonce, payload))
+        }
+    }
+
+    fn test_tag(key_id: u32, nonce: u64, payload: &[u8]) -> [u8; 8] {
+        let mut acc = (key_id as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(nonce.rotate_left(17));
+        for (index, byte) in payload.iter().copied().enumerate() {
+            acc = acc.rotate_left(5) ^ ((byte as u64) << ((index % 8) * 8));
+            acc = acc.wrapping_mul(0x1000_0000_01B3);
+        }
+        acc.to_le_bytes()
+    }
+
     #[test]
     fn fake_transport_counts_batches_without_storing_packets() {
         let mut batch = PacketBatch::new();
@@ -2658,6 +3327,130 @@ mod tests {
             }
         );
         assert_eq!(transport.inner().packets_sent(), 0);
+    }
+
+    #[test]
+    fn packet_security_envelope_roundtrips_and_enforces_limits() {
+        let config = PacketSecurityConfig {
+            max_payload_bytes: 4,
+            max_tag_bytes: 8,
+            max_replay_history: 4,
+        };
+        let envelope = PacketSecurityEnvelope {
+            key_id: 9,
+            nonce: 42,
+            payload: b"move".to_vec(),
+            tag: vec![1, 2, 3, 4],
+        };
+        let mut bytes = Vec::new();
+        envelope
+            .encode(config, &mut bytes)
+            .expect("envelope should encode");
+        assert_eq!(
+            PacketSecurityEnvelope::decode(config, &bytes).expect("envelope should decode"),
+            envelope
+        );
+
+        let too_large = PacketSecurityEnvelope {
+            key_id: 9,
+            nonce: 43,
+            payload: b"large".to_vec(),
+            tag: Vec::new(),
+        }
+        .encode(config, &mut Vec::new())
+        .expect_err("payload should exceed configured budget");
+        assert_eq!(
+            too_large,
+            PacketSecurityEncodeError::PayloadTooLarge {
+                budget: 4,
+                actual: 5
+            }
+        );
+
+        let mut bad = bytes;
+        bad[16..20].copy_from_slice(&5_u32.to_le_bytes());
+        assert_eq!(
+            PacketSecurityEnvelope::decode(config, &bad)
+                .expect_err("decoded payload length should exceed budget"),
+            PacketSecurityDecodeError::PayloadTooLarge {
+                budget: 4,
+                actual: 5
+            }
+        );
+    }
+
+    #[test]
+    fn packet_security_box_seals_opens_and_rejects_replay() {
+        let mut sender = PacketSecurityBox::new(
+            PacketSecurityConfig::default(),
+            TestAuthenticator,
+            PlaintextPacketCipher,
+        );
+        let mut receiver = PacketSecurityBox::new(
+            PacketSecurityConfig::default(),
+            TestAuthenticator,
+            PlaintextPacketCipher,
+        );
+
+        let sealed = sender.seal(7, b"command").expect("packet should seal");
+        assert_eq!(sender.stats().sealed, 1);
+        let opened = receiver.open(&sealed).expect("packet should open");
+        assert_eq!(opened, b"command");
+        assert_eq!(receiver.stats().opened, 1);
+
+        let replay = receiver.open(&sealed).expect_err("replay should reject");
+        match replay {
+            PacketSecurityError::Replay { key_id, nonce } => {
+                assert_eq!(key_id, 7);
+                assert_eq!(nonce, 1);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(receiver.stats().replay_rejected, 1);
+    }
+
+    #[test]
+    fn packet_security_box_rejects_tampered_payload() {
+        let mut sender = PacketSecurityBox::new(
+            PacketSecurityConfig::default(),
+            TestAuthenticator,
+            PlaintextPacketCipher,
+        );
+        let mut receiver = PacketSecurityBox::new(
+            PacketSecurityConfig::default(),
+            TestAuthenticator,
+            PlaintextPacketCipher,
+        );
+
+        let mut sealed = sender
+            .seal_with_nonce(7, 10, b"command")
+            .expect("packet should seal");
+        let payload_offset = PACKET_SECURITY_HEADER_BYTES;
+        sealed[payload_offset] ^= 0x55;
+        let error = receiver
+            .open(&sealed)
+            .expect_err("tampered payload should reject");
+        match error {
+            PacketSecurityError::AuthenticationFailed { key_id, nonce } => {
+                assert_eq!(key_id, 7);
+                assert_eq!(nonce, 10);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(receiver.stats().auth_failed, 1);
+        assert_eq!(receiver.replay().len(), 0);
+    }
+
+    #[test]
+    fn packet_replay_window_bounds_history() {
+        let mut replay = PacketReplayWindow::new(2);
+        assert!(replay.accept(1, 1));
+        assert!(replay.accept(1, 2));
+        assert!(!replay.accept(1, 2));
+        assert!(replay.accept(1, 3));
+        assert_eq!(replay.len(), 2);
+        assert!(!replay.contains(1, 1));
+        assert!(replay.accept(1, 1));
     }
 
     #[test]
