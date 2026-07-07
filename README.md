@@ -61,7 +61,7 @@ Current crates:
   station-local entity storage, ghost/owner roles, dirty masks, compiled sync
   policies, custom component registry/storage, typed component codecs, schema
   helpers, generated-schema-friendly layout descriptors, cell indexing,
-  interest queries, range/frustum visibility filters, replication planning,
+  interest queries, range/frustum/tag visibility filters, replication planning,
   bounded command/event queues, handoff transfer types, hotspot planning,
   gateway session/routing primitives, barrier metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
@@ -106,6 +106,7 @@ cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example load_scheduler
 cargo run -p sectorsync-bench --example frustum_visibility
+cargo run -p sectorsync-bench --example tag_visibility
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example barrier_transport
@@ -175,7 +176,7 @@ Initial status:
 - Git repository initialized on branch `main`.
 - Rust workspace scaffolded.
 - Core low-level SDK types exist for station ownership, 3D spatial indexing,
-  interest queries, range/frustum visibility filtering, policy tables,
+  interest queries, range/frustum/tag visibility filtering, policy tables,
   replication planning, event queues, barriers, snapshots, commands, and fake
   transport integration.
 - Runtime barrier controller can request scoped barriers, wait for station tick
@@ -231,8 +232,12 @@ Initial status:
 - Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
   concrete wire payloads with bounded entity/component materialization.
 - Built-in visibility filters support range-only culling, six-plane 3D frustum
-  culling, and composable filter conjunctions for replication planning without
-  adding camera, rendering, occlusion, or client-world ownership to SectorSync.
+  culling, tag bitset required/excluded checks, and composable filter
+  conjunctions for replication planning without adding camera, rendering,
+  occlusion, business perception rules, or client-world ownership to SectorSync.
+- Station tag updates use authoritative owner checks and mark `DirtyMask::TAGS`
+  so business-defined entity categories can participate in synchronization
+  strategies without becoming a game-rule system inside SectorSync.
 - Runtime replication transport bridge plans AOI for a viewer, builds a concrete
   replication frame from component storage, skips empty frames by default,
   encodes the frame, and submits it to bounded client packet transport.
@@ -312,6 +317,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example frustum_visibility` demonstrates a
   low-level 3D frustum visibility filter composed with range culling before
   replication planning.
+- `cargo run -p sectorsync-bench --example tag_visibility` demonstrates
+  business-defined entity tag bits driving a low-level replication visibility
+  filter while preserving authoritative tag updates.
 - `cargo run -p sectorsync-bench --example replication_bridge` demonstrates a
   low-level downlink path: viewer AOI planning, replication frame building,
   bounded in-memory client transport send, receive, source/target validation,

@@ -112,8 +112,9 @@ impl ReplicationPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::EntityTags;
     use crate::ids::{ClientId, EntityId, InstanceId, NodeId, PolicyId, StationId};
-    use crate::interest::{AndVisibility, FrustumVisibility, RangeOnlyVisibility};
+    use crate::interest::{AndVisibility, FrustumVisibility, RangeOnlyVisibility, TagVisibility};
     use crate::policy::CompiledSyncPolicy;
     use crate::spatial::{Aabb3, Bounds, Frustum3, GridSpec, Position3};
     use crate::station::{Station, StationConfig};
@@ -176,6 +177,73 @@ mod tests {
         );
 
         assert_eq!(plan.entities, vec![visible]);
+        assert_eq!(plan.stats.selected, 1);
+        assert_eq!(plan.stats.considered, 2);
+    }
+
+    #[test]
+    fn planner_applies_tag_visibility_filter() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let grid = GridSpec::new(16.0).expect("grid is valid");
+        let mut index = CellIndex::new(grid);
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 128.0));
+
+        let static_visible = station
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(10.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn static");
+        let fast_mover = station
+            .spawn_owned(
+                EntityId::new(2),
+                Position3::new(12.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn mover");
+        station
+            .set_tags(static_visible, EntityTags::from_bits(0b001))
+            .expect("tag static");
+        station
+            .set_tags(fast_mover, EntityTags::from_bits(0b010))
+            .expect("tag mover");
+        index.upsert(
+            static_visible,
+            Position3::new(10.0, 0.0, 0.0),
+            Bounds::Point,
+        );
+        index.upsert(fast_mover, Position3::new(12.0, 0.0, 0.0), Bounds::Point);
+
+        let viewer = ViewerQuery {
+            client_id: ClientId::new(7),
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: 128.0,
+            max_entities: 8,
+        };
+        let filter = AndVisibility::new(
+            RangeOnlyVisibility,
+            TagVisibility::new(EntityTags::from_bits(0b001), EntityTags::from_bits(0b010)),
+        );
+
+        let plan = ReplicationPlanner::plan_for_viewer(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &filter,
+            ReplicationBudget::default(),
+        );
+
+        assert_eq!(plan.entities, vec![static_visible]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.considered, 2);
     }

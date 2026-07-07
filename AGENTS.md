@@ -68,6 +68,9 @@
 - Use `cargo run -p sectorsync-bench --example frustum_visibility` when changing
   3D spatial frustum primitives, visibility filters, or replication-planner
   visibility integration.
+- Use `cargo run -p sectorsync-bench --example tag_visibility` when changing
+  entity tag primitives, authoritative tag update APIs, tag visibility filters,
+  or tag-driven replication planning.
 - Do not run `--profile=medium` or `--profile=large` as part of routine checks
   unless the user asks for heavier validation.
 - Heavy benchmark profiles require `--allow-heavy`. Do not add a default path
@@ -138,6 +141,10 @@ The core library does not own:
   allocation-light on hot paths, and they must not own camera systems,
   rendering, occlusion pipelines, client world state, or game-specific
   perception rules.
+- Entity tags are business-defined bitsets. Core code may expose bounded
+  required/excluded tag filters and authoritative tag mutation helpers, but it
+  must not add string tag registries, rule engines, gameplay taxonomies, or
+  dynamic tag scripts.
 - Gateway/session primitives must remain low-level and bounded: session tables,
   route epochs, reconnect generations, replay/stale sequence checks, expiry,
   and per-client command admission limits are allowed; sockets, auth providers,

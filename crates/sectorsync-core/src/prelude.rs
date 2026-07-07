@@ -32,7 +32,8 @@ pub use crate::ids::{
     NodeId, OwnerEpoch, PolicyId, StationId, Tick,
 };
 pub use crate::interest::{
-    AndVisibility, FrustumVisibility, RangeOnlyVisibility, ViewerQuery, VisibilityFilter,
+    AndVisibility, FrustumVisibility, RangeOnlyVisibility, TagVisibility, ViewerQuery,
+    VisibilityFilter,
 };
 pub use crate::policy::{CompiledSyncPolicy, PolicyTable};
 pub use crate::replication::{

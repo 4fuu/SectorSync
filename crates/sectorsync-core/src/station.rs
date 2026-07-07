@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::entity::{DirtyMask, EntityRecord, EntityRole};
+use crate::entity::{DirtyMask, EntityRecord, EntityRole, EntityTags};
 use crate::handoff::HandoffTransfer;
 use crate::ids::{
     EntityHandle, EntityId, InstanceId, NodeId, OwnerEpoch, PolicyId, StationId, Tick,
@@ -195,6 +195,19 @@ impl Station {
         }
         record.position = position;
         record.dirty.insert(DirtyMask::TRANSFORM);
+        Ok(())
+    }
+
+    /// Replaces authoritative entity tags and marks tags dirty.
+    pub fn set_tags(&mut self, handle: EntityHandle, tags: EntityTags) -> Result<(), StationError> {
+        let record = self
+            .get_mut(handle)
+            .ok_or(StationError::MissingEntityHandle(handle))?;
+        if !record.is_owned() {
+            return Err(StationError::NotOwner(record.id));
+        }
+        record.tags = tags;
+        record.dirty.insert(DirtyMask::TAGS);
         Ok(())
     }
 
@@ -579,6 +592,47 @@ mod tests {
             .move_owned(handle, Position3::new(1.0, 0.0, 0.0))
             .expect_err("ghost move should fail");
         assert_eq!(error, StationError::NotOwner(EntityId::new(5)));
+    }
+
+    #[test]
+    fn owned_tags_can_be_replaced_and_mark_dirty() {
+        let mut station = Station::new(config());
+        let handle = station
+            .spawn_owned(
+                EntityId::new(6),
+                Position3::new(0.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("spawn should work");
+        let tags = EntityTags::from_bits(0b101);
+
+        station
+            .set_tags(handle, tags)
+            .expect("set tags should work");
+        let record = station.get(handle).expect("entity should exist");
+
+        assert_eq!(record.tags, tags);
+        assert!(record.dirty.contains(DirtyMask::TAGS));
+    }
+
+    #[test]
+    fn ghost_tags_cannot_be_replaced_as_owned() {
+        let mut station = Station::new(config());
+        let handle = station.upsert_ghost(
+            EntityId::new(7),
+            Position3::new(0.0, 0.0, 0.0),
+            Bounds::Point,
+            PolicyId::new(0),
+            StationId::new(2),
+            OwnerEpoch::new(1),
+            Tick::new(10),
+        );
+
+        let error = station
+            .set_tags(handle, EntityTags::from_bits(1))
+            .expect_err("ghost tags should fail");
+        assert_eq!(error, StationError::NotOwner(EntityId::new(7)));
     }
 
     #[test]

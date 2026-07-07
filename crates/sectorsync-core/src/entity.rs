@@ -26,9 +26,19 @@ impl EntityTags {
         (self.0 & mask.0) == mask.0
     }
 
+    /// Returns whether any bit in `mask` is present.
+    pub const fn intersects(self, mask: Self) -> bool {
+        (self.0 & mask.0) != 0
+    }
+
     /// Adds all tags in `mask`.
     pub fn insert(&mut self, mask: Self) {
         self.0 |= mask.0;
+    }
+
+    /// Removes all tags in `mask`.
+    pub fn remove(&mut self, mask: Self) {
+        self.0 &= !mask.0;
     }
 }
 
@@ -180,5 +190,22 @@ impl EntityRecord {
     /// Returns whether this record is authoritative in its station.
     pub const fn is_owned(&self) -> bool {
         self.role.is_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_tags_support_contains_intersects_and_remove() {
+        let mut tags = EntityTags::from_bits(0b1011);
+
+        assert!(tags.contains(EntityTags::from_bits(0b0011)));
+        assert!(tags.intersects(EntityTags::from_bits(0b1000)));
+        assert!(!tags.intersects(EntityTags::from_bits(0b0100_0000)));
+
+        tags.remove(EntityTags::from_bits(0b0010));
+        assert_eq!(tags.bits(), 0b1001);
     }
 }

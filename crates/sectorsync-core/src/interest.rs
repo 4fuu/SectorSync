@@ -1,6 +1,6 @@
 //! Interest query primitives used by replication planning.
 
-use crate::entity::EntityRecord;
+use crate::entity::{EntityRecord, EntityTags};
 use crate::ids::ClientId;
 use crate::spatial::{Frustum3, Position3};
 
@@ -58,6 +58,38 @@ impl VisibilityFilter for FrustumVisibility {
     fn is_visible(&self, _viewer: &ViewerQuery, entity: &EntityRecord) -> bool {
         self.frustum
             .intersects_bounds(entity.position, entity.bounds)
+    }
+}
+
+/// Tag visibility filter using business-defined entity tag bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TagVisibility {
+    /// Tags that must all be present.
+    pub required: EntityTags,
+    /// Tags where any match rejects the entity.
+    pub excluded: EntityTags,
+}
+
+impl TagVisibility {
+    /// Creates a tag filter.
+    pub const fn new(required: EntityTags, excluded: EntityTags) -> Self {
+        Self { required, excluded }
+    }
+
+    /// Creates a tag filter requiring all bits in `required`.
+    pub const fn require(required: EntityTags) -> Self {
+        Self::new(required, EntityTags::EMPTY)
+    }
+
+    /// Creates a tag filter excluding any bit in `excluded`.
+    pub const fn exclude(excluded: EntityTags) -> Self {
+        Self::new(EntityTags::EMPTY, excluded)
+    }
+}
+
+impl VisibilityFilter for TagVisibility {
+    fn is_visible(&self, _viewer: &ViewerQuery, entity: &EntityRecord) -> bool {
+        entity.tags.contains(self.required) && !entity.tags.intersects(self.excluded)
     }
 }
 
