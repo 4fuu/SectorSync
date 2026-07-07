@@ -50,6 +50,31 @@ The first implementation should stay resource-aware. The development machine is
 not assumed to be a production benchmark host, so expensive tests must be
 explicitly gated and default checks must stay lightweight.
 
+## Workspace Layout
+
+Current crates:
+
+- `crates/sectorsync-core`: IDs, command envelopes, 3D spatial primitives,
+  station-local entity storage, ghost/owner roles, dirty masks, compiled sync
+  policies, cell indexing, interest queries, replication planning, event queues,
+  barrier metadata, and snapshot metadata.
+- `crates/sectorsync-wire`: frame shapes and a default binary frame encoder.
+- `crates/sectorsync-transport`: transport sink trait and fake transport for
+  tests/benchmarks.
+- `crates/sectorsync-runtime`: in-process station collection helpers.
+- `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
+
+Useful commands:
+
+```bash
+cargo test --workspace
+cargo run -p sectorsync-bench -- --profile=smoke
+cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
+```
+
+The default smoke profile is intentionally small. Larger benchmark profiles must
+be requested explicitly, for example `--profile=medium` or `--profile=large`.
+
 ## Performance Targets
 
 The project is judged by multiple hard metrics together, not by a single number:
@@ -82,3 +107,23 @@ measured against simpler strategies.
 This repository is being built iteratively. The README and `AGENTS.md` are
 living documents and should be updated whenever the architecture, rules, or
 implementation scope changes materially.
+
+Initial status:
+
+- Git repository initialized on branch `main`.
+- Rust workspace scaffolded.
+- Core low-level SDK types exist for station ownership, 3D spatial indexing,
+  interest queries, policy tables, replication planning, event queues, barriers,
+  snapshots, commands, and fake transport integration.
+- Smoke benchmark runs through planning, frame encoding, and fake transport.
+
+Not complete yet:
+
+- Full runtime barrier execution semantics.
+- Two-phase owner handoff implementation.
+- Hotspot detection and station ownership split execution.
+- Multi-station scheduler and bounded cross-station queues beyond core queue
+  primitives.
+- Component registry and custom component codecs.
+- Real transport adapters.
+- Large-scale benchmark validation against the stated hard metrics.

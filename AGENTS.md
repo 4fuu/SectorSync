@@ -10,6 +10,11 @@
   host, so do not run heavy stress tests unless explicitly requested.
 - When a benchmark must consume substantial CPU or memory, add a small default
   profile and gate larger profiles behind explicit arguments.
+- Default Rust verification should start with `cargo test --workspace`.
+- Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
+  benchmark smoke test.
+- Do not run `--profile=medium` or `--profile=large` as part of routine checks
+  unless the user asks for heavier validation.
 
 ## Project Boundary
 
@@ -61,6 +66,8 @@ The core library does not own:
   architectural invariants change.
 - Prefer short design notes near the code being introduced. Avoid large stale
   design documents unless the implementation needs them.
+- When a new crate, benchmark mode, runtime invariant, or public SDK boundary is
+  introduced, update `README.md` in the same iteration.
 
 ## Git Rules
 
