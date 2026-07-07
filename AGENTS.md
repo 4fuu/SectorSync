@@ -54,6 +54,8 @@ The core library does not own:
 - Cell-level migration must update both ownership metadata and source/target
   spatial indexes. Do not move a cell without preserving source ghost visibility
   during the handoff window.
+- Split scheduler changes should remain conservative by default: bounded actions,
+  bounded moved cells, and preference for lower-load target stations.
 - Runtime barrier work must preserve the sequence: request, align to tick
   boundary, freeze, snapshot or migrate, resume.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded
