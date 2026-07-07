@@ -19,6 +19,9 @@
 - Use `cargo run -p sectorsync-bench --example gateway_command_pipeline` when
   changing runtime gateway command frame decoding, gateway admission to station
   queue routing, or command ACK generation.
+- Use `cargo run -p sectorsync-bench --example gateway_deployment_dispatch`
+  when changing gateway-to-deployment delivery route resolution or gateway
+  command dispatch reports for external node transports.
 - Use `cargo run -p sectorsync-bench --example deployment_routing` when changing
   deployment node/station route tables, node heartbeat/stale checks, draining
   behavior, route moves, or placement capacity rules.
@@ -105,6 +108,11 @@ The core library does not own:
   ACKs. They must not perform game-rule validation, anti-cheat decisions,
   account auth, reconnect loops, NAT traversal, blocking network IO, or
   unbounded buffering.
+- Gateway-to-deployment dispatch may resolve admitted command routes into node
+  delivery metadata and return stamped command envelopes for external
+  transports. It must remain metadata-only: no service discovery, process
+  supervision, remote procedure framework, hidden retries, or durable cluster
+  state.
 - Deployment routing primitives must remain metadata-only and bounded: node
   registration, heartbeat ticks, station placement routes, route epochs,
   draining/offline state, stale checks, and capacity guards are allowed;

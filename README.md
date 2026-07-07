@@ -101,6 +101,7 @@ cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --example gateway_command_pipeline
+cargo run -p sectorsync-bench --example gateway_deployment_dispatch
 cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
@@ -179,6 +180,10 @@ Initial status:
   gateway/session metadata admission, queues accepted commands into target
   station queues, and encodes command ACKs for accepted or rejected commands
   without interpreting game payloads.
+- Deployment routing can resolve a connected gateway client's station route into
+  node delivery metadata, including gateway/station/node route epochs. Runtime
+  gateway command dispatch can return a stamped command envelope plus a
+  deployment delivery route for external node transports.
 - Wire codec supports client command ingress frames that convert into
   `CommandEnvelope` after the server stamps `received_at`, plus command ACK
   frames for the return path. Command payloads remain opaque to SectorSync.
@@ -258,6 +263,9 @@ Initial status:
   demonstrates a reusable gateway command frame pipeline that turns command
   bytes into station queue entries and ACK bytes while preserving gateway
   rate-limit rejection.
+- `cargo run -p sectorsync-bench --example gateway_deployment_dispatch`
+  demonstrates gateway-admitted command bytes resolving to deployment node
+  delivery routes before and after a station route move.
 - `cargo run -p sectorsync-bench --example deployment_routing` demonstrates a
   low-level deployment route table registering nodes, assigning station routes,
   marking a node draining, moving a station route to another node, and marking a

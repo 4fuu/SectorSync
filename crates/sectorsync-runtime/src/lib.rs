@@ -7,10 +7,10 @@ pub mod deployment;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, ClientId, CommandId,
-    CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues, EntityHandle, EntityId,
-    EventQueueError, EventQueueLimits, EventQueues, GatewayError, GatewaySessionTable,
-    HandoffTransfer, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotThresholds,
+    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, ClientId, CommandEnvelope,
+    CommandId, CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues, EntityHandle,
+    EntityId, EventQueueError, EventQueueLimits, EventQueues, GatewayError, GatewaySessionTable,
+    HandoffTransfer, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotThresholds, NodeId,
     OwnerEpoch, PushOutcome, RuntimeBarrier, SnapshotVersion, SplitProposal, Station, StationError,
     StationEvent, StationId, StationLoadSample, StationSnapshot, Tick,
 };
@@ -23,6 +23,7 @@ use sectorsync_wire::{
 pub use deployment::{
     DeploymentConfig, DeploymentError, DeploymentNodeRoute, DeploymentNodeState,
     DeploymentRouteTable, DeploymentStationMove, DeploymentStationRoute, DeploymentStats,
+    GatewayDeliveryError, GatewayDeliveryRoute,
 };
 
 /// Accepted command ACK reason code.
@@ -39,6 +40,8 @@ pub const GATEWAY_COMMAND_ACK_QUEUE_FULL: u16 = 4;
 pub const GATEWAY_COMMAND_ACK_BARRIER_REJECTED: u16 = 5;
 /// Command route pointed at a station queue that was not registered.
 pub const GATEWAY_COMMAND_ACK_MISSING_QUEUE: u16 = 6;
+/// Command could not be resolved through deployment metadata.
+pub const GATEWAY_COMMAND_ACK_DEPLOYMENT_REJECTED: u16 = 7;
 
 /// Gateway command pipeline configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +75,10 @@ pub struct GatewayCommandPipelineStats {
     pub commands_rejected_gateway: usize,
     /// Commands rejected by station queue or station queue lookup.
     pub commands_rejected_queue: usize,
+    /// Commands resolved to deployment node delivery routes.
+    pub commands_routed_deployment: usize,
+    /// Commands rejected by deployment node/station route metadata.
+    pub commands_rejected_deployment: usize,
     /// ACK frames encoded.
     pub acks_encoded: usize,
 }
@@ -89,6 +96,8 @@ pub enum GatewayCommandPipelineError {
     MissingQueue(StationId),
     /// Target station queue rejected the command.
     Queue(CommandQueueError),
+    /// Deployment route metadata rejected command delivery.
+    Deployment(DeploymentError),
     /// ACK encode failed.
     Encode(BinaryEncodeError),
 }
@@ -105,6 +114,7 @@ impl core::fmt::Display for GatewayCommandPipelineError {
                 station_id.get()
             ),
             Self::Queue(error) => write!(f, "{error}"),
+            Self::Deployment(error) => write!(f, "{error}"),
             Self::Encode(error) => write!(f, "{error}"),
         }
     }
@@ -116,6 +126,7 @@ impl std::error::Error for GatewayCommandPipelineError {
             Self::Decode(error) => Some(error),
             Self::Gateway(error) => Some(error),
             Self::Queue(error) => Some(error),
+            Self::Deployment(error) => Some(error),
             Self::Encode(error) => Some(error),
             Self::NonCommandFrame | Self::MissingQueue(_) => None,
         }
@@ -131,6 +142,12 @@ pub struct GatewayCommandPipelineReport {
     pub command_id: Option<CommandId>,
     /// Target station when gateway routing succeeded.
     pub station_id: Option<StationId>,
+    /// Target node when deployment routing succeeded.
+    pub node_id: Option<NodeId>,
+    /// Resolved deployment delivery route.
+    pub delivery: Option<GatewayDeliveryRoute>,
+    /// Stamped command envelope for external dispatch, when not enqueued locally.
+    pub command: Option<CommandEnvelope>,
     /// Whether the command was queued for station application.
     pub accepted: bool,
     /// ACK reason code. Zero means accepted.
@@ -256,6 +273,82 @@ impl GatewayCommandPipeline {
         self.accepted_report(client_id, command_id, station_id, now)
     }
 
+    /// Decodes and admits one command packet, then resolves a deployment route
+    /// for external node dispatch without touching local station queues.
+    pub fn dispatch(
+        &mut self,
+        gateway: &mut GatewaySessionTable,
+        deployment: &DeploymentRouteTable,
+        input: &[u8],
+        now: Tick,
+    ) -> GatewayCommandPipelineReport {
+        let frame = match self.decoder.decode(input) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.stats.frames_rejected_decode =
+                    self.stats.frames_rejected_decode.saturating_add(1);
+                return GatewayCommandPipelineReport {
+                    error: Some(GatewayCommandPipelineError::Decode(error)),
+                    ..GatewayCommandPipelineReport::default()
+                };
+            }
+        };
+
+        let RuntimeFrame::Command(command_frame) = frame else {
+            self.stats.frames_rejected_non_command =
+                self.stats.frames_rejected_non_command.saturating_add(1);
+            return GatewayCommandPipelineReport {
+                error: Some(GatewayCommandPipelineError::NonCommandFrame),
+                ..GatewayCommandPipelineReport::default()
+            };
+        };
+        self.stats.command_frames_decoded = self.stats.command_frames_decoded.saturating_add(1);
+
+        let client_id = command_frame.client_id;
+        let command_id = command_frame.command_id;
+        let command = command_frame.into_envelope(now);
+        let admission = match gateway.admit_command(&command) {
+            Ok(admission) => {
+                self.stats.commands_admitted = self.stats.commands_admitted.saturating_add(1);
+                admission
+            }
+            Err(error) => {
+                self.stats.commands_rejected_gateway =
+                    self.stats.commands_rejected_gateway.saturating_add(1);
+                return self.rejected_report(
+                    client_id,
+                    command_id,
+                    None,
+                    now,
+                    gateway_reject_reason_code(error),
+                    GatewayCommandPipelineError::Gateway(error),
+                );
+            }
+        };
+
+        let delivery = match deployment.resolve_gateway_route(admission.route) {
+            Ok(delivery) => {
+                self.stats.commands_routed_deployment =
+                    self.stats.commands_routed_deployment.saturating_add(1);
+                delivery
+            }
+            Err(error) => {
+                self.stats.commands_rejected_deployment =
+                    self.stats.commands_rejected_deployment.saturating_add(1);
+                return self.rejected_report(
+                    client_id,
+                    command_id,
+                    Some(admission.route.station_id),
+                    now,
+                    GATEWAY_COMMAND_ACK_DEPLOYMENT_REJECTED,
+                    GatewayCommandPipelineError::Deployment(error),
+                );
+            }
+        };
+
+        self.dispatch_report(command, delivery, now)
+    }
+
     fn accepted_report(
         &mut self,
         client_id: ClientId,
@@ -275,6 +368,9 @@ impl GatewayCommandPipeline {
                 client_id: Some(client_id),
                 command_id: Some(command_id),
                 station_id: Some(station_id),
+                node_id: None,
+                delivery: None,
+                command: None,
                 accepted: true,
                 reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
                 ack_bytes: Some(ack_bytes),
@@ -284,6 +380,50 @@ impl GatewayCommandPipeline {
                 client_id: Some(client_id),
                 command_id: Some(command_id),
                 station_id: Some(station_id),
+                node_id: None,
+                delivery: None,
+                command: None,
+                accepted: false,
+                reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+                ack_bytes: None,
+                error: Some(GatewayCommandPipelineError::Encode(error)),
+            },
+        }
+    }
+
+    fn dispatch_report(
+        &mut self,
+        command: CommandEnvelope,
+        delivery: GatewayDeliveryRoute,
+        now: Tick,
+    ) -> GatewayCommandPipelineReport {
+        let ack = CommandAckFrame {
+            client_id: command.client_id,
+            command_id: command.id,
+            server_tick: now,
+            accepted: true,
+            reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+        };
+        match self.encode_ack(&ack) {
+            Ok(ack_bytes) => GatewayCommandPipelineReport {
+                client_id: Some(command.client_id),
+                command_id: Some(command.id),
+                station_id: Some(delivery.station_id),
+                node_id: Some(delivery.node_id),
+                delivery: Some(delivery),
+                command: Some(command),
+                accepted: true,
+                reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
+                ack_bytes: Some(ack_bytes),
+                error: None,
+            },
+            Err(error) => GatewayCommandPipelineReport {
+                client_id: Some(command.client_id),
+                command_id: Some(command.id),
+                station_id: Some(delivery.station_id),
+                node_id: Some(delivery.node_id),
+                delivery: Some(delivery),
+                command: None,
                 accepted: false,
                 reason_code: GATEWAY_COMMAND_ACK_ACCEPTED,
                 ack_bytes: None,
@@ -316,6 +456,9 @@ impl GatewayCommandPipeline {
                         client_id: Some(client_id),
                         command_id: Some(command_id),
                         station_id,
+                        node_id: None,
+                        delivery: None,
+                        command: None,
                         accepted: false,
                         reason_code,
                         ack_bytes: None,
@@ -331,6 +474,9 @@ impl GatewayCommandPipeline {
             client_id: Some(client_id),
             command_id: Some(command_id),
             station_id,
+            node_id: None,
+            delivery: None,
+            command: None,
             accepted: false,
             reason_code,
             ack_bytes,
@@ -2023,6 +2169,98 @@ mod tests {
         ));
         assert_eq!(pipeline.stats().commands_admitted, 1);
         assert_eq!(pipeline.stats().commands_rejected_queue, 1);
+    }
+
+    #[test]
+    fn gateway_command_pipeline_dispatches_to_deployment_route() {
+        let client_id = ClientId::new(7);
+        let station_id = StationId::new(1);
+        let node_id = NodeId::new(9);
+        let mut gateway = gateway(4);
+        gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let mut deployment = DeploymentRouteTable::new(DeploymentConfig {
+            max_nodes: 4,
+            max_stations_per_node: 4,
+            stale_after_ticks: 10,
+        });
+        deployment
+            .register_node(node_id, 4, Tick::new(10))
+            .expect("node should register");
+        deployment
+            .assign_station(station_id, node_id, Tick::new(10))
+            .expect("station should assign");
+        let mut pipeline = GatewayCommandPipeline::default();
+
+        let report = pipeline.dispatch(
+            &mut gateway,
+            &deployment,
+            &encode_command_frame(1),
+            Tick::new(12),
+        );
+
+        assert!(report.accepted);
+        assert_eq!(report.station_id, Some(station_id));
+        assert_eq!(report.node_id, Some(node_id));
+        let delivery = report.delivery.expect("delivery should resolve");
+        assert_eq!(delivery.client_id, client_id);
+        assert_eq!(delivery.station_id, station_id);
+        assert_eq!(delivery.node_id, node_id);
+        assert_eq!(delivery.station_route_epoch, 1);
+        assert_eq!(
+            report
+                .command
+                .expect("command should be returned")
+                .received_at,
+            Tick::new(12)
+        );
+        let RuntimeFrame::CommandAck(ack) = BinaryFrameDecoder
+            .decode(&report.ack_bytes.expect("ACK should encode"))
+            .expect("ACK should decode")
+        else {
+            panic!("expected command ACK");
+        };
+        assert!(ack.accepted);
+        assert_eq!(pipeline.stats().commands_routed_deployment, 1);
+    }
+
+    #[test]
+    fn gateway_command_pipeline_negative_acks_missing_deployment_route() {
+        let client_id = ClientId::new(7);
+        let station_id = StationId::new(1);
+        let mut gateway = gateway(4);
+        gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let deployment = DeploymentRouteTable::default();
+        let mut pipeline = GatewayCommandPipeline::default();
+
+        let report = pipeline.dispatch(
+            &mut gateway,
+            &deployment,
+            &encode_command_frame(1),
+            Tick::new(12),
+        );
+
+        assert!(!report.accepted);
+        assert_eq!(report.station_id, Some(station_id));
+        assert_eq!(report.reason_code, GATEWAY_COMMAND_ACK_DEPLOYMENT_REJECTED);
+        assert!(matches!(
+            report.error,
+            Some(GatewayCommandPipelineError::Deployment(
+                DeploymentError::MissingStation(id)
+            )) if id == station_id
+        ));
+        let RuntimeFrame::CommandAck(ack) = BinaryFrameDecoder
+            .decode(&report.ack_bytes.expect("rejection ACK should encode"))
+            .expect("ACK should decode")
+        else {
+            panic!("expected command ACK");
+        };
+        assert!(!ack.accepted);
+        assert_eq!(ack.reason_code, GATEWAY_COMMAND_ACK_DEPLOYMENT_REJECTED);
+        assert_eq!(pipeline.stats().commands_rejected_deployment, 1);
     }
 
     #[test]

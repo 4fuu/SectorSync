@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sectorsync_core::prelude::{NodeId, StationId, Tick};
+use sectorsync_core::prelude::{
+    ClientId, GatewayError, GatewayRoute, GatewaySessionTable, NodeId, StationId, Tick,
+};
 
 /// Deployment route table configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +76,56 @@ pub struct DeploymentStationMove {
     pub previous: DeploymentStationRoute,
     /// New station route.
     pub current: DeploymentStationRoute,
+}
+
+/// Resolved gateway command delivery route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayDeliveryRoute {
+    /// Routed client.
+    pub client_id: ClientId,
+    /// Destination station.
+    pub station_id: StationId,
+    /// Node currently hosting the destination station.
+    pub node_id: NodeId,
+    /// Gateway session generation observed during route resolution.
+    pub gateway_generation: u64,
+    /// Gateway route epoch observed during route resolution.
+    pub gateway_route_epoch: u64,
+    /// Deployment station route epoch observed during route resolution.
+    pub station_route_epoch: u64,
+    /// Deployment node route epoch observed during route resolution.
+    pub node_route_epoch: u64,
+    /// Destination node state observed during route resolution.
+    pub node_state: DeploymentNodeState,
+    /// Tick at which the station placement was assigned.
+    pub assigned_at: Tick,
+}
+
+/// Error while resolving a gateway client through deployment metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayDeliveryError {
+    /// Gateway/session metadata rejected route lookup.
+    Gateway(GatewayError),
+    /// Deployment station/node metadata rejected route lookup.
+    Deployment(DeploymentError),
+}
+
+impl core::fmt::Display for GatewayDeliveryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Gateway(error) => write!(f, "{error}"),
+            Self::Deployment(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for GatewayDeliveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Gateway(error) => Some(error),
+            Self::Deployment(error) => Some(error),
+        }
+    }
 }
 
 /// Deployment route table statistics.
@@ -456,6 +508,49 @@ impl DeploymentRouteTable {
         Ok(node.stations.iter().copied().collect())
     }
 
+    /// Resolves a gateway route to deployment node/station metadata.
+    ///
+    /// Draining nodes remain valid for existing station routes; offline nodes
+    /// are rejected so embedders can reroute or fail over explicitly.
+    pub fn resolve_gateway_route(
+        &self,
+        route: GatewayRoute,
+    ) -> Result<GatewayDeliveryRoute, DeploymentError> {
+        let station_route = self.station_route(route.station_id)?;
+        let node_route = self.node_route(station_route.node_id)?;
+        if node_route.state == DeploymentNodeState::Offline {
+            return Err(DeploymentError::NodeUnavailable {
+                node_id: node_route.node_id,
+                state: node_route.state,
+            });
+        }
+
+        Ok(GatewayDeliveryRoute {
+            client_id: route.client_id,
+            station_id: route.station_id,
+            node_id: node_route.node_id,
+            gateway_generation: route.generation,
+            gateway_route_epoch: route.route_epoch,
+            station_route_epoch: station_route.route_epoch,
+            node_route_epoch: node_route.route_epoch,
+            node_state: node_route.state,
+            assigned_at: station_route.assigned_at,
+        })
+    }
+
+    /// Resolves a connected gateway client to deployment node/station metadata.
+    pub fn resolve_gateway_client(
+        &self,
+        gateway: &GatewaySessionTable,
+        client_id: ClientId,
+    ) -> Result<GatewayDeliveryRoute, GatewayDeliveryError> {
+        let route = gateway
+            .route(client_id)
+            .map_err(GatewayDeliveryError::Gateway)?;
+        self.resolve_gateway_route(route)
+            .map_err(GatewayDeliveryError::Deployment)
+    }
+
     /// Returns stale node ids without mutating node state.
     pub fn stale_nodes(&self, now: Tick) -> Vec<NodeId> {
         self.nodes
@@ -635,6 +730,60 @@ mod tests {
                 .stations_on_node(NodeId::new(2))
                 .expect("target exists"),
             vec![StationId::new(10)]
+        );
+    }
+
+    #[test]
+    fn resolves_gateway_clients_to_deployment_delivery_routes() {
+        let client_id = ClientId::new(7);
+        let station_id = StationId::new(10);
+        let node_id = NodeId::new(1);
+        let mut gateway = GatewaySessionTable::default();
+        let connected = gateway
+            .connect(client_id, station_id, Tick::new(10))
+            .expect("client should connect");
+        let mut table = DeploymentRouteTable::new(config());
+        table
+            .register_node(node_id, 2, Tick::new(10))
+            .expect("node should register");
+        table
+            .assign_station(station_id, node_id, Tick::new(10))
+            .expect("station should assign");
+
+        let route = table
+            .resolve_gateway_client(&gateway, client_id)
+            .expect("route should resolve");
+        assert_eq!(route.client_id, client_id);
+        assert_eq!(route.station_id, station_id);
+        assert_eq!(route.node_id, node_id);
+        assert_eq!(route.gateway_generation, connected.route.generation);
+        assert_eq!(route.gateway_route_epoch, connected.route.route_epoch);
+        assert_eq!(route.station_route_epoch, 1);
+        assert_eq!(route.node_route_epoch, 1);
+        assert_eq!(route.node_state, DeploymentNodeState::Online);
+
+        table
+            .mark_draining(node_id)
+            .expect("draining node should remain routable");
+        assert_eq!(
+            table
+                .resolve_gateway_client(&gateway, client_id)
+                .expect("draining node should still route")
+                .node_state,
+            DeploymentNodeState::Draining
+        );
+
+        table
+            .mark_offline(node_id)
+            .expect("offline node should mark");
+        assert_eq!(
+            table
+                .resolve_gateway_client(&gateway, client_id)
+                .expect_err("offline node should reject delivery"),
+            GatewayDeliveryError::Deployment(DeploymentError::NodeUnavailable {
+                node_id,
+                state: DeploymentNodeState::Offline
+            })
         );
     }
 
