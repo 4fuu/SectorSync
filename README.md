@@ -87,8 +87,8 @@ Current crates:
   includes dynamic cell ownership tables, conservative automatic split
   scheduling with cooldown/capacity/improvement guards, cell-level migration
   execution, a low-level deployment node/station route table, a station event
-  router, a bounded station event transport bridge, a business-agnostic gateway
-  command pipeline, and a simple station scheduler.
+  router, bounded station event and command dispatch transport bridges, a
+  business-agnostic gateway command pipeline, and a simple station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -191,6 +191,10 @@ Initial status:
 - Wire codec supports internal command dispatch frames for gateway-to-station
   node delivery. These frames preserve the gateway-stamped `received_at` tick
   and target station while keeping command payloads opaque.
+- Runtime command dispatch transport bridge encodes gateway-stamped command
+  envelopes into internal dispatch frames, moves them through bounded station
+  packet transport, validates packet targets, and enqueues decoded commands into
+  target station command queues.
 - Custom component registry and sparse blob storage allow external systems to
   register game-owned data without forcing a full ECS framework.
 - Typed component codecs and schema helpers support compact user-defined
@@ -269,8 +273,9 @@ Initial status:
   rate-limit rejection.
 - `cargo run -p sectorsync-bench --example gateway_deployment_dispatch`
   demonstrates gateway-admitted command bytes resolving to deployment node
-  delivery routes before and after a station route move, then encoding the
-  stamped command envelope into an internal command dispatch frame.
+  delivery routes before and after a station route move, then sending the
+  stamped command envelope through bounded station transport into the target
+  station command queue.
 - `cargo run -p sectorsync-bench --example deployment_routing` demonstrates a
   low-level deployment route table registering nodes, assigning station routes,
   marking a node draining, moving a station route to another node, and marking a

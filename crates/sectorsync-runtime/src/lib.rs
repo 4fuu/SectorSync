@@ -17,7 +17,7 @@ use sectorsync_core::prelude::{
 use sectorsync_transport::{StationOutboundPacket, StationTransportReceiver, StationTransportSink};
 use sectorsync_wire::{
     BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
-    FrameDecoder, FrameEncoder, RuntimeFrame, StationEventFrame,
+    CommandDispatchFrame, FrameDecoder, FrameEncoder, RuntimeFrame, StationEventFrame,
 };
 
 pub use deployment::{
@@ -1697,6 +1697,249 @@ impl StationEventTransportBridge {
     }
 }
 
+/// Statistics for command dispatch transport bridging.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommandDispatchTransportStats {
+    /// Commands encoded and submitted to station transport.
+    pub commands_sent: usize,
+    /// Bytes submitted to station transport.
+    pub bytes_sent: usize,
+    /// Packets received from station transport.
+    pub packets_received: usize,
+    /// Bytes received from station transport.
+    pub bytes_received: usize,
+    /// Commands decoded and enqueued at the target station.
+    pub commands_enqueued: usize,
+    /// Commands rejected by target station queues.
+    pub commands_rejected_queue: usize,
+}
+
+/// Result of pumping command dispatch packets for one target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommandDispatchPumpReport {
+    /// Target station pumped.
+    pub target_station: StationId,
+    /// Packets consumed from station transport.
+    pub packets_received: usize,
+    /// Bytes consumed from station transport.
+    pub bytes_received: usize,
+    /// Commands enqueued into the target queue.
+    pub commands_enqueued: usize,
+}
+
+/// Error produced while bridging command dispatch frames through station packet transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandDispatchTransportError<E> {
+    /// Underlying station transport failed.
+    Transport(E),
+    /// Wire encoding failed.
+    Encode(BinaryEncodeError),
+    /// Wire decoding failed.
+    Decode(BinaryDecodeError),
+    /// Packet decoded as a non-command-dispatch frame.
+    UnexpectedFrame,
+    /// Packet envelope and decoded dispatch frame disagreed about the target.
+    EndpointMismatch {
+        /// Packet source station.
+        packet_source: StationId,
+        /// Packet target station.
+        packet_target: StationId,
+        /// Decoded command dispatch target station.
+        dispatch_target: StationId,
+    },
+    /// Target station queue was not registered.
+    MissingQueue(StationId),
+    /// Target station queue rejected the command.
+    Queue(CommandQueueError),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for CommandDispatchTransportError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Encode(error) => write!(f, "{error}"),
+            Self::Decode(error) => write!(f, "{error}"),
+            Self::UnexpectedFrame => {
+                f.write_str("station transport packet was not a command dispatch frame")
+            }
+            Self::EndpointMismatch {
+                packet_source,
+                packet_target,
+                dispatch_target,
+            } => write!(
+                f,
+                "command dispatch endpoint mismatch: packet {}->{}, dispatch target {}",
+                packet_source.get(),
+                packet_target.get(),
+                dispatch_target.get()
+            ),
+            Self::MissingQueue(station_id) => {
+                write!(
+                    f,
+                    "command dispatch target station {} has no queue",
+                    station_id.get()
+                )
+            }
+            Self::Queue(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for CommandDispatchTransportError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Encode(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::UnexpectedFrame | Self::EndpointMismatch { .. } | Self::MissingQueue(_) => None,
+            Self::Queue(error) => Some(error),
+        }
+    }
+}
+
+impl<E> From<BinaryEncodeError> for CommandDispatchTransportError<E> {
+    fn from(value: BinaryEncodeError) -> Self {
+        Self::Encode(value)
+    }
+}
+
+impl<E> From<BinaryDecodeError> for CommandDispatchTransportError<E> {
+    fn from(value: BinaryDecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+impl<E> From<CommandQueueError> for CommandDispatchTransportError<E> {
+    fn from(value: CommandQueueError) -> Self {
+        Self::Queue(value)
+    }
+}
+
+/// Bridge between stamped command envelopes and bounded station packet transport.
+#[derive(Clone, Debug, Default)]
+pub struct CommandDispatchTransportBridge {
+    stats: CommandDispatchTransportStats,
+}
+
+impl CommandDispatchTransportBridge {
+    /// Returns bridge statistics.
+    pub const fn stats(&self) -> CommandDispatchTransportStats {
+        self.stats
+    }
+
+    /// Encodes and sends a stamped command envelope to a station node.
+    pub fn send_envelope<T>(
+        &mut self,
+        transport: &mut T,
+        source_station: StationId,
+        target_station: StationId,
+        command: &CommandEnvelope,
+    ) -> Result<(), CommandDispatchTransportError<T::Error>>
+    where
+        T: StationTransportSink,
+    {
+        let frame = CommandDispatchFrame::from_envelope(target_station, command);
+        self.send_frame(transport, source_station, &frame)
+    }
+
+    /// Encodes and sends a command dispatch frame to its target station.
+    pub fn send_frame<T>(
+        &mut self,
+        transport: &mut T,
+        source_station: StationId,
+        frame: &CommandDispatchFrame,
+    ) -> Result<(), CommandDispatchTransportError<T::Error>>
+    where
+        T: StationTransportSink,
+    {
+        let mut bytes = Vec::with_capacity(64);
+        BinaryFrameEncoder.encode_command_dispatch(frame, &mut bytes)?;
+        let byte_len = bytes.len();
+        transport
+            .send_station(StationOutboundPacket {
+                source_station,
+                target_station: frame.station_id,
+                bytes,
+            })
+            .map_err(CommandDispatchTransportError::Transport)?;
+        self.stats.commands_sent = self.stats.commands_sent.saturating_add(1);
+        self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(byte_len);
+        Ok(())
+    }
+
+    /// Receives up to `max_packets` for `target_station`, decodes command
+    /// dispatch frames, and enqueues stamped commands into `station_queues`.
+    pub fn pump_target<T>(
+        &mut self,
+        transport: &mut T,
+        station_queues: &mut BTreeMap<StationId, CommandQueues>,
+        target_station: StationId,
+        max_packets: usize,
+        ingress: CommandIngress,
+    ) -> Result<CommandDispatchPumpReport, CommandDispatchTransportError<T::Error>>
+    where
+        T: StationTransportReceiver,
+    {
+        let mut report = CommandDispatchPumpReport {
+            target_station,
+            ..CommandDispatchPumpReport::default()
+        };
+        for _ in 0..max_packets {
+            let Some(packet) = transport
+                .try_recv_station(target_station)
+                .map_err(CommandDispatchTransportError::Transport)?
+            else {
+                break;
+            };
+            report.packets_received = report.packets_received.saturating_add(1);
+            report.bytes_received = report.bytes_received.saturating_add(packet.bytes.len());
+
+            let decoded = BinaryFrameDecoder.decode(&packet.bytes)?;
+            let RuntimeFrame::CommandDispatch(frame) = decoded else {
+                return Err(CommandDispatchTransportError::UnexpectedFrame);
+            };
+            if frame.station_id != packet.target_station {
+                return Err(CommandDispatchTransportError::EndpointMismatch {
+                    packet_source: packet.source_station,
+                    packet_target: packet.target_station,
+                    dispatch_target: frame.station_id,
+                });
+            }
+
+            let queue = station_queues.get_mut(&frame.station_id).ok_or(
+                CommandDispatchTransportError::MissingQueue(frame.station_id),
+            )?;
+            match queue.push(frame.into_envelope(), ingress) {
+                Ok(_) => {
+                    report.commands_enqueued = report.commands_enqueued.saturating_add(1);
+                }
+                Err(error) => {
+                    self.stats.commands_rejected_queue =
+                        self.stats.commands_rejected_queue.saturating_add(1);
+                    return Err(CommandDispatchTransportError::Queue(error));
+                }
+            }
+        }
+
+        self.stats.packets_received = self
+            .stats
+            .packets_received
+            .saturating_add(report.packets_received);
+        self.stats.bytes_received = self
+            .stats
+            .bytes_received
+            .saturating_add(report.bytes_received);
+        self.stats.commands_enqueued = self
+            .stats
+            .commands_enqueued
+            .saturating_add(report.commands_enqueued);
+        Ok(report)
+    }
+}
+
 /// Basic in-process station scheduler.
 #[derive(Clone, Debug, Default)]
 pub struct StationScheduler {
@@ -1960,13 +2203,16 @@ impl BarrierController {
 mod tests {
     use super::*;
     use sectorsync_core::prelude::{
-        Bounds, CellCoord3, CellLoadSample, CommandPriority, CommandQueueLimits, EventId,
-        EventKind, EventPriority, GatewayConfig, GridSpec, HotspotThresholds, InstanceId, NodeId,
-        PolicyId, Position3, StationConfig, StationLoadSample,
+        Bounds, CellCoord3, CellLoadSample, CommandEnvelope, CommandPriority, CommandQueueLimits,
+        EventId, EventKind, EventPriority, GatewayConfig, GridSpec, HotspotThresholds, InstanceId,
+        NodeId, PolicyId, Position3, StationConfig, StationLoadSample,
     };
-    use sectorsync_transport::InMemoryStationTransport;
+    use sectorsync_transport::{
+        InMemoryStationTransport, StationOutboundPacket, StationTransportSink,
+    };
     use sectorsync_wire::{
-        BinaryFrameDecoder, BinaryFrameEncoder, CommandFrame, FrameDecoder, FrameEncoder,
+        BinaryFrameDecoder, BinaryFrameEncoder, CommandDispatchFrame, CommandFrame, FrameDecoder,
+        FrameEncoder,
     };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
@@ -2419,6 +2665,113 @@ mod tests {
         assert_eq!(bridge.stats().events_routed, 1);
         assert_eq!(transport.stats().packets_sent, 1);
         assert_eq!(transport.stats().packets_received, 1);
+    }
+
+    #[test]
+    fn command_dispatch_transport_bridge_enqueues_stamped_command() {
+        let gateway_station = StationId::new(0);
+        let target_station = StationId::new(2);
+        let command = CommandEnvelope {
+            id: CommandId::new(42),
+            client_id: ClientId::new(7),
+            entity_id: EntityId::new(100),
+            sequence: 42,
+            received_at: Tick::new(12),
+            kind: 1,
+            priority: CommandPriority::High,
+            payload: b"move:north".to_vec(),
+        };
+        let mut transport = InMemoryStationTransport::default();
+        transport.register_station(target_station);
+        let mut queues = BTreeMap::from([(target_station, command_queues())]);
+        let mut bridge = CommandDispatchTransportBridge::default();
+
+        bridge
+            .send_envelope(&mut transport, gateway_station, target_station, &command)
+            .expect("command dispatch should send");
+        assert_eq!(transport.queued_len(target_station), Some(1));
+        let report = bridge
+            .pump_target(
+                &mut transport,
+                &mut queues,
+                target_station,
+                4,
+                CommandIngress::RUNNING,
+            )
+            .expect("command dispatch should pump");
+
+        assert_eq!(report.packets_received, 1);
+        assert_eq!(report.commands_enqueued, 1);
+        let queued = queues
+            .get_mut(&target_station)
+            .expect("queue should exist")
+            .pop_next()
+            .expect("command should queue");
+        assert_eq!(queued, command);
+        assert_eq!(bridge.stats().commands_sent, 1);
+        assert_eq!(bridge.stats().commands_enqueued, 1);
+        assert_eq!(transport.stats().packets_sent, 1);
+        assert_eq!(transport.stats().packets_received, 1);
+    }
+
+    #[test]
+    fn command_dispatch_transport_bridge_rejects_endpoint_mismatch() {
+        let packet_target = StationId::new(2);
+        let frame_target = StationId::new(3);
+        let mut transport = InMemoryStationTransport::default();
+        transport.register_station(packet_target);
+        let frame = CommandDispatchFrame {
+            station_id: frame_target,
+            client_id: ClientId::new(7),
+            command_id: CommandId::new(42),
+            entity_id: EntityId::new(100),
+            sequence: 42,
+            received_at: Tick::new(12),
+            kind: 1,
+            priority: CommandPriority::High,
+            payload: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_command_dispatch(&frame, &mut bytes)
+            .expect("frame should encode");
+        transport
+            .send_station(StationOutboundPacket {
+                source_station: StationId::new(0),
+                target_station: packet_target,
+                bytes,
+            })
+            .expect("bad packet should enter transport");
+        let mut queues = BTreeMap::from([(packet_target, command_queues())]);
+        let mut bridge = CommandDispatchTransportBridge::default();
+
+        let error = bridge
+            .pump_target(
+                &mut transport,
+                &mut queues,
+                packet_target,
+                4,
+                CommandIngress::RUNNING,
+            )
+            .expect_err("endpoint mismatch should reject");
+
+        assert!(matches!(
+            error,
+            CommandDispatchTransportError::EndpointMismatch {
+                packet_source,
+                packet_target: observed_packet_target,
+                dispatch_target,
+            } if packet_source == StationId::new(0)
+                && observed_packet_target == packet_target
+                && dispatch_target == frame_target
+        ));
+        assert!(
+            queues
+                .get_mut(&packet_target)
+                .expect("queue should exist")
+                .pop_next()
+                .is_none()
+        );
     }
 
     #[test]

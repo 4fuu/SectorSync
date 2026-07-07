@@ -21,7 +21,8 @@
   queue routing, or command ACK generation.
 - Use `cargo run -p sectorsync-bench --example gateway_deployment_dispatch`
   when changing gateway-to-deployment delivery route resolution or gateway
-  command dispatch reports/frames for external node transports.
+  command dispatch reports/frames/transport bridges for external node
+  transports.
 - Use `cargo run -p sectorsync-bench --example deployment_routing` when changing
   deployment node/station route tables, node heartbeat/stale checks, draining
   behavior, route moves, or placement capacity rules.
@@ -126,6 +127,10 @@ The core library does not own:
   from a gateway process to a station node. They must preserve `received_at`
   and target station metadata without interpreting the command payload or
   replacing external service discovery and transport security.
+- Command dispatch transport bridges may encode stamped commands into station
+  packets, validate packet targets, and enqueue into bounded station command
+  queues. They must not add hidden blocking IO, unbounded buffering, retry
+  loops, service discovery, or game-rule validation.
 - Reliable client packet helpers may carry command, command ACK, replication, or
   integration-defined frames, but they must not interpret game semantics or
   replace external command validation.

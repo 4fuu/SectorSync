@@ -1,15 +1,18 @@
 //! Gateway-to-deployment command dispatch SDK example.
 
+use std::collections::BTreeMap;
+
 use sectorsync_core::prelude::{
-    ClientId, CommandId, CommandPriority, EntityId, GatewayConfig, GatewaySessionTable, NodeId,
-    StationId, Tick,
+    ClientId, CommandId, CommandIngress, CommandPriority, CommandQueueLimits, CommandQueues,
+    EntityId, GatewayConfig, GatewaySessionTable, NodeId, StationId, Tick,
 };
 use sectorsync_runtime::{
-    DeploymentConfig, DeploymentRouteTable, GATEWAY_COMMAND_ACK_ACCEPTED, GatewayCommandPipeline,
+    CommandDispatchTransportBridge, DeploymentConfig, DeploymentRouteTable,
+    GATEWAY_COMMAND_ACK_ACCEPTED, GatewayCommandPipeline,
 };
+use sectorsync_transport::{InMemoryStationTransport, StationTransportLimits};
 use sectorsync_wire::{
-    BinaryFrameDecoder, BinaryFrameEncoder, CommandDispatchFrame, CommandFrame, FrameDecoder,
-    FrameEncoder, RuntimeFrame,
+    BinaryFrameDecoder, BinaryFrameEncoder, CommandFrame, FrameDecoder, FrameEncoder, RuntimeFrame,
 };
 
 fn main() {
@@ -71,30 +74,56 @@ fn main() {
     let second_delivery = second.delivery.expect("delivery should resolve");
     assert_eq!(second_delivery.node_id, node_two);
     assert_eq!(second_delivery.station_route_epoch, 2);
-    let dispatch_frame = CommandDispatchFrame::from_envelope(
-        second_delivery.station_id,
-        second.command.as_ref().expect("command should exist"),
-    );
-    let mut dispatch_bytes = Vec::new();
-    BinaryFrameEncoder
-        .encode_command_dispatch(&dispatch_frame, &mut dispatch_bytes)
-        .expect("dispatch frame should encode");
-    let RuntimeFrame::CommandDispatch(decoded_dispatch) = BinaryFrameDecoder
-        .decode(&dispatch_bytes)
-        .expect("dispatch frame should decode")
-    else {
-        panic!("expected command dispatch frame");
-    };
-    assert_eq!(decoded_dispatch.station_id, station_id);
-    assert_eq!(decoded_dispatch.into_envelope().received_at, Tick::new(12));
+
+    let mut station_transport = InMemoryStationTransport::new(StationTransportLimits {
+        max_queued_packets_per_station: 8,
+        max_packet_bytes: 512,
+    });
+    station_transport.register_station(station_id);
+    let mut station_queues = BTreeMap::from([(
+        station_id,
+        CommandQueues::new(CommandQueueLimits {
+            high: 4,
+            normal: 4,
+            low: 4,
+        }),
+    )]);
+    let mut dispatch_bridge = CommandDispatchTransportBridge::default();
+    dispatch_bridge
+        .send_envelope(
+            &mut station_transport,
+            StationId::new(0),
+            second_delivery.station_id,
+            second.command.as_ref().expect("command should exist"),
+        )
+        .expect("dispatch command should enter station transport");
+    let pump = dispatch_bridge
+        .pump_target(
+            &mut station_transport,
+            &mut station_queues,
+            station_id,
+            4,
+            CommandIngress::RUNNING,
+        )
+        .expect("target station should pump command dispatch");
+    assert_eq!(pump.commands_enqueued, 1);
+    let applied = station_queues
+        .get_mut(&station_id)
+        .expect("target queue should exist")
+        .pop_next()
+        .expect("command should be queued at target station");
+    assert_eq!(applied.id, CommandId::new(2));
+    assert_eq!(applied.received_at, Tick::new(12));
 
     println!(
-        "gateway_deployment_dispatch routed={} first_node={} second_node={} station_route_epoch={} dispatch_bytes={} acked={}",
+        "gateway_deployment_dispatch routed={} first_node={} second_node={} station_route_epoch={} dispatch_packets={} dispatch_bytes={} applied_command={} acked={}",
         pipeline.stats().commands_routed_deployment,
         node_one.get(),
         second_delivery.node_id.get(),
         second_delivery.station_route_epoch,
-        dispatch_bytes.len(),
+        pump.packets_received,
+        dispatch_bridge.stats().bytes_sent,
+        applied.id.get(),
         pipeline.stats().acks_encoded
     );
 }
