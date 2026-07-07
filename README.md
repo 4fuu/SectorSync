@@ -113,6 +113,7 @@ cargo run -p sectorsync-bench --example adaptive_cadence
 cargo run -p sectorsync-bench --example priority_budget
 cargo run -p sectorsync-bench --example replication_tracker
 cargo run -p sectorsync-bench --example replication_bridge
+cargo run -p sectorsync-bench --example replication_bridge_priority
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example barrier_transport
 cargo run -p sectorsync-bench --example barrier_upgrade
@@ -259,7 +260,9 @@ Initial status:
   all required recipients have received an update.
 - Runtime replication transport bridge plans AOI for a viewer, builds a concrete
   replication frame from component storage, skips empty frames by default,
-  encodes the frame, and submits it to bounded client packet transport.
+  encodes the frame, and submits it to bounded client packet transport. It also
+  supports caller-provided plans plus cadence-aware and priority-aware planning
+  variants without owning per-client state.
 - Runtime replication receive bridge consumes bounded client packet transport,
   validates optional source client metadata and target client id, decodes
   replication frames, and reports received entity/component counts.
@@ -352,6 +355,9 @@ Initial status:
   low-level downlink path: viewer AOI planning, replication frame building,
   bounded in-memory client transport send, receive, source/target validation,
   and decode.
+- `cargo run -p sectorsync-bench --example replication_bridge_priority`
+  demonstrates priority-aware runtime replication transport under a tight
+  per-viewer budget.
 - `cargo run -p sectorsync-bench --example client_bridge` demonstrates a
   low-level client/gateway SDK path: command frame send, gateway transport
   pump, ACK return, replication downlink, and client-bound frame pumping through

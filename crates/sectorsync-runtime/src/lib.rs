@@ -12,9 +12,9 @@ use sectorsync_core::prelude::{
     EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues, GatewayError,
     GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner, HotspotSeverity,
     HotspotThresholds, NodeId, OwnerEpoch, PolicyTable, PushOutcome, ReplicationBudget,
-    ReplicationPlanner, RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion, SplitProposal,
-    Station, StationError, StationEvent, StationId, StationLoadSample, StationSnapshot, Tick,
-    ViewerQuery, VisibilityFilter,
+    ReplicationPlan, ReplicationPlanner, RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion,
+    SplitProposal, Station, StationError, StationEvent, StationId, StationLoadSample,
+    StationSnapshot, Tick, ViewerQuery, VisibilityFilter,
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
@@ -64,6 +64,10 @@ pub struct ReplicationTransportStats {
     pub bytes_sent: usize,
     /// Entities selected by AOI planning.
     pub entities_selected: usize,
+    /// Entities skipped by replication planner budget.
+    pub entities_skipped_by_budget: usize,
+    /// Entities skipped by replication planner cadence.
+    pub entities_skipped_by_cadence: usize,
     /// Entity deltas encoded into replication frames.
     pub entities_encoded: usize,
     /// Component deltas encoded into replication frames.
@@ -83,6 +87,10 @@ pub struct ReplicationTransportReport {
     pub encoded_components: usize,
     /// Estimated bytes from the replication planner.
     pub estimated_plan_bytes: usize,
+    /// Candidate entities skipped because the planner budget was exhausted.
+    pub skipped_by_budget: usize,
+    /// Candidate entities skipped because cadence had not elapsed.
+    pub skipped_by_cadence: usize,
     /// Encoded wire bytes submitted to transport.
     pub bytes_sent: usize,
     /// Whether a frame was sent.
@@ -145,6 +153,8 @@ impl ReplicationTransportBridge {
                 frames_sent: 0,
                 bytes_sent: 0,
                 entities_selected: 0,
+                entities_skipped_by_budget: 0,
+                entities_skipped_by_cadence: 0,
                 entities_encoded: 0,
                 components_encoded: 0,
             },
@@ -190,20 +200,159 @@ impl ReplicationTransportBridge {
             filter,
             self.config.budget,
         );
+        self.send_plan(
+            transport,
+            viewer.client_id,
+            station.tick(),
+            station,
+            components,
+            selection,
+            &plan,
+        )
+    }
+
+    /// Plans with cadence, builds, encodes, and sends one viewer replication frame.
+    pub fn send_viewer_with_cadence<T, F, L>(
+        &mut self,
+        transport: &mut T,
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        viewer: &ViewerQuery,
+        filter: &F,
+        last_sent: L,
+    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
+    where
+        T: TransportSink,
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
+        let plan = ReplicationPlanner::plan_for_viewer_with_cadence(
+            station,
+            index,
+            policies,
+            viewer,
+            filter,
+            self.config.budget,
+            last_sent,
+        );
+        self.send_plan(
+            transport,
+            viewer.client_id,
+            station.tick(),
+            station,
+            components,
+            selection,
+            &plan,
+        )
+    }
+
+    /// Plans by priority, builds, encodes, and sends one viewer replication frame.
+    pub fn send_viewer_prioritized<T, F>(
+        &mut self,
+        transport: &mut T,
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        viewer: &ViewerQuery,
+        filter: &F,
+    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
+    where
+        T: TransportSink,
+        F: VisibilityFilter,
+    {
+        let plan = ReplicationPlanner::plan_for_viewer_prioritized(
+            station,
+            index,
+            policies,
+            viewer,
+            filter,
+            self.config.budget,
+        );
+        self.send_plan(
+            transport,
+            viewer.client_id,
+            station.tick(),
+            station,
+            components,
+            selection,
+            &plan,
+        )
+    }
+
+    /// Plans by priority and cadence, builds, encodes, and sends one viewer replication frame.
+    pub fn send_viewer_prioritized_with_cadence<T, F, L>(
+        &mut self,
+        transport: &mut T,
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        viewer: &ViewerQuery,
+        filter: &F,
+        last_sent: L,
+    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
+    where
+        T: TransportSink,
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
+        let plan = ReplicationPlanner::plan_for_viewer_prioritized_with_cadence(
+            station,
+            index,
+            policies,
+            viewer,
+            filter,
+            self.config.budget,
+            last_sent,
+        );
+        self.send_plan(
+            transport,
+            viewer.client_id,
+            station.tick(),
+            station,
+            components,
+            selection,
+            &plan,
+        )
+    }
+
+    /// Builds, encodes, and sends a caller-provided replication plan.
+    pub fn send_plan<T>(
+        &mut self,
+        transport: &mut T,
+        client_id: ClientId,
+        server_tick: Tick,
+        station: &Station,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        plan: &ReplicationPlan,
+    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
+    where
+        T: TransportSink,
+    {
         self.stats.viewers_planned = self.stats.viewers_planned.saturating_add(1);
         self.stats.entities_selected = self
             .stats
             .entities_selected
             .saturating_add(plan.stats.selected);
+        self.stats.entities_skipped_by_budget = self
+            .stats
+            .entities_skipped_by_budget
+            .saturating_add(plan.stats.skipped_by_budget);
+        self.stats.entities_skipped_by_cadence = self
+            .stats
+            .entities_skipped_by_cadence
+            .saturating_add(plan.stats.skipped_by_cadence);
 
-        let build = self.builder.build(
-            viewer.client_id,
-            station.tick(),
-            station,
-            &plan,
-            components,
-            selection,
-        );
+        let build =
+            self.builder
+                .build(client_id, server_tick, station, plan, components, selection);
         let build_stats = build.stats;
         self.stats.entities_encoded = self
             .stats
@@ -216,32 +365,21 @@ impl ReplicationTransportBridge {
 
         if build.frame.entities.is_empty() && !self.config.send_empty_frames {
             self.stats.frames_skipped_empty = self.stats.frames_skipped_empty.saturating_add(1);
-            return Ok(replication_report(
-                viewer.client_id,
-                plan.stats.selected,
-                plan.stats.estimated_bytes,
-                build_stats,
-                0,
-                false,
-            ));
+            return Ok(replication_report(client_id, plan, build_stats, 0, false));
         }
 
         let mut bytes = Vec::new();
         BinaryFrameEncoder.encode_replication(&build.frame, &mut bytes)?;
         let byte_len = bytes.len();
         transport
-            .send(OutboundPacket {
-                client_id: viewer.client_id,
-                bytes,
-            })
+            .send(OutboundPacket { client_id, bytes })
             .map_err(ReplicationTransportError::Transport)?;
         self.stats.frames_sent = self.stats.frames_sent.saturating_add(1);
         self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(byte_len);
 
         Ok(replication_report(
-            viewer.client_id,
-            plan.stats.selected,
-            plan.stats.estimated_bytes,
+            client_id,
+            plan,
             build_stats,
             byte_len,
             true,
@@ -258,20 +396,21 @@ impl Default for ReplicationTransportBridge {
     }
 }
 
-const fn replication_report(
+fn replication_report(
     client_id: ClientId,
-    selected_entities: usize,
-    estimated_plan_bytes: usize,
+    plan: &ReplicationPlan,
     build_stats: ReplicationFrameBuildStats,
     bytes_sent: usize,
     sent: bool,
 ) -> ReplicationTransportReport {
     ReplicationTransportReport {
         client_id,
-        selected_entities,
+        selected_entities: plan.stats.selected,
         encoded_entities: build_stats.encoded_entities,
         encoded_components: build_stats.encoded_components,
-        estimated_plan_bytes,
+        estimated_plan_bytes: plan.stats.estimated_bytes,
+        skipped_by_budget: plan.stats.skipped_by_budget,
+        skipped_by_cadence: plan.stats.skipped_by_cadence,
         bytes_sent,
         sent,
     }
@@ -4152,6 +4291,117 @@ mod tests {
         assert_eq!(transport.packets_sent(), 0);
         assert_eq!(bridge.stats().frames_skipped_empty, 1);
         assert_eq!(bridge.stats().entities_selected, 1);
+    }
+
+    #[test]
+    fn replication_transport_bridge_prioritized_reports_budget_skips() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let mut station = station(1, 10);
+        let mut index = CellIndex::new(GridSpec::new(64.0).expect("grid is valid"));
+        let mut policies = PolicyTable::default();
+        let mut low = CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 256.0);
+        low.priority_weight = 1;
+        let mut high = CompiledSyncPolicy::new(PolicyId::new(2), 1, 20, 256.0);
+        high.priority_weight = 10;
+        policies.set(low);
+        policies.set(high);
+
+        let low_handle = station
+            .spawn_owned(
+                EntityId::new(100),
+                Position3::new(0.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn low should work");
+        let high_handle = station
+            .spawn_owned(
+                EntityId::new(200),
+                Position3::new(128.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(2),
+            )
+            .expect("spawn high should work");
+        index.upsert(low_handle, Position3::new(0.0, 0.0, 0.0), Bounds::Point);
+        index.upsert(high_handle, Position3::new(128.0, 0.0, 0.0), Bounds::Point);
+
+        let descriptor = ComponentDescriptor::sparse_blob(
+            ComponentId::new(1),
+            "health",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let mut components = ComponentStore::default();
+        components
+            .set_typed(&descriptor, low_handle, 1, &U32LeCodec, &100)
+            .expect("low component should write");
+        components
+            .set_typed(&descriptor, high_handle, 1, &U32LeCodec, &200)
+            .expect("high component should write");
+        let selection = ComponentSelection {
+            component_ids: vec![ComponentId::new(1)],
+        };
+        let viewer = ViewerQuery {
+            client_id,
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: 256.0,
+            max_entities: 1,
+        };
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 4,
+            max_packet_bytes: 512,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, "127.0.0.1:23107".parse().expect("client addr"))
+            .expect("client endpoint should register");
+        let mut server_transport = hub
+            .endpoint(server_id, "127.0.0.1:23100".parse().expect("server addr"))
+            .expect("server endpoint should register");
+        let mut bridge = ReplicationTransportBridge::new(
+            ReplicationTransportConfig {
+                budget: ReplicationBudget {
+                    max_entities: 1,
+                    max_bytes: 32,
+                    estimated_entity_bytes: 32,
+                },
+                send_empty_frames: false,
+            },
+            ReplicationFrameBuilder::default(),
+        );
+
+        let report = bridge
+            .send_viewer_prioritized(
+                &mut server_transport,
+                &station,
+                &index,
+                &policies,
+                &components,
+                &selection,
+                &viewer,
+                &RangeOnlyVisibility,
+            )
+            .expect("prioritized replication should send");
+
+        assert!(report.sent);
+        assert_eq!(report.selected_entities, 1);
+        assert_eq!(report.skipped_by_budget, 1);
+        assert_eq!(bridge.stats().entities_skipped_by_budget, 1);
+
+        let packet = client_transport
+            .try_recv()
+            .expect("receive should work")
+            .expect("packet should exist");
+        let frame = match BinaryFrameDecoder
+            .decode(&packet.bytes)
+            .expect("frame decodes")
+        {
+            RuntimeFrame::Replication(frame) => frame,
+            _ => panic!("expected replication frame"),
+        };
+        assert_eq!(frame.entities.len(), 1);
+        assert_eq!(frame.entities[0].entity_id, EntityId::new(200));
     }
 
     #[test]

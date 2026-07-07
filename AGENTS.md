@@ -18,6 +18,9 @@
 - Use `cargo run -p sectorsync-bench --example replication_bridge` when changing
   runtime replication transport send/receive bridges, AOI-to-frame downlink
   flow, or client replication transport integration.
+- Use `cargo run -p sectorsync-bench --example replication_bridge_priority`
+  when changing runtime bridge entry points for caller-provided, cadence-aware,
+  or priority-aware replication plans.
 - Use `cargo run -p sectorsync-bench --example client_bridge` when changing
   low-level client command send, gateway client command transport, ACK,
   replication, or barrier receive pumping, or client-bound frame validation.
@@ -261,6 +264,10 @@ The core library does not own:
   validate source/target metadata, and decode replication frames. They must not
   add hidden persistence, blocking client IO, unbounded per-client buffers,
   client state storage, or game payload interpretation.
+- Replication transport bridge convenience methods may expose simple,
+  cadence-aware, priority-aware, or caller-provided plan paths. They must keep
+  all plan state explicit and must not hide per-client cadence maps, priority
+  business rules, or ACK tracking inside the transport bridge.
 - Client transport bridges may encode command frames to a configured
   server/gateway target and pump client-bound ACK, replication, and barrier
   frames. They must not own reconnect loops, production authentication,
