@@ -57,6 +57,8 @@ The core library does not own:
   command buffers on hot paths.
 - Custom component work should keep SectorSync as a low-level SDK. Do not turn
   it into a mandatory ECS framework; expose descriptors, storage, and hooks.
+- Component codecs should stay dependency-light by default. Prefer traits and
+  explicit binary codecs over adding a mandatory serialization framework.
 - Station-local APIs may be low-level and high-performance, but they must not
   bypass owner, dirty, replication-budget, barrier, or event-ordering invariants.
 - Station internals should favor single-owner, lock-minimal execution.
@@ -65,6 +67,8 @@ The core library does not own:
   needed. Do not introduce distributed transactions in the core.
 - Wire and transport abstractions must stay at frame/packet/batch boundaries.
   Avoid per-entity transport abstraction on hot paths.
+- Replication frame changes must preserve entity/component delta payload support
+  and maintain binary encode/decode roundtrip tests.
 - Runtime-configurable sync policies must compile into compact hot-path data.
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.

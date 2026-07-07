@@ -56,11 +56,13 @@ Current crates:
 
 - `crates/sectorsync-core`: IDs, command envelopes, 3D spatial primitives,
   station-local entity storage, ghost/owner roles, dirty masks, compiled sync
-  policies, custom component registry/storage, cell indexing, interest queries,
-  replication planning, bounded command/event queues, handoff transfer types,
-  hotspot planning, barrier metadata, and snapshot metadata.
+  policies, custom component registry/storage, typed component codecs, schema
+  helpers, cell indexing, interest queries, replication planning, bounded
+  command/event queues, handoff transfer types, hotspot planning, barrier
+  metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
-  replication frames, command acknowledgements, and barrier notifications.
+  replication frames with entity/component delta payloads, command
+  acknowledgements, and barrier notifications.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
   byte-budget transport wrapper, and fake transport for tests/benchmarks.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
@@ -134,8 +136,10 @@ Initial status:
   buffer/reject/drain behavior.
 - Custom component registry and sparse blob storage allow external systems to
   register game-owned data without forcing a full ECS framework.
+- Typed component codecs and schema helpers support compact user-defined
+  component encoding without forcing a serialization framework.
 - Wire codec supports binary encode/decode for replication, command ACK, and
-  barrier frames.
+  barrier frames. Replication frames can carry concrete entity/component deltas.
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
 - Runtime event router queues cross-station events by target station and drains
   events once their target tick is ready.
@@ -143,14 +147,15 @@ Initial status:
   cells for external schedulers to move.
 - Smoke benchmark runs through planning, frame encoding, fake transport, and
   hotspot report fields. It also reports command enqueue/apply counts,
-  command latency in ticks, max queue depth, tick timing estimates, threshold
-  checks, and an aggregate `benchmark_ok` verdict.
+  command latency in ticks, max queue depth, payload entity/component delta
+  counts, tick timing estimates, threshold checks, and an aggregate
+  `benchmark_ok` verdict.
 
 Not complete yet:
 
 - Automatic station ownership split execution and migration scheduling.
 - Multi-station scheduler and bounded cross-station transport integration beyond
   core queue primitives.
-- Typed component codecs and generated schema helpers.
+- Generated schema helpers.
 - Real transport adapters.
 - Large-scale benchmark validation against the stated hard metrics.
