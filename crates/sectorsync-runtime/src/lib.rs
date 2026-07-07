@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod deployment;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sectorsync_core::prelude::{
@@ -15,6 +17,11 @@ use sectorsync_transport::{StationOutboundPacket, StationTransportReceiver, Stat
 use sectorsync_wire::{
     BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder, FrameDecoder,
     FrameEncoder, RuntimeFrame, StationEventFrame,
+};
+
+pub use deployment::{
+    DeploymentConfig, DeploymentError, DeploymentNodeRoute, DeploymentNodeState,
+    DeploymentRouteTable, DeploymentStationMove, DeploymentStationRoute, DeploymentStats,
 };
 
 /// Small in-process station collection for simulations and embedders.
