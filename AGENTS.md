@@ -13,6 +13,9 @@
 - Default Rust verification should start with `cargo test --workspace`.
 - Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
   benchmark smoke test.
+- Use `cargo run -p sectorsync-bench --example gateway_session` when changing
+  gateway session/routing primitives, reconnect grace behavior, route epochs,
+  replay checks, or per-client admission limits.
 - Use `cargo run -p sectorsync-bench --example udp_loopback` when changing the
   UDP transport adapter or wire/transport integration.
 - Use `cargo run -p sectorsync-bench --example command_ingress` when changing
@@ -76,6 +79,11 @@ The core library does not own:
   boundary, freeze, snapshot or migrate, resume.
 - Command queues must remain bounded and barrier-aware. Do not add unbounded
   command buffers on hot paths.
+- Gateway/session primitives must remain low-level and bounded: session tables,
+  route epochs, reconnect generations, replay/stale sequence checks, expiry,
+  and per-client command admission limits are allowed; sockets, auth providers,
+  NAT traversal, deployment discovery, durable account state, and production
+  process orchestration stay outside core.
 - Command wire frames and command envelopes are business-agnostic containers.
   SectorSync may encode, decode, queue, stamp `received_at`, and acknowledge
   them, but schema validation, anti-cheat, and game-rule translation belong in

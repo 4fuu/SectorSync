@@ -62,7 +62,8 @@ Current crates:
   policies, custom component registry/storage, typed component codecs, schema
   helpers, generated-schema-friendly layout descriptors, cell indexing,
   interest queries, replication planning, bounded command/event queues, handoff
-  transfer types, hotspot planning, barrier metadata, and snapshot metadata.
+  transfer types, hotspot planning, gateway session/routing primitives, barrier
+  metadata, and snapshot metadata.
 - `crates/sectorsync-wire`: frame shapes plus default binary encode/decode for
   replication frames with entity/component delta payloads, client command
   ingress frames, command acknowledgements, cross-station event frames, and
@@ -94,6 +95,7 @@ cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
+cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
 cargo run -p sectorsync-bench --example reliable_command_ingress
@@ -158,6 +160,10 @@ Initial status:
   stations while leaving the old station with a short-lived ghost.
 - Bounded command queues support priority ordering and barrier-aware
   buffer/reject/drain behavior.
+- Gateway session table primitives support bounded client sessions, station
+  routes, route epochs, reconnect generations, reconnect grace windows,
+  disconnected-session expiry, replay/stale sequence rejection, and per-client
+  per-tick command admission limits.
 - Wire codec supports client command ingress frames that convert into
   `CommandEnvelope` after the server stamps `received_at`, plus command ACK
   frames for the return path. Command payloads remain opaque to SectorSync.
@@ -220,6 +226,10 @@ Initial status:
 - `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
   scheduler cooldown and target-capacity guard behavior without running a heavy
   benchmark profile.
+- `cargo run -p sectorsync-bench --example gateway_session` demonstrates a
+  low-level gateway session table connecting a client, routing commands into
+  station command queues, rerouting to another station, rate-limiting a command,
+  and reconnecting inside a grace window.
 - `cargo run -p sectorsync-bench --example udp_loopback` demonstrates a
   replication frame encoded by `sectorsync-wire`, sent through the UDP transport
   adapter over localhost, received, and decoded back into a runtime frame.
@@ -249,9 +259,9 @@ Not complete yet:
 
 - Long-running split scheduler calibration against production telemetry and
   heavier workload profiles.
-- Authentication/encryption, reconnects, deployment-level routing, production
-  cluster integration, and long-running reliability calibration beyond the
-  low-level reliable client/station packet helpers and in-memory/UDP packet
-  adapters.
-- Production gateway/session orchestration for client connectivity.
+- Authentication/encryption, NAT traversal, deployment-level routing,
+  production cluster integration, and long-running reliability calibration
+  beyond the low-level gateway/session, reliable client/station packet helpers,
+  and in-memory/UDP packet adapters.
+- Production gateway process orchestration for client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.
