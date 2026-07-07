@@ -1,24 +1,32 @@
 //! Lightweight benchmark entry point.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Instant;
 
 use sectorsync_core::prelude::{
     Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
     CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
-    GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, OwnerEpoch,
-    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
-    Station, StationConfig, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
+    GatewayConfig, GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity,
+    HotspotThresholds, InstanceId, NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3,
+    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig, StationId,
+    StationLoadSample, Tick, Vec3, ViewerQuery,
 };
-use sectorsync_transport::{FakeTransport, OutboundPacket, TransportSink};
+use sectorsync_runtime::{
+    CommandDispatchTransportBridge, DeploymentConfig, DeploymentRouteTable, GatewayCommandPipeline,
+};
+use sectorsync_transport::{
+    FakeTransport, InMemoryStationTransport, OutboundPacket, StationTransportLimits, TransportSink,
+};
 use sectorsync_wire::{
-    BinaryFrameEncoder, ComponentDelta, EntityDelta, FrameEncoder, ReplicationFrame,
+    BinaryFrameEncoder, CommandFrame, ComponentDelta, EntityDelta, FrameEncoder, ReplicationFrame,
 };
 
 const DEFAULT_GUARD_MAX_ENTITIES: usize = 4_000;
 const DEFAULT_GUARD_MAX_CLIENTS: usize = 150;
 const DEFAULT_GUARD_MAX_STATIONS: usize = 8;
 const DEFAULT_GUARD_MAX_TICKS: usize = 5;
+const DISPATCH_BENCH_MAX_COMMANDS_PER_TICK: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Baseline {
@@ -92,6 +100,12 @@ struct BenchStats {
     payload_component_deltas: usize,
     commands_enqueued: usize,
     commands_applied: usize,
+    gateway_commands_dispatched: usize,
+    command_dispatch_packets: usize,
+    command_dispatch_bytes: usize,
+    command_dispatch_enqueued: usize,
+    command_dispatch_applied: usize,
+    command_dispatch_latency_ticks_max: u64,
     command_latency_ticks_total: u64,
     command_latency_ticks_max: u64,
     command_queue_max: usize,
@@ -138,6 +152,27 @@ fn main() {
     );
     println!("commands_enqueued={}", stats.commands_enqueued);
     println!("commands_applied={}", stats.commands_applied);
+    println!(
+        "gateway_commands_dispatched={}",
+        stats.gateway_commands_dispatched
+    );
+    println!(
+        "command_dispatch_packets={}",
+        stats.command_dispatch_packets
+    );
+    println!("command_dispatch_bytes={}", stats.command_dispatch_bytes);
+    println!(
+        "command_dispatch_enqueued={}",
+        stats.command_dispatch_enqueued
+    );
+    println!(
+        "command_dispatch_applied={}",
+        stats.command_dispatch_applied
+    );
+    println!(
+        "command_dispatch_latency_ticks_max={}",
+        stats.command_dispatch_latency_ticks_max
+    );
     println!(
         "command_latency_ticks_avg={:.3}",
         stats.command_latency_ticks_avg()
@@ -349,6 +384,7 @@ fn run(config: BenchConfig) -> BenchStats {
     let mut encoder = BinaryFrameEncoder;
     let mut transport = FakeTransport::default();
     let mut command_queues = create_command_queues(config.stations);
+    let mut dispatch = DispatchBench::new(config);
     let mut next_command_id = 1_u64;
 
     for tick_index in 0..config.ticks {
@@ -362,6 +398,14 @@ fn run(config: BenchConfig) -> BenchStats {
             tick_index,
             &clients,
             &mut command_queues,
+            &mut next_command_id,
+            &mut stats,
+        );
+        dispatch_gateway_commands(
+            config,
+            tick_index,
+            &clients,
+            &mut dispatch,
             &mut next_command_id,
             &mut stats,
         );
@@ -497,6 +541,167 @@ fn create_command_queues(count: usize) -> Vec<CommandQueues> {
             })
         })
         .collect()
+}
+
+struct DispatchBench {
+    gateway: GatewaySessionTable,
+    deployment: DeploymentRouteTable,
+    station_transport: InMemoryStationTransport,
+    station_queues: BTreeMap<StationId, CommandQueues>,
+    pipeline: GatewayCommandPipeline,
+    bridge: CommandDispatchTransportBridge,
+}
+
+impl DispatchBench {
+    fn new(config: BenchConfig) -> Self {
+        let mut gateway = GatewaySessionTable::new(GatewayConfig {
+            max_sessions: config.clients.max(1),
+            reconnect_grace_ticks: 20,
+            max_commands_per_tick: DISPATCH_BENCH_MAX_COMMANDS_PER_TICK,
+        });
+        let mut deployment = DeploymentRouteTable::new(DeploymentConfig {
+            max_nodes: config.stations.max(1),
+            max_stations_per_node: config.stations.max(1),
+            stale_after_ticks: 20,
+        });
+        let mut station_transport = InMemoryStationTransport::new(StationTransportLimits {
+            max_queued_packets_per_station: DISPATCH_BENCH_MAX_COMMANDS_PER_TICK * 2,
+            max_packet_bytes: 512,
+        });
+        let mut station_queues = BTreeMap::new();
+
+        for station_index in 0..config.stations {
+            let station_id = StationId::new(station_index as u32);
+            let node_id = NodeId::new(station_index as u32);
+            deployment
+                .register_node(node_id, 1, Tick::new(0))
+                .expect("benchmark deployment node should register");
+            deployment
+                .assign_station(station_id, node_id, Tick::new(0))
+                .expect("benchmark station should assign");
+            station_transport.register_station(station_id);
+            station_queues.insert(
+                station_id,
+                CommandQueues::new(CommandQueueLimits {
+                    high: 256,
+                    normal: 1024,
+                    low: 256,
+                }),
+            );
+        }
+
+        for client_index in 0..config.clients {
+            let station_id = StationId::new((client_index % config.stations.max(1)) as u32);
+            gateway
+                .connect(ClientId::new(client_index as u64), station_id, Tick::new(0))
+                .expect("benchmark client should connect");
+        }
+
+        Self {
+            gateway,
+            deployment,
+            station_transport,
+            station_queues,
+            pipeline: GatewayCommandPipeline::default(),
+            bridge: CommandDispatchTransportBridge::default(),
+        }
+    }
+}
+
+fn dispatch_gateway_commands(
+    config: BenchConfig,
+    tick_index: usize,
+    clients: &[Position3],
+    dispatch: &mut DispatchBench,
+    next_command_id: &mut u64,
+    stats: &mut BenchStats,
+) {
+    if clients.is_empty() {
+        return;
+    }
+
+    let command_count = clients.len().min(DISPATCH_BENCH_MAX_COMMANDS_PER_TICK);
+    let stride = clients.len().div_ceil(command_count).max(1);
+    let tick = Tick::new(tick_index as u64);
+    let mut encoder = BinaryFrameEncoder;
+
+    for client_index in (0..clients.len()).step_by(stride).take(command_count) {
+        let command_id = *next_command_id;
+        *next_command_id = next_command_id.saturating_add(1);
+        let frame = CommandFrame {
+            client_id: ClientId::new(client_index as u64),
+            command_id: CommandId::new(command_id),
+            entity_id: EntityId::new((client_index % config.entities.max(1)) as u64),
+            sequence: command_id,
+            kind: 1,
+            priority: if client_index % 16 == 0 {
+                CommandPriority::High
+            } else {
+                CommandPriority::Normal
+            },
+            payload: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        encoder
+            .encode_command(&frame, &mut bytes)
+            .expect("benchmark command should encode");
+        let report =
+            dispatch
+                .pipeline
+                .dispatch(&mut dispatch.gateway, &dispatch.deployment, &bytes, tick);
+        if !report.accepted {
+            continue;
+        }
+        let delivery = report
+            .delivery
+            .expect("accepted dispatch should include delivery route");
+        let command = report
+            .command
+            .expect("accepted dispatch should include stamped command");
+        dispatch
+            .bridge
+            .send_envelope(
+                &mut dispatch.station_transport,
+                StationId::new(0),
+                delivery.station_id,
+                &command,
+            )
+            .expect("benchmark command dispatch should send");
+        stats.gateway_commands_dispatched = stats.gateway_commands_dispatched.saturating_add(1);
+    }
+
+    for station_index in 0..config.stations {
+        let station_id = StationId::new(station_index as u32);
+        let pump = dispatch
+            .bridge
+            .pump_target(
+                &mut dispatch.station_transport,
+                &mut dispatch.station_queues,
+                station_id,
+                DISPATCH_BENCH_MAX_COMMANDS_PER_TICK,
+                CommandIngress::RUNNING,
+            )
+            .expect("benchmark command dispatch should pump");
+        stats.command_dispatch_packets = stats
+            .command_dispatch_packets
+            .saturating_add(pump.packets_received);
+        stats.command_dispatch_bytes = stats
+            .command_dispatch_bytes
+            .saturating_add(pump.bytes_received);
+        stats.command_dispatch_enqueued = stats
+            .command_dispatch_enqueued
+            .saturating_add(pump.commands_enqueued);
+    }
+
+    for queue in dispatch.station_queues.values_mut() {
+        stats.command_queue_max = stats.command_queue_max.max(queue.total_len());
+        while let Some(command) = queue.pop_next() {
+            let latency = tick.get().saturating_sub(command.received_at.get());
+            stats.command_dispatch_latency_ticks_max =
+                stats.command_dispatch_latency_ticks_max.max(latency);
+            stats.command_dispatch_applied = stats.command_dispatch_applied.saturating_add(1);
+        }
+    }
 }
 
 fn enqueue_commands(

@@ -12,7 +12,8 @@
   profile and gate larger profiles behind explicit arguments.
 - Default Rust verification should start with `cargo test --workspace`.
 - Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
-  benchmark smoke test.
+  benchmark smoke test, including the lightweight gateway/deployment command
+  dispatch transport workload.
 - Use `cargo run -p sectorsync-bench --example gateway_session` when changing
   gateway session/routing primitives, reconnect grace behavior, route epochs,
   replay checks, or per-client admission limits.
