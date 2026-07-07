@@ -70,12 +70,12 @@ Current crates:
   materializes dirty component deltas from a core replication plan.
 - `crates/sectorsync-transport`: transport sink trait, batch packet API,
   byte-budget transport wrapper, fake transport for tests/benchmarks, bounded
-  in-memory station-to-station packet transport, a non-blocking
-  `std::net::UdpSocket` client packet adapter, and a non-blocking UDP
-  station-to-station packet adapter with explicit station address registration.
-  It also provides low-level reliable station packet helpers with bounded
-  in-flight windows, ACKs, retries, timeout accounting, and duplicate
-  suppression history.
+  in-memory client packet hubs, bounded in-memory station-to-station packet
+  transport, a non-blocking `std::net::UdpSocket` client packet adapter, and a
+  non-blocking UDP station-to-station packet adapter with explicit station
+  address registration. It also provides low-level reliable client and station
+  packet helpers with bounded in-flight windows, ACKs, retries, timeout
+  accounting, and duplicate suppression history.
 - `crates/sectorsync-runtime`: in-process station collection helpers, a full
   runtime barrier controller for tick-boundary freeze/snapshot/resume flows, and
   an in-process entity migration executor built on two-phase handoff. It also
@@ -96,6 +96,7 @@ cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
 cargo run -p sectorsync-bench --example udp_loopback
 cargo run -p sectorsync-bench --example command_ingress
+cargo run -p sectorsync-bench --example reliable_command_ingress
 cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --example udp_station_event
 cargo run -p sectorsync-bench --example reliable_station_event
@@ -172,6 +173,9 @@ Initial status:
 - Replication frame builder converts `ReplicationPlan` + `ComponentStore` into
   concrete wire payloads with bounded entity/component materialization.
 - Transport SDK supports packet batches and byte-budget enforcement wrappers.
+- Bounded in-memory client transport hubs support explicit local endpoints,
+  per-client queue capacity, packet byte limits, source-client stamping, and
+  delivery statistics for deterministic SDK tests or adapter prototypes.
 - Bounded station-to-station packet transport supports explicit target station
   registration, per-station queue capacity, packet byte limits, and delivery
   statistics for in-process simulations or adapter prototypes.
@@ -186,6 +190,10 @@ Initial status:
 - Runtime station event transport bridge encodes typed station events into wire
   frames, moves them through bounded station packet transport, validates packet
   endpoints, and routes decoded events into the target station router.
+- Reliable client packet helpers wrap arbitrary client/server packet payloads
+  with a bounded ACK/retry envelope, per-peer in-flight limits, payload budgets,
+  timeout counters, required source-client identity, and bounded duplicate
+  suppression history.
 - Reliable station packet helpers wrap arbitrary station packet payloads with a
   bounded ACK/retry envelope, per-target in-flight limits, payload budgets,
   timeout counters, and bounded duplicate suppression history.
@@ -218,6 +226,11 @@ Initial status:
 - `cargo run -p sectorsync-bench --example command_ingress` demonstrates a
   client command frame sent over UDP, decoded by the server, converted into a
   bounded command queue entry, applied, and acknowledged back to the client.
+- `cargo run -p sectorsync-bench --example reliable_command_ingress`
+  demonstrates a client command frame wrapped in a reliable client packet
+  envelope, retried once, duplicate-suppressed at the server, applied, and then
+  acknowledged back to the client through a separate reliable command ACK
+  payload.
 - `cargo run -p sectorsync-bench --example station_event_transport`
   demonstrates a typed cross-station event encoded into a wire frame, delivered
   through bounded station transport, pumped into the target router, and drained
@@ -238,6 +251,7 @@ Not complete yet:
   heavier workload profiles.
 - Authentication/encryption, reconnects, deployment-level routing, production
   cluster integration, and long-running reliability calibration beyond the
-  low-level reliable station packet helpers and in-memory/UDP packet adapters.
-- Reliable transport/session/gateway layers for production client connectivity.
+  low-level reliable client/station packet helpers and in-memory/UDP packet
+  adapters.
+- Production gateway/session orchestration for client connectivity.
 - Large-scale benchmark validation against the stated hard metrics.

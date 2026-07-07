@@ -17,6 +17,9 @@
   UDP transport adapter or wire/transport integration.
 - Use `cargo run -p sectorsync-bench --example command_ingress` when changing
   command wire frames, command queues, or ingress/ACK integration.
+- Use `cargo run -p sectorsync-bench --example reliable_command_ingress` when
+  changing reliable client packet helpers, in-memory client transport hubs, or
+  reliable command ingress examples.
 - Use `cargo run -p sectorsync-bench --example station_event_transport` when
   changing station event frames, station transport, or event router bridging.
 - Use `cargo run -p sectorsync-bench --example udp_station_event` when changing
@@ -77,6 +80,9 @@ The core library does not own:
   SectorSync may encode, decode, queue, stamp `received_at`, and acknowledge
   them, but schema validation, anti-cheat, and game-rule translation belong in
   external validators before commands are applied.
+- Reliable client packet helpers may carry command, command ACK, replication, or
+  integration-defined frames, but they must not interpret game semantics or
+  replace external command validation.
 - Custom component work should keep SectorSync as a low-level SDK. Do not turn
   it into a mandatory ECS framework; expose descriptors, storage, and hooks.
 - Component codecs should stay dependency-light by default. Prefer traits and
@@ -94,6 +100,11 @@ The core library does not own:
   queues. Do not reuse client transport abstractions for station event routing.
 - Station event transport bridges must validate packet endpoints against decoded
   frames before routing events into target queues.
+- Reliable client packet helpers must preserve bounded per-peer in-flight
+  windows, payload budgets, retry attempts, timeout accounting, required source
+  client identity, and bounded duplicate suppression history. Do not hide a
+  production gateway, authentication layer, reconnect loop, blocking wait, or
+  unbounded replay buffer inside these helpers.
 - Reliable station packet helpers must preserve bounded in-flight windows,
   payload budgets, retry attempts, timeout accounting, and bounded duplicate
   suppression history. Do not introduce unbounded replay buffers, hidden
