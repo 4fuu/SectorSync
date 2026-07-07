@@ -2,7 +2,12 @@
 
 #![forbid(unsafe_code)]
 
-/// Returns the crate name for smoke tests and examples.
-pub const fn crate_name() -> &'static str {
-    "sectorsync-core"
-}
+pub mod barrier;
+pub mod entity;
+pub mod event;
+pub mod ids;
+pub mod policy;
+pub mod prelude;
+pub mod snapshot;
+pub mod spatial;
+pub mod station;
