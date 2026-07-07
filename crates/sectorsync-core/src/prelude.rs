@@ -5,6 +5,11 @@ pub use crate::command::{
     CommandDecision, CommandEnvelope, CommandIngress, CommandPriority, CommandPushOutcome,
     CommandQueueError, CommandQueueLimits, CommandQueues, CommandRejectReason,
 };
+pub use crate::component::{
+    ComponentBlob, ComponentDescriptor, ComponentMigrationMode, ComponentRegistry,
+    ComponentRegistryError, ComponentStorageKind, ComponentStore, ComponentStoreError,
+    ComponentSyncMode,
+};
 pub use crate::entity::{DirtyMask, EntityRecord, EntityRole, EntityTags};
 pub use crate::event::{
     EventKind, EventPriority, EventQueueLimits, EventQueues, PushOutcome, StationEvent,
