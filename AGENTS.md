@@ -23,6 +23,9 @@
   UDP transport adapter or wire/transport integration.
 - Use `cargo run -p sectorsync-bench --example command_ingress` when changing
   command wire frames, command queues, or ingress/ACK integration.
+- Use `cargo run -p sectorsync-bench --example secure_command_ingress` when
+  changing packet security envelopes, authenticator/cipher hooks, replay
+  windows, or secure command ingress examples.
 - Use `cargo run -p sectorsync-bench --example reliable_command_ingress` when
   changing reliable client packet helpers, in-memory client transport hubs, or
   reliable command ingress examples.
@@ -133,6 +136,11 @@ The core library does not own:
 - Transport implementations must be non-blocking or externally bounded at the
   station tick boundary. Do not introduce blocking receives, unbounded packet
   queues, or hidden per-entity network work in core transport adapters.
+- Packet security helpers must remain framing and policy hooks: bounded
+  envelopes, key ids, nonces, authenticator/cipher traits, and replay windows
+  are allowed; mandatory crypto dependencies, hard-coded algorithms, key
+  rotation services, certificate stores, and account auth systems stay outside
+  SectorSync.
 - The standard UDP adapter is a low-level packet adapter only. Reliability,
   encryption, authentication, reconnect, NAT traversal, and gateway/session
   semantics must not be hidden inside the UDP adapter. Use explicit reliable
