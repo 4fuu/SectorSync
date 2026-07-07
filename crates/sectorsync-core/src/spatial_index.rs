@@ -89,6 +89,16 @@ impl CellIndex {
         self.query_aabb(Bounds::Sphere { radius }.to_aabb(center))
     }
 
+    /// Returns handles indexed directly in one cell.
+    pub fn handles_in_cell(&self, cell: CellCoord3) -> Vec<EntityHandle> {
+        self.cells.get(&cell).cloned().unwrap_or_default()
+    }
+
+    /// Returns cells currently occupied by one entity handle.
+    pub fn cells_for_handle(&self, handle: EntityHandle) -> Option<&[CellCoord3]> {
+        self.entity_cells.get(&handle).map(Vec::as_slice)
+    }
+
     /// Number of indexed entities.
     pub fn entity_count(&self) -> usize {
         self.entity_cells.len()
@@ -111,5 +121,22 @@ impl CellIndex {
             .collect::<Vec<_>>();
         cells.sort_by_key(|occupancy| occupancy.cell);
         cells
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_exposes_handles_by_cell() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::new(grid);
+        let handle = EntityHandle::new(1, 0);
+        index.upsert(handle, Position3::new(1.0, 2.0, 3.0), Bounds::Point);
+        let cell = grid.cell_at(Position3::new(1.0, 2.0, 3.0));
+
+        assert_eq!(index.handles_in_cell(cell), vec![handle]);
+        assert_eq!(index.cells_for_handle(handle), Some([cell].as_slice()));
     }
 }

@@ -2,13 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierScope, BarrierState, CommandQueueMode, EntityHandle, EntityId,
-    EventQueueError, EventQueueLimits, EventQueues, HandoffTransfer, OwnerEpoch, PushOutcome,
-    RuntimeBarrier, SnapshotVersion, Station, StationError, StationEvent, StationId,
-    StationSnapshot, Tick,
+    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CommandQueueMode, EntityHandle,
+    EntityId, EventQueueError, EventQueueLimits, EventQueues, HandoffTransfer, OwnerEpoch,
+    PushOutcome, RuntimeBarrier, SnapshotVersion, SplitProposal, Station, StationError,
+    StationEvent, StationId, StationSnapshot, Tick,
 };
 
 /// Small in-process station collection for simulations and embedders.
@@ -193,6 +193,213 @@ impl EntityMigrationExecutor {
 
 fn next_target_epoch(station: &mut Station) -> OwnerEpoch {
     station.next_owner_epoch()
+}
+
+/// Dynamic ownership table for fixed 3D cells.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellOwnershipTable {
+    owners: BTreeMap<CellCoord3, StationId>,
+}
+
+impl CellOwnershipTable {
+    /// Assigns one cell to a station and returns the previous owner.
+    pub fn assign(&mut self, cell: CellCoord3, station_id: StationId) -> Option<StationId> {
+        self.owners.insert(cell, station_id)
+    }
+
+    /// Returns the current owner for one cell.
+    pub fn owner_of(&self, cell: CellCoord3) -> Option<StationId> {
+        self.owners.get(&cell).copied()
+    }
+
+    /// Applies a split proposal by assigning all proposed cells to `target_station`.
+    pub fn apply_split(
+        &mut self,
+        proposal: &SplitProposal,
+        target_station: StationId,
+    ) -> CellOwnershipUpdate {
+        let mut moved_cells = Vec::new();
+        for cell in &proposal.cells_to_move {
+            let previous = self.assign(*cell, target_station);
+            if previous != Some(target_station) {
+                moved_cells.push(*cell);
+            }
+        }
+        CellOwnershipUpdate {
+            source_station: proposal.source_station,
+            target_station,
+            moved_cells,
+        }
+    }
+
+    /// Number of explicitly assigned cells.
+    pub fn len(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// Returns whether no cells are explicitly assigned.
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+}
+
+/// Result of applying cell ownership changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellOwnershipUpdate {
+    /// Previous/source station.
+    pub source_station: StationId,
+    /// New/target station.
+    pub target_station: StationId,
+    /// Cells whose owner changed.
+    pub moved_cells: Vec<CellCoord3>,
+}
+
+/// Result of migrating entities indexed by moved cells.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CellMigrationReport {
+    /// Source station.
+    pub source_station: StationId,
+    /// Target station.
+    pub target_station: StationId,
+    /// Cells scanned for owner entities.
+    pub scanned_cells: Vec<CellCoord3>,
+    /// Entity migrations that were committed.
+    pub entity_migrations: Vec<EntityMigrationReport>,
+    /// Candidate handles that no longer resolved to an entity.
+    pub skipped_missing_handles: usize,
+    /// Candidate entities skipped because they were ghosts or non-authoritative.
+    pub skipped_non_owned: usize,
+    /// Duplicate candidate entities skipped after first occurrence.
+    pub skipped_duplicate_entities: usize,
+}
+
+/// Cell-level migration error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellMigrationError {
+    /// Entity migration failed.
+    Entity(EntityMigrationError),
+    /// Target owner record was not found after a successful migration.
+    MissingTargetRecord(EntityId),
+    /// Source ghost record was not found after a successful migration.
+    MissingSourceRecord(EntityId),
+}
+
+impl core::fmt::Display for CellMigrationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Entity(error) => write!(f, "{error}"),
+            Self::MissingTargetRecord(id) => {
+                write!(f, "target owner record for entity {} is missing", id.get())
+            }
+            Self::MissingSourceRecord(id) => {
+                write!(f, "source ghost record for entity {} is missing", id.get())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CellMigrationError {}
+
+impl From<EntityMigrationError> for CellMigrationError {
+    fn from(value: EntityMigrationError) -> Self {
+        Self::Entity(value)
+    }
+}
+
+/// Executes cell-level ownership migration using station-local indexes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CellMigrationExecutor;
+
+impl CellMigrationExecutor {
+    /// Migrates owned entities found in `cells` from source station to target station.
+    pub fn migrate_cells(
+        stations: &mut StationSet,
+        source_index: &mut CellIndex,
+        target_index: &mut CellIndex,
+        source_station: StationId,
+        target_station: StationId,
+        cells: &[CellCoord3],
+        ghost_ttl_ticks: u64,
+    ) -> Result<CellMigrationReport, CellMigrationError> {
+        let mut report = CellMigrationReport {
+            source_station,
+            target_station,
+            scanned_cells: cells.to_vec(),
+            ..CellMigrationReport::default()
+        };
+        let mut seen_handles = BTreeSet::new();
+        let mut entity_ids = Vec::new();
+
+        {
+            let source = stations
+                .get(source_station)
+                .ok_or(EntityMigrationError::MissingSource(source_station))?;
+            for cell in cells {
+                for handle in source_index.handles_in_cell(*cell) {
+                    if !seen_handles.insert(handle) {
+                        report.skipped_duplicate_entities += 1;
+                        continue;
+                    }
+                    let Some(record) = source.get(handle) else {
+                        report.skipped_missing_handles += 1;
+                        continue;
+                    };
+                    if record.is_owned() {
+                        entity_ids.push(record.id);
+                    } else {
+                        report.skipped_non_owned += 1;
+                    }
+                }
+            }
+        }
+
+        let mut seen_entities = BTreeSet::new();
+        for entity_id in entity_ids {
+            if !seen_entities.insert(entity_id) {
+                report.skipped_duplicate_entities += 1;
+                continue;
+            }
+            let migration = EntityMigrationExecutor::migrate_entity(
+                stations,
+                entity_id,
+                source_station,
+                target_station,
+                ghost_ttl_ticks,
+            )?;
+
+            {
+                let target = stations
+                    .get(target_station)
+                    .ok_or(EntityMigrationError::MissingTarget(target_station))?;
+                let target_record = target
+                    .get(migration.target_owner)
+                    .ok_or(CellMigrationError::MissingTargetRecord(entity_id))?;
+                target_index.upsert(
+                    migration.target_owner,
+                    target_record.position,
+                    target_record.bounds,
+                );
+            }
+
+            {
+                let source = stations
+                    .get(source_station)
+                    .ok_or(EntityMigrationError::MissingSource(source_station))?;
+                let source_record = source
+                    .get(migration.source_ghost)
+                    .ok_or(CellMigrationError::MissingSourceRecord(entity_id))?;
+                source_index.upsert(
+                    migration.source_ghost,
+                    source_record.position,
+                    source_record.bounds,
+                );
+            }
+
+            report.entity_migrations.push(migration);
+        }
+
+        Ok(report)
+    }
 }
 
 /// Event router statistics.
@@ -586,8 +793,8 @@ impl BarrierController {
 mod tests {
     use super::*;
     use sectorsync_core::prelude::{
-        Bounds, EventId, EventKind, EventPriority, InstanceId, NodeId, PolicyId, Position3,
-        StationConfig,
+        Bounds, CellCoord3, EventId, EventKind, EventPriority, GridSpec, InstanceId, NodeId,
+        PolicyId, Position3, StationConfig,
     };
 
     fn station(station_id: u32, instance_id: u64) -> Station {
@@ -714,5 +921,79 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(router.stats().routed_events, 1);
         assert_eq!(router.stats().drained_events, 1);
+    }
+
+    #[test]
+    fn cell_migration_moves_owned_entities_and_updates_indexes() {
+        let grid = GridSpec::new(16.0).expect("valid grid");
+        let cell = CellCoord3::new(0, 0, 0);
+        let mut stations = StationSet::default();
+        let mut source = station(1, 10);
+        let first = source
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(1.0, 1.0, 1.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("first spawn should work");
+        let second = source
+            .spawn_owned(
+                EntityId::new(2),
+                Position3::new(2.0, 1.0, 1.0),
+                Bounds::Point,
+                PolicyId::new(0),
+            )
+            .expect("second spawn should work");
+        stations.push(source);
+        stations.push(station(2, 10));
+
+        let mut source_index = CellIndex::new(grid);
+        source_index.upsert(first, Position3::new(1.0, 1.0, 1.0), Bounds::Point);
+        source_index.upsert(second, Position3::new(2.0, 1.0, 1.0), Bounds::Point);
+        let mut target_index = CellIndex::new(grid);
+
+        let mut ownership = CellOwnershipTable::default();
+        ownership.assign(cell, StationId::new(1));
+        let update = ownership.apply_split(
+            &SplitProposal {
+                source_station: StationId::new(1),
+                cells_to_move: vec![cell],
+                moved_pressure_score: 10,
+            },
+            StationId::new(2),
+        );
+        assert_eq!(ownership.owner_of(cell), Some(StationId::new(2)));
+        assert_eq!(update.moved_cells, vec![cell]);
+
+        let report = CellMigrationExecutor::migrate_cells(
+            &mut stations,
+            &mut source_index,
+            &mut target_index,
+            StationId::new(1),
+            StationId::new(2),
+            &update.moved_cells,
+            4,
+        )
+        .expect("cell migration should work");
+
+        assert_eq!(report.entity_migrations.len(), 2);
+        assert_eq!(target_index.entity_count(), 2);
+        assert!(
+            !stations
+                .get(StationId::new(1))
+                .expect("source")
+                .get_by_id(EntityId::new(1))
+                .expect("source ghost")
+                .is_owned()
+        );
+        assert!(
+            stations
+                .get(StationId::new(2))
+                .expect("target")
+                .get_by_id(EntityId::new(1))
+                .expect("target owner")
+                .is_owned()
+        );
     }
 }
