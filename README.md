@@ -428,6 +428,9 @@ Initial status:
 
 Not complete yet:
 
+See `docs/gaps.md` for the current delivery gap register and completion
+evidence checklist.
+
 - Long-running split scheduler calibration against production telemetry and
   heavier workload profiles.
 - Production authentication/encryption implementations, secret storage, key
