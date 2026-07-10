@@ -151,14 +151,16 @@ jobs:
 
           readme_path = Path("README.md")
           readme = readme_path.read_text(encoding="utf-8")
-          if readme.count(dependency_current) != 4:
-              raise SystemExit("expected four exact dependency versions in README.md")
+          readme_dependency_current = f'"={current_version}"'
+          readme_dependency_release = f'"={release_version}"'
+          if readme.count(readme_dependency_current) != 6:
+              raise SystemExit("expected six exact dependency versions in README.md")
           readme_path.write_text(
-              readme.replace(dependency_current, dependency_release),
+              readme.replace(readme_dependency_current, readme_dependency_release),
               encoding="utf-8",
           )
           PY
-          cargo check --workspace
+          cargo check --workspace --all-features
 
       - name: Run release quality gate
         if: steps.release.outputs.should_release == 'true'
@@ -166,9 +168,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-features --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
           cargo run -q -p sectorsync-bench --locked -- --profile=smoke
           git diff --check
 

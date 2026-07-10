@@ -63,6 +63,18 @@ sectorsync-runtime = "=2026.7.10"
 adding mandatory async runtimes, serialization frameworks, ECS frameworks, or
 network services.
 
+Performance integrations are opt-in:
+
+```toml
+sectorsync-core = { version = "=2026.7.10", features = ["simd"] }
+sectorsync-runtime = { version = "=2026.7.10", features = ["parallel"] }
+```
+
+`simd` enables the safe eight-lane range-only candidate path. `parallel` exposes
+an explicitly constructed, bounded replication pool with deterministic station
+batch planning and synchronous ordered batch mapping. Neither feature creates
+threads or changes planner behavior in the default build.
+
 ## Quick Start
 
 ```rust
@@ -130,6 +142,7 @@ cargo run -p sectorsync-bench --example load_sampling
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
+cargo run -p sectorsync-bench --features parallel --example parallel_replication
 ```
 
 The focused example-to-feature map is maintained in
@@ -162,6 +175,34 @@ cargo run -q -p sectorsync-bench -- --profile=smoke --baseline=naive-grid
 Medium, large, and oversized manual profiles require `--allow-heavy`. See the
 [performance acceptance matrix](docs/performance-acceptance.md) before changing
 thresholds or running larger workloads.
+
+For a deliberate measurement on the current development host, use the guarded
+release-mode `local` profile. It scales from detected host parallelism, caps the
+workload at 24,000 entities and 480 clients, fully encodes selected replication
+deltas in a bounded dense-AOI scenario, and enforces a 10-second between-tick
+time budget:
+
+```powershell
+$env:CARGO_BUILD_JOBS=4
+cargo run --release -q -p sectorsync-bench -- --profile=local --allow-heavy
+```
+
+This is a repeatable local regression and capacity signal, not a production or
+cross-machine network capacity guarantee.
+
+The optimized 128 Hz simulation check keeps replication at an explicit 32 Hz,
+spreads viewers across four deterministic phases, and enforces the 7.8125 ms
+tick budget:
+
+```powershell
+$env:CARGO_BUILD_JOBS=4
+cargo run --release -q -p sectorsync-bench --features optimized -- `
+  --profile=local --allow-heavy --planner=parallel --threads=8 `
+  --replication-hz=32 --tick-ms-p99-budget=7.8125
+```
+
+Use `--replication-hz=128` only as the harsher all-clients-every-tick comparison;
+it is not stable at 128 Hz on the current development host.
 
 ## Documentation
 

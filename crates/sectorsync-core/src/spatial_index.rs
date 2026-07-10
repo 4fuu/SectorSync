@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use crate::ids::EntityHandle;
 use crate::spatial::{Aabb3, Bounds, CellCoord3, GridSpec, Position3};
 
+const MAX_DENSE_DEDUP_SLOTS: usize = 262_144;
+
 /// Occupancy count for one non-empty cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellOccupancy {
@@ -42,7 +44,10 @@ pub struct CellQueryStats {
 /// Reusable scratch storage for allocation-aware cell queries.
 #[derive(Clone, Debug, Default)]
 pub struct CellQueryScratch {
-    seen: HashSet<EntityHandle>,
+    seen_dense: Vec<u64>,
+    seen_collisions: Vec<u32>,
+    seen_sparse: HashSet<EntityHandle>,
+    query_epoch: u32,
     handles: Vec<EntityHandle>,
     matching_cells: Vec<CellCoord3>,
     stats: CellQueryStats,
@@ -51,7 +56,7 @@ pub struct CellQueryScratch {
 impl CellQueryScratch {
     /// Clears retained query results while keeping allocated capacity.
     pub fn clear(&mut self) {
-        self.seen.clear();
+        self.begin_query();
         self.handles.clear();
         self.matching_cells.clear();
         self.stats = CellQueryStats::default();
@@ -84,12 +89,56 @@ impl CellQueryScratch {
 
     /// Capacity retained by the candidate deduplication set.
     pub fn dedup_capacity(&self) -> usize {
-        self.seen.capacity()
+        self.seen_dense
+            .capacity()
+            .saturating_add(self.seen_collisions.capacity())
+            .saturating_add(self.seen_sparse.capacity())
     }
 
     /// Capacity retained for occupied cells matched by sparse queries.
     pub fn matching_cell_capacity(&self) -> usize {
         self.matching_cells.capacity()
+    }
+
+    fn begin_query(&mut self) {
+        self.query_epoch = self.query_epoch.wrapping_add(1);
+        if self.query_epoch == 0 {
+            self.seen_dense.fill(0);
+            self.seen_collisions.fill(0);
+            self.query_epoch = 1;
+        }
+        self.seen_sparse.clear();
+    }
+
+    fn insert_seen(&mut self, handle: EntityHandle) -> bool {
+        let Ok(index) = usize::try_from(handle.index()) else {
+            return self.seen_sparse.insert(handle);
+        };
+        if index >= MAX_DENSE_DEDUP_SLOTS {
+            return self.seen_sparse.insert(handle);
+        }
+        if index >= self.seen_dense.len() {
+            self.seen_dense.resize(index + 1, 0);
+            self.seen_collisions.resize(index + 1, 0);
+        }
+        let marker = (u64::from(self.query_epoch) << 32) | u64::from(handle.generation());
+        let previous = self.seen_dense[index];
+        let previous_epoch = u32::try_from(previous >> 32).expect("marker epoch fits u32");
+        if previous_epoch != self.query_epoch {
+            self.seen_dense[index] = marker;
+            true
+        } else if self.seen_collisions[index] == self.query_epoch {
+            self.seen_sparse.insert(handle)
+        } else if previous == marker {
+            false
+        } else {
+            self.seen_collisions[index] = self.query_epoch;
+            let previous_generation =
+                u32::try_from(previous & u64::from(u32::MAX)).expect("marker generation fits u32");
+            self.seen_sparse
+                .insert(EntityHandle::new(handle.index(), previous_generation));
+            self.seen_sparse.insert(handle)
+        }
     }
 }
 
@@ -214,7 +263,7 @@ impl CellIndex {
         if let Some(handles) = self.cells.get(&cell) {
             scratch.stats.matched_cells = scratch.stats.matched_cells.saturating_add(1);
             for handle in handles {
-                if scratch.seen.insert(*handle) {
+                if scratch.insert_seen(*handle) {
                     scratch.handles.push(*handle);
                 }
             }
@@ -334,6 +383,28 @@ mod tests {
         );
         assert!(second.is_empty());
         assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn dense_dedup_preserves_generations_and_bounds_sparse_handles() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::new(grid);
+        let old = EntityHandle::new(7, 1);
+        let current = EntityHandle::new(7, 2);
+        let sparse = EntityHandle::new(u32::MAX, 0);
+        let spanning = Bounds::Sphere { radius: 2.0 };
+        index.upsert(old, Position3::new(9.0, 0.0, 0.0), spanning);
+        index.upsert(current, Position3::new(9.0, 0.0, 0.0), spanning);
+        index.upsert(sparse, Position3::new(9.0, 0.0, 0.0), Bounds::Point);
+        let mut scratch = CellQueryScratch::default();
+
+        let handles = index.query_aabb_into(
+            spanning.to_aabb(Position3::new(10.0, 0.0, 0.0)),
+            &mut scratch,
+        );
+
+        assert_eq!(handles, &[old, current, sparse]);
+        assert!(scratch.dedup_capacity() < MAX_DENSE_DEDUP_SLOTS);
     }
 
     #[test]

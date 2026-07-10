@@ -3,9 +3,11 @@
 use std::collections::BTreeMap;
 
 use crate::ids::{ClientId, EntityHandle, Tick};
+#[cfg(not(feature = "simd"))]
+use crate::interest::RangeOnlyVisibility;
 use crate::interest::{ViewerQuery, VisibilityFilter};
 use crate::policy::{CompiledSyncPolicy, PolicyTable};
-use crate::spatial_index::{CellIndex, CellQueryScratch, CellQueryStats};
+use crate::spatial_index::{CellIndex, CellQueryScratch, CellQueryStats, CellQueryStrategy};
 use crate::station::Station;
 
 /// Per-client replication budget.
@@ -36,6 +38,112 @@ pub struct ReplicationPlan {
     pub entities: Vec<EntityHandle>,
     /// Planner statistics.
     pub stats: ReplicationStats,
+}
+
+/// Aggregated work and retained-capacity signals from one viewer batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationBatchStats {
+    /// Viewer queries planned in input order.
+    pub viewers: usize,
+    /// Spatial candidates returned across all viewers.
+    pub candidates: usize,
+    /// Candidate records considered after stale-handle filtering.
+    pub considered: usize,
+    /// Entities selected across all plans.
+    pub selected: usize,
+    /// Estimated payload bytes across all plans.
+    pub estimated_bytes: usize,
+    /// Queries that probed the regular cell grid.
+    pub grid_queries: usize,
+    /// Queries that scanned occupied cells.
+    pub occupied_queries: usize,
+    /// Grid cells probed across the batch.
+    pub grid_cells_probed: usize,
+    /// Occupied cells scanned across the batch.
+    pub occupied_cells_scanned: usize,
+    /// Cells intersecting viewer query bounds across the batch.
+    pub matched_cells: usize,
+    /// Largest retained candidate-handle capacity.
+    pub candidate_capacity_max: usize,
+    /// Largest retained candidate-deduplication capacity.
+    pub dedup_capacity_max: usize,
+    /// Largest retained matched-cell capacity.
+    pub matching_cell_capacity_max: usize,
+    /// Largest retained priority candidate capacity.
+    pub priority_capacity_max: usize,
+}
+
+impl ReplicationBatchStats {
+    fn record(&mut self, plan: &ReplicationPlan, scratch: &ReplicationScratch) {
+        self.viewers = self.viewers.saturating_add(1);
+        self.candidates = self.candidates.saturating_add(plan.stats.candidates);
+        self.considered = self.considered.saturating_add(plan.stats.considered);
+        self.selected = self.selected.saturating_add(plan.stats.selected);
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(plan.stats.estimated_bytes);
+        let query = scratch.query_stats();
+        match query.strategy {
+            CellQueryStrategy::Grid => self.grid_queries = self.grid_queries.saturating_add(1),
+            CellQueryStrategy::OccupiedCells => {
+                self.occupied_queries = self.occupied_queries.saturating_add(1);
+            }
+        }
+        self.grid_cells_probed = self
+            .grid_cells_probed
+            .saturating_add(query.grid_cells_probed);
+        self.occupied_cells_scanned = self
+            .occupied_cells_scanned
+            .saturating_add(query.occupied_cells_scanned);
+        self.matched_cells = self.matched_cells.saturating_add(query.matched_cells);
+        self.candidate_capacity_max = self
+            .candidate_capacity_max
+            .max(scratch.candidate_capacity());
+        self.dedup_capacity_max = self
+            .dedup_capacity_max
+            .max(scratch.candidate_dedup_capacity());
+        self.matching_cell_capacity_max = self
+            .matching_cell_capacity_max
+            .max(scratch.matching_cell_capacity());
+        self.priority_capacity_max = self
+            .priority_capacity_max
+            .max(scratch.prioritized_capacity());
+    }
+
+    /// Merges another deterministic batch partition into this report.
+    pub fn merge(&mut self, other: Self) {
+        self.viewers = self.viewers.saturating_add(other.viewers);
+        self.candidates = self.candidates.saturating_add(other.candidates);
+        self.considered = self.considered.saturating_add(other.considered);
+        self.selected = self.selected.saturating_add(other.selected);
+        self.estimated_bytes = self.estimated_bytes.saturating_add(other.estimated_bytes);
+        self.grid_queries = self.grid_queries.saturating_add(other.grid_queries);
+        self.occupied_queries = self.occupied_queries.saturating_add(other.occupied_queries);
+        self.grid_cells_probed = self
+            .grid_cells_probed
+            .saturating_add(other.grid_cells_probed);
+        self.occupied_cells_scanned = self
+            .occupied_cells_scanned
+            .saturating_add(other.occupied_cells_scanned);
+        self.matched_cells = self.matched_cells.saturating_add(other.matched_cells);
+        self.candidate_capacity_max = self
+            .candidate_capacity_max
+            .max(other.candidate_capacity_max);
+        self.dedup_capacity_max = self.dedup_capacity_max.max(other.dedup_capacity_max);
+        self.matching_cell_capacity_max = self
+            .matching_cell_capacity_max
+            .max(other.matching_cell_capacity_max);
+        self.priority_capacity_max = self.priority_capacity_max.max(other.priority_capacity_max);
+    }
+}
+
+/// Ordered plans and aggregate statistics produced for a viewer batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationBatchResult {
+    /// One plan per input viewer, retaining input order.
+    pub plans: Vec<ReplicationPlan>,
+    /// Aggregate work signals for the batch.
+    pub stats: ReplicationBatchStats,
 }
 
 /// Bounded per-client replication tracking configuration.
@@ -488,6 +596,70 @@ impl ReplicationPlanner {
         )
     }
 
+    /// Plans viewers in input order while reusing caller-provided scratch.
+    pub fn plan_for_viewers_with_scratch<F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationBatchResult {
+        let mut batch = ReplicationBatchResult {
+            plans: Vec::with_capacity(viewers.len()),
+            stats: ReplicationBatchStats::default(),
+        };
+        for viewer in viewers {
+            let plan = Self::plan_for_viewer_with_scratch(
+                station, index, policies, viewer, filter, budget, scratch,
+            );
+            batch.stats.record(&plan, scratch);
+            batch.plans.push(plan);
+        }
+        batch
+    }
+
+    /// Plans one range-only viewer using the optional SIMD candidate filter.
+    ///
+    /// With the `simd` feature this evaluates candidate distances in eight-lane
+    /// groups. Without it, the same API uses the scalar range-only planner.
+    pub fn plan_for_viewer_range_with_scratch(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationPlan {
+        let candidates =
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        Self::plan_for_range_candidates(station, candidates, policies, viewer, budget)
+    }
+
+    /// Plans a range-only viewer batch in input order with optional SIMD filtering.
+    pub fn plan_for_viewers_range_with_scratch(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+    ) -> ReplicationBatchResult {
+        let mut batch = ReplicationBatchResult {
+            plans: Vec::with_capacity(viewers.len()),
+            stats: ReplicationBatchStats::default(),
+        };
+        for viewer in viewers {
+            let plan = Self::plan_for_viewer_range_with_scratch(
+                station, index, policies, viewer, budget, scratch,
+            );
+            batch.stats.record(&plan, scratch);
+            batch.plans.push(plan);
+        }
+        batch
+    }
+
     /// Plans a frame and skips entities whose distance-based cadence has not elapsed.
     pub fn plan_for_viewer_with_cadence<F, L>(
         station: &Station,
@@ -727,7 +899,7 @@ impl ReplicationPlanner {
             if distance_squared > policy_radius_sq {
                 continue;
             }
-            if !filter.is_visible(viewer, entity) {
+            if !filter.is_visible_with_distance(viewer, entity, distance_squared) {
                 continue;
             }
             if !cadence_allows(*handle, policy, distance_squared) {
@@ -741,6 +913,91 @@ impl ReplicationPlanner {
             }
 
             plan.entities.push(*handle);
+        }
+
+        plan.stats.selected = plan.entities.len();
+        plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
+        plan
+    }
+
+    #[cfg(not(feature = "simd"))]
+    fn plan_for_range_candidates(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+    ) -> ReplicationPlan {
+        Self::plan_for_candidates_inner(
+            station,
+            candidates,
+            policies,
+            viewer,
+            &RangeOnlyVisibility,
+            budget,
+            |_, _, _| true,
+        )
+    }
+
+    #[cfg(feature = "simd")]
+    fn plan_for_range_candidates(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+    ) -> ReplicationPlan {
+        use wide::{CmpLe, f32x8};
+
+        const LANES: usize = 8;
+        let max_entities = viewer.max_entities.min(budget.max_entities);
+        let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
+        let hard_limit = max_entities.min(max_by_bytes);
+        let mut plan = ReplicationPlan {
+            entities: Vec::with_capacity(hard_limit),
+            stats: ReplicationStats {
+                candidates: candidates.len(),
+                ..ReplicationStats::default()
+            },
+        };
+        let viewer_radius_squared = viewer.radius_squared();
+
+        for handles in candidates.chunks(LANES) {
+            let mut distance_squared = [f32::NAN; LANES];
+            let mut policy_radius_squared = [f32::NAN; LANES];
+            let mut valid_lanes = 0_u8;
+
+            for (lane, handle) in handles.iter().copied().enumerate() {
+                let Some(entity) = station.get(handle) else {
+                    continue;
+                };
+                plan.stats.considered = plan.stats.considered.saturating_add(1);
+                let Some(policy) = policies.get(entity.policy_id) else {
+                    continue;
+                };
+                distance_squared[lane] = entity.position.distance_squared(viewer.position);
+                policy_radius_squared[lane] = policy.interest_radius * policy.interest_radius;
+                valid_lanes |= 1 << lane;
+            }
+
+            let visible_lanes = u8::try_from(
+                (f32x8::new(distance_squared).cmp_le(f32x8::new(policy_radius_squared))
+                    & f32x8::new(distance_squared).cmp_le(f32x8::splat(viewer_radius_squared)))
+                .move_mask(),
+            )
+            .expect("eight-lane SIMD mask fits u8")
+                & valid_lanes;
+
+            for (lane, handle) in handles.iter().copied().enumerate() {
+                if visible_lanes & (1 << lane) == 0 {
+                    continue;
+                }
+                if plan.entities.len() >= hard_limit {
+                    plan.stats.skipped_by_budget = plan.stats.skipped_by_budget.saturating_add(1);
+                } else {
+                    plan.entities.push(handle);
+                }
+            }
         }
 
         plan.stats.selected = plan.entities.len();
@@ -789,7 +1046,7 @@ impl ReplicationPlanner {
             if distance_squared > policy_radius_sq {
                 continue;
             }
-            if !filter.is_visible(viewer, entity) {
+            if !filter.is_visible_with_distance(viewer, entity, distance_squared) {
                 continue;
             }
             if !cadence_allows(*handle, policy, distance_squared) {
@@ -962,6 +1219,128 @@ mod tests {
         assert_eq!(plan.entities, vec![static_visible]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.considered, 2);
+    }
+
+    #[test]
+    fn range_batch_matches_ordered_scalar_plans() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 128,
+        });
+        let grid = GridSpec::new(16.0).expect("grid is valid");
+        let mut index = CellIndex::new(grid);
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 128, 96.0));
+        for entity_index in 0_u16..24 {
+            let position = Position3::new(f32::from(entity_index) * 8.0 - 64.0, 0.0, 0.0);
+            let handle = station
+                .spawn_owned(
+                    EntityId::new(u64::from(entity_index)),
+                    position,
+                    Bounds::Point,
+                    PolicyId::new(1),
+                )
+                .expect("entity id is unique");
+            index.upsert(handle, position, Bounds::Point);
+        }
+        let viewers = [
+            ViewerQuery {
+                client_id: ClientId::new(1),
+                position: Position3::new(0.0, 0.0, 0.0),
+                radius: 80.0,
+                max_entities: 32,
+            },
+            ViewerQuery {
+                client_id: ClientId::new(2),
+                position: Position3::new(48.0, 0.0, 0.0),
+                radius: 48.0,
+                max_entities: 8,
+            },
+        ];
+        let mut scalar_scratch = ReplicationScratch::default();
+        let expected = viewers
+            .iter()
+            .map(|viewer| {
+                ReplicationPlanner::plan_for_viewer_with_scratch(
+                    &station,
+                    &index,
+                    &policies,
+                    viewer,
+                    &RangeOnlyVisibility,
+                    ReplicationBudget::default(),
+                    &mut scalar_scratch,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut batch_scratch = ReplicationScratch::default();
+        let batch = ReplicationPlanner::plan_for_viewers_range_with_scratch(
+            &station,
+            &index,
+            &policies,
+            &viewers,
+            ReplicationBudget::default(),
+            &mut batch_scratch,
+        );
+
+        assert_eq!(batch.plans, expected);
+        assert_eq!(batch.stats.viewers, viewers.len());
+        assert_eq!(
+            batch.stats.selected,
+            expected.iter().map(|plan| plan.stats.selected).sum()
+        );
+        assert_eq!(
+            batch.stats.grid_queries + batch.stats.occupied_queries,
+            viewers.len()
+        );
+    }
+
+    #[test]
+    fn range_batch_preserves_scalar_nan_radius_semantics() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 128,
+        });
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 128, 96.0));
+        let handle = station
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(1.0, 2.0, 3.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn entity");
+        let viewer = ViewerQuery {
+            client_id: ClientId::new(1),
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: f32::NAN,
+            max_entities: 8,
+        };
+        let candidates = [handle];
+        let scalar = ReplicationPlanner::plan_for_candidates_inner(
+            &station,
+            &candidates,
+            &policies,
+            &viewer,
+            &RangeOnlyVisibility,
+            ReplicationBudget::default(),
+            |_, _, _| true,
+        );
+        let range = ReplicationPlanner::plan_for_range_candidates(
+            &station,
+            &candidates,
+            &policies,
+            &viewer,
+            ReplicationBudget::default(),
+        );
+
+        assert!(scalar.entities.is_empty());
+        assert_eq!(range, scalar);
     }
 
     #[test]

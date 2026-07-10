@@ -14,7 +14,12 @@ categories = ["game-development", "network-programming"]
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+parallel = ["dep:rayon"]
+
 [dependencies]
+rayon = { workspace = true, optional = true }
 sectorsync-core.workspace = true
 sectorsync-transport.workspace = true
 sectorsync-wire.workspace = true

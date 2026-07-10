@@ -6,9 +6,9 @@ Run the release-quality gate for completed changes:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo doc --workspace --no-deps
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo doc --workspace --all-features --no-deps
 cargo run -q -p sectorsync-bench -- --profile=smoke
 git diff --check
 ```
@@ -27,7 +27,7 @@ Use the closest examples for focused verification:
 | Area | Examples |
 | --- | --- |
 | End-to-end SDK | `sdk_flow` |
-| Replication and client flow | `replication_bridge`, `replication_bridge_priority`, `client_bridge` |
+| Replication and client flow | `replication_bridge`, `replication_bridge_priority`, `client_bridge`, `parallel_replication` |
 | Gateway and deployment | `gateway_session`, `gateway_command_pipeline`, `gateway_deployment_dispatch`, `deployment_routing` |
 | Commands and security hooks | `command_ingress`, `reliable_command_ingress`, `secure_command_ingress`, `secure_key_rotation` |
 | Station events and UDP | `station_event_transport`, `udp_station_event`, `reliable_station_event`, `udp_loopback` |

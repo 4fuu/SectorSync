@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 pub mod deployment;
+#[cfg(feature = "parallel")]
+mod parallel;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +33,11 @@ pub use deployment::{
     DeploymentConfig, DeploymentError, DeploymentNodeRoute, DeploymentNodeState,
     DeploymentRouteTable, DeploymentStationMove, DeploymentStationRoute, DeploymentStats,
     GatewayDeliveryError, GatewayDeliveryRoute,
+};
+#[cfg(feature = "parallel")]
+pub use parallel::{
+    ParallelReplicationResult, ParallelReplicationScratch, ReplicationThreadPool,
+    ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig, StationReplicationBatch,
 };
 
 /// Client replication transport bridge configuration.

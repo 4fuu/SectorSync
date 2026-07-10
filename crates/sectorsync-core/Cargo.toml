@@ -14,5 +14,12 @@ categories = ["game-development", "network-programming"]
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+simd = ["dep:wide"]
+
+[dependencies]
+wide = { workspace = true, optional = true }
+
 [lints]
 workspace = true

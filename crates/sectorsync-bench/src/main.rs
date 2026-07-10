@@ -2,25 +2,27 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sectorsync_core::prelude::{
-    Bounds, CellIndex, CellLoadSample, CellQueryStrategy, ClientId, CommandEnvelope, CommandId,
-    CommandIngress, CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy,
-    ComponentId, EntityId, EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig,
-    GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId,
-    NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
-    ReplicationPlanner, ReplicationScratch, Station, StationConfig, StationEvent, StationId,
-    StationLoadSample, Tick, Vec3, ViewerQuery,
+    Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
+    CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
+    EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig, GatewaySessionTable,
+    GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, OwnerEpoch,
+    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBatchStats,
+    ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station, StationConfig,
+    StationEvent, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
     DeploymentRouteTable, EventRouter, GatewayClientTransportBridge, GatewayCommandPipeline,
     StationScheduleConfig, StationScheduler, StationSet,
 };
+#[cfg(feature = "parallel")]
+use sectorsync_runtime::{ReplicationThreadPool, ReplicationThreadPoolConfig};
 use sectorsync_transport::{
     ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportEndpoint,
-    InMemoryTransportHub, OutboundPacket, StationTransportLimits, TransportSink,
+    InMemoryTransportHub, OutboundPacket, PacketBatch, StationTransportLimits, TransportSink,
 };
 use sectorsync_wire::{
     BinaryFrameEncoder, CommandFrame, ComponentDelta, EntityDelta, FrameEncoder, ReplicationFrame,
@@ -30,6 +32,14 @@ const DEFAULT_GUARD_MAX_ENTITIES: usize = 4_000;
 const DEFAULT_GUARD_MAX_CLIENTS: usize = 150;
 const DEFAULT_GUARD_MAX_STATIONS: usize = 8;
 const DEFAULT_GUARD_MAX_TICKS: usize = 5;
+const LOCAL_MAX_ENTITIES: usize = 24_000;
+const LOCAL_MAX_CLIENTS: usize = 480;
+const LOCAL_MAX_STATIONS: usize = 8;
+const LOCAL_TICKS: usize = 30;
+const LOCAL_TIME_BUDGET_MS: u64 = 10_000;
+const SAMPLED_ENTITY_DELTAS_PER_FRAME: usize = 16;
+const FULL_ENTITY_DELTAS_PER_FRAME: usize = 300;
+const TICK_128_HZ_BUDGET_MS: f64 = 1_000.0 / 128.0;
 const DISPATCH_BENCH_MAX_COMMANDS_PER_TICK: usize = 32;
 const CLIENT_BRIDGE_BENCH_MAX_CLIENTS_PER_TICK: usize = 32;
 
@@ -41,6 +51,59 @@ enum Baseline {
     SectorSync,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PlannerMode {
+    #[default]
+    Scalar,
+    Batch,
+    Parallel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadMaterialization {
+    Sampled,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadShape {
+    Wide,
+    Dense,
+}
+
+impl WorkloadShape {
+    const fn horizontal_extent(self) -> f32 {
+        match self {
+            Self::Wide => 5_000.0,
+            Self::Dense => 1_000.0,
+        }
+    }
+
+    const fn vertical_extent(self) -> f32 {
+        match self {
+            Self::Wide => 500.0,
+            Self::Dense => 100.0,
+        }
+    }
+
+    const fn viewer_radius() -> f32 {
+        256.0
+    }
+}
+
+impl PayloadMaterialization {
+    const fn entity_limit(self) -> usize {
+        match self {
+            Self::Sampled => SAMPLED_ENTITY_DELTAS_PER_FRAME,
+            Self::Full => FULL_ENTITY_DELTAS_PER_FRAME,
+        }
+    }
+
+    const fn requires_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BenchConfig {
     entities: usize,
@@ -48,12 +111,20 @@ struct BenchConfig {
     stations: usize,
     ticks: usize,
     baseline: Baseline,
+    requested_planner: PlannerMode,
+    planner: PlannerMode,
+    requested_parallel_threads: usize,
+    tick_rate_hz: u16,
+    replication_hz: u16,
     requested_profile: &'static str,
     profile_name: &'static str,
     allow_heavy: bool,
     heavy_profile_denied: bool,
     default_resource_guard_applied: bool,
     host_parallelism: usize,
+    payload_materialization: PayloadMaterialization,
+    workload_shape: WorkloadShape,
+    time_budget_ms: Option<u64>,
     thresholds: BenchThresholds,
 }
 
@@ -75,12 +146,20 @@ impl Default for BenchConfig {
             stations: 4,
             ticks: 5,
             baseline: Baseline::SectorSync,
+            requested_planner: PlannerMode::Scalar,
+            planner: PlannerMode::Scalar,
+            requested_parallel_threads: 0,
+            tick_rate_hz: 20,
+            replication_hz: 20,
             requested_profile: "smoke",
             profile_name: "smoke",
             allow_heavy: false,
             heavy_profile_denied: false,
             default_resource_guard_applied: false,
             host_parallelism: 1,
+            payload_materialization: PayloadMaterialization::Sampled,
+            workload_shape: WorkloadShape::Wide,
+            time_budget_ms: None,
             thresholds: BenchThresholds::default(),
         }
     }
@@ -154,7 +233,42 @@ struct BenchStats {
     scheduler_candidates_considered: usize,
     scheduler_stations_selected: usize,
     scheduler_total_advances: usize,
+    parallel_threads: usize,
+    time_budget_exhausted: bool,
+    planning_ms: Vec<f64>,
+    encoding_ms: Vec<f64>,
     tick_ms: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UpdateWork {
+    client_index: usize,
+    server_tick: Tick,
+    updates: usize,
+    entity_limit: usize,
+}
+
+struct EncodedUpdate {
+    packet: OutboundPacket,
+    updates: usize,
+    entity_deltas: usize,
+    component_deltas: usize,
+}
+
+#[cfg(feature = "parallel")]
+struct StationPipelineWork<'a> {
+    station: &'a Station,
+    index: &'a CellIndex,
+    viewers: &'a [ViewerQuery],
+    scratch: &'a mut ReplicationScratch,
+}
+
+#[cfg(feature = "parallel")]
+struct StationPipelineOutput {
+    stats: ReplicationBatchStats,
+    encoded: Vec<EncodedUpdate>,
+    planning_ms: f64,
+    encoding_ms: f64,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -166,6 +280,28 @@ fn main() {
 
     println!("SectorSync benchmark");
     println!("baseline={:?}", config.baseline);
+    println!("requested_planner={:?}", config.requested_planner);
+    println!("planner={:?}", config.planner);
+    println!(
+        "planner_mode_denied={}",
+        config.requested_planner != config.planner
+    );
+    println!("simd_enabled={}", cfg!(feature = "simd"));
+    println!("parallel_enabled={}", cfg!(feature = "parallel"));
+    println!(
+        "requested_parallel_threads={}",
+        config.requested_parallel_threads
+    );
+    println!("parallel_threads={}", stats.parallel_threads);
+    let replication_phases = config.replication_phase_count();
+    println!("tick_rate_hz={}", config.tick_rate_hz);
+    println!("requested_replication_hz={}", config.replication_hz);
+    println!("replication_phases={replication_phases}");
+    println!(
+        "effective_replication_hz={:.3}",
+        f64::from(config.tick_rate_hz)
+            / f64::from(config.tick_rate_hz.div_ceil(config.replication_hz))
+    );
     println!("requested_profile={}", config.requested_profile);
     println!("profile={}", config.profile_name);
     println!("allow_heavy={}", config.allow_heavy);
@@ -175,6 +311,19 @@ fn main() {
         config.default_resource_guard_applied
     );
     println!("host_parallelism={}", config.host_parallelism);
+    println!(
+        "entity_deltas_per_frame_limit={}",
+        config.payload_materialization.entity_limit()
+    );
+    println!(
+        "require_full_payload_materialization={}",
+        config.payload_materialization.requires_full()
+    );
+    println!("workload_shape={:?}", config.workload_shape);
+    println!(
+        "time_budget_ms={}",
+        config.time_budget_ms.map_or(0, |value| value)
+    );
     println!("guard_max_entities={DEFAULT_GUARD_MAX_ENTITIES}");
     println!("guard_max_clients={DEFAULT_GUARD_MAX_CLIENTS}");
     println!("guard_max_stations={DEFAULT_GUARD_MAX_STATIONS}");
@@ -183,6 +332,8 @@ fn main() {
     println!("clients={}", config.clients);
     println!("stations={}", config.stations);
     println!("ticks={}", config.ticks);
+    println!("ticks_completed={}", stats.tick_ms.len());
+    println!("time_budget_exhausted={}", stats.time_budget_exhausted);
     println!("updates={}", stats.updates);
     println!("estimated_payload_bytes={}", stats.estimated_payload_bytes);
     println!("encoded_packets={}", stats.encoded_packets);
@@ -349,7 +500,15 @@ fn main() {
     println!("tick_ms_p95={tick_ms_p95:.3}");
     println!("tick_ms_p99={tick_ms_p99:.3}");
     println!("tick_ms_max={tick_ms_max:.3}");
-    let verdict = BenchVerdict::evaluate(config.thresholds, &stats, tick_ms_p99);
+    print_phase_percentiles("planning_ms", &stats.planning_ms);
+    print_phase_percentiles("encoding_ms", &stats.encoding_ms);
+    println!("tick_128hz_budget_ms={TICK_128_HZ_BUDGET_MS:.4}");
+    println!(
+        "tick_128hz_headroom_ms={:.4}",
+        TICK_128_HZ_BUDGET_MS - tick_ms_p99
+    );
+    println!("tick_128hz_ok={}", tick_ms_p99 <= TICK_128_HZ_BUDGET_MS);
+    let verdict = BenchVerdict::evaluate(config, &stats, tick_ms_p99);
     println!("threshold_tick_ms_p99={:.3}", config.thresholds.tick_ms_p99);
     println!(
         "threshold_command_latency_ticks_max={}",
@@ -395,8 +554,24 @@ fn main() {
         verdict.router_delivery_ok
     );
     println!("threshold_client_bridge_ok={}", verdict.client_bridge_ok);
+    println!(
+        "threshold_payload_materialization_ok={}",
+        verdict.payload_materialization_ok
+    );
+    println!(
+        "threshold_workload_completed_ok={}",
+        verdict.workload_completed_ok
+    );
+    println!("threshold_planner_mode_ok={}", verdict.planner_mode_ok);
+    println!(
+        "threshold_profile_admitted_ok={}",
+        verdict.profile_admitted_ok
+    );
     println!("benchmark_ok={}", verdict.is_ok());
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
+    if !verdict.is_ok() {
+        std::process::exit(1);
+    }
 }
 
 impl BenchStats {
@@ -422,11 +597,16 @@ struct BenchVerdict {
     command_delivery_ok: bool,
     router_delivery_ok: bool,
     client_bridge_ok: bool,
+    payload_materialization_ok: bool,
+    workload_completed_ok: bool,
+    planner_mode_ok: bool,
+    profile_admitted_ok: bool,
 }
 
 impl BenchVerdict {
-    fn evaluate(thresholds: BenchThresholds, stats: &BenchStats, tick_ms_p99: f64) -> Self {
+    fn evaluate(config: BenchConfig, stats: &BenchStats, tick_ms_p99: f64) -> Self {
         let expected_client_bridge_frames = stats.client_bridge_commands_sent;
+        let thresholds = config.thresholds;
         Self {
             tick_ok: tick_ms_p99 <= thresholds.tick_ms_p99,
             command_latency_ok: stats.command_latency_ticks_max
@@ -449,6 +629,14 @@ impl BenchVerdict {
                 && stats.client_bridge_gateway_commands_applied == expected_client_bridge_frames
                 && stats.client_bridge_acks_received == expected_client_bridge_frames
                 && stats.client_bridge_replication_frames_received == expected_client_bridge_frames,
+            payload_materialization_ok: !config.payload_materialization.requires_full()
+                || stats.payload_entity_deltas == stats.updates,
+            workload_completed_ok: !stats.time_budget_exhausted
+                && !stats.tick_ms.is_empty()
+                && stats.tick_ms.len() == config.ticks
+                && stats.encoded_packets > 0,
+            planner_mode_ok: config.requested_planner == config.planner,
+            profile_admitted_ok: !config.heavy_profile_denied,
         }
     }
 
@@ -462,6 +650,10 @@ impl BenchVerdict {
             && self.command_delivery_ok
             && self.router_delivery_ok
             && self.client_bridge_ok
+            && self.payload_materialization_ok
+            && self.workload_completed_ok
+            && self.planner_mode_ok
+            && self.profile_admitted_ok
     }
 }
 
@@ -470,19 +662,20 @@ impl BenchConfig {
         Self::from_args_with_host(args, HostResources::detect())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_args_with_host(args: impl Iterator<Item = String>, host: HostResources) -> Self {
         let args = args.collect::<Vec<_>>();
         let allow_heavy = args.iter().any(|arg| arg == "--allow-heavy");
         let mut config = Self::smoke(host, allow_heavy);
         for arg in args {
             if let Some(value) = arg.strip_prefix("--entities=") {
-                config.entities = value.parse().unwrap_or(config.entities);
+                config.entities = value.parse().unwrap_or(config.entities).max(1);
             } else if let Some(value) = arg.strip_prefix("--clients=") {
-                config.clients = value.parse().unwrap_or(config.clients);
+                config.clients = value.parse().unwrap_or(config.clients).max(1);
             } else if let Some(value) = arg.strip_prefix("--stations=") {
                 config.stations = value.parse().unwrap_or(config.stations).max(1);
             } else if let Some(value) = arg.strip_prefix("--ticks=") {
-                config.ticks = value.parse().unwrap_or(config.ticks);
+                config.ticks = value.parse().unwrap_or(config.ticks).max(1);
             } else if let Some(value) = arg.strip_prefix("--baseline=") {
                 config.baseline = match value {
                     "full" => Baseline::FullBroadcast,
@@ -491,11 +684,28 @@ impl BenchConfig {
                     "sectorsync" => Baseline::SectorSync,
                     _ => config.baseline,
                 };
+            } else if let Some(value) = arg.strip_prefix("--planner=") {
+                config.requested_planner = match value {
+                    "scalar" => PlannerMode::Scalar,
+                    "batch" => PlannerMode::Batch,
+                    "parallel" => PlannerMode::Parallel,
+                    _ => config.requested_planner,
+                };
+            } else if let Some(value) = arg.strip_prefix("--threads=") {
+                config.requested_parallel_threads =
+                    value.parse().unwrap_or(config.requested_parallel_threads);
+            } else if let Some(value) = arg.strip_prefix("--tick-rate-hz=") {
+                config.tick_rate_hz = value.parse().unwrap_or(config.tick_rate_hz);
+            } else if let Some(value) = arg.strip_prefix("--replication-hz=") {
+                config.replication_hz = value.parse().unwrap_or(config.replication_hz);
             } else if let Some(value) = arg.strip_prefix("--profile=") {
                 match value {
                     "smoke" => {
                         config = Self::smoke(host, allow_heavy);
                         config.requested_profile = "smoke";
+                    }
+                    "local" => {
+                        config = Self::local(host, allow_heavy);
                     }
                     "medium" => {
                         config.requested_profile = "medium";
@@ -552,6 +762,10 @@ impl BenchConfig {
                     .unwrap_or(config.thresholds.estimated_payload_bytes);
             }
         }
+        config.resolve_planner();
+        config.tick_rate_hz = config.tick_rate_hz.max(1);
+        config.replication_hz = config.replication_hz.clamp(1, config.tick_rate_hz);
+        config.apply_local_resource_guard();
         config.apply_default_resource_guard();
         config
     }
@@ -564,18 +778,70 @@ impl BenchConfig {
         }
     }
 
+    fn local(host: HostResources, allow_heavy: bool) -> Self {
+        let mut config = Self::smoke(host, allow_heavy);
+        config.requested_profile = "local";
+        if allow_heavy {
+            config.profile_name = "local";
+            config.entities = host
+                .parallelism
+                .saturating_mul(2_000)
+                .clamp(8_000, LOCAL_MAX_ENTITIES);
+            config.clients = host
+                .parallelism
+                .saturating_mul(40)
+                .clamp(160, LOCAL_MAX_CLIENTS);
+            config.stations = host.parallelism.clamp(4, LOCAL_MAX_STATIONS);
+            config.ticks = LOCAL_TICKS;
+            config.payload_materialization = PayloadMaterialization::Full;
+            config.workload_shape = WorkloadShape::Dense;
+            config.time_budget_ms = Some(LOCAL_TIME_BUDGET_MS);
+            config.tick_rate_hz = 128;
+            config.replication_hz = 128;
+            config.thresholds.estimated_payload_bytes = 512 * 1024 * 1024;
+        } else {
+            config.heavy_profile_denied = true;
+        }
+        config
+    }
+
     fn apply_default_resource_guard(&mut self) {
         if self.allow_heavy {
             return;
         }
 
         let before = (self.entities, self.clients, self.stations, self.ticks);
-        self.entities = self.entities.min(DEFAULT_GUARD_MAX_ENTITIES);
-        self.clients = self.clients.min(DEFAULT_GUARD_MAX_CLIENTS);
+        self.entities = self.entities.clamp(1, DEFAULT_GUARD_MAX_ENTITIES);
+        self.clients = self.clients.clamp(1, DEFAULT_GUARD_MAX_CLIENTS);
         self.stations = self.stations.clamp(1, DEFAULT_GUARD_MAX_STATIONS);
-        self.ticks = self.ticks.min(DEFAULT_GUARD_MAX_TICKS);
+        self.ticks = self.ticks.clamp(1, DEFAULT_GUARD_MAX_TICKS);
         self.default_resource_guard_applied =
             before != (self.entities, self.clients, self.stations, self.ticks);
+    }
+
+    fn apply_local_resource_guard(&mut self) {
+        if self.profile_name != "local" {
+            return;
+        }
+
+        let before = (self.entities, self.clients, self.stations, self.ticks);
+        self.entities = self.entities.clamp(1, LOCAL_MAX_ENTITIES);
+        self.clients = self.clients.clamp(1, LOCAL_MAX_CLIENTS);
+        self.stations = self.stations.clamp(1, LOCAL_MAX_STATIONS);
+        self.ticks = self.ticks.clamp(1, LOCAL_TICKS);
+        self.default_resource_guard_applied |=
+            before != (self.entities, self.clients, self.stations, self.ticks);
+    }
+
+    fn resolve_planner(&mut self) {
+        self.planner = match self.requested_planner {
+            PlannerMode::Parallel if !cfg!(feature = "parallel") => PlannerMode::Scalar,
+            requested => requested,
+        };
+    }
+
+    fn replication_phase_count(self) -> usize {
+        usize::from(self.tick_rate_hz.div_ceil(self.replication_hz))
     }
 }
 
@@ -595,21 +861,41 @@ impl HostResources {
 
 #[allow(clippy::too_many_lines)]
 fn run(config: BenchConfig) -> BenchStats {
-    let mut stations = create_stations(config.stations);
+    let run_start = Instant::now();
+    let mut stations = create_stations(config.stations, config.tick_rate_hz);
     let mut indexes = create_indexes(config.stations);
     let policies = create_policies();
-    populate_entities(config.entities, &mut stations, &mut indexes);
-    let clients = create_clients(config.clients);
+    populate_entities(
+        config.entities,
+        config.workload_shape,
+        &mut stations,
+        &mut indexes,
+    );
+    let clients = create_clients(config.clients, config.workload_shape);
+    let viewer_schedules =
+        create_viewer_schedules(&clients, config.stations, config.replication_phase_count());
 
     let mut stats = BenchStats::default();
     let load_samples = apply_hotspot_report(&mut stats, config, &stations, &indexes);
     apply_scheduler_report(&mut stats, config, &load_samples);
-    let mut encoder = BinaryFrameEncoder;
     let mut transport = FakeTransport::default();
     let mut command_queues = create_command_queues(config.stations);
     let mut dispatch = DispatchBench::new(config);
     let mut client_bridge = ClientBridgeBench::new(config);
     let mut replication_scratch = ReplicationScratch::default();
+    let mut batch_scratch = vec![ReplicationScratch::default(); config.stations];
+    #[cfg(feature = "parallel")]
+    let parallel_pool = if config.planner == PlannerMode::Parallel {
+        let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(
+            config.requested_parallel_threads,
+            8,
+        ))
+        .expect("benchmark replication pool should build");
+        stats.parallel_threads = pool.threads();
+        Some(pool)
+    } else {
+        None
+    };
     let mut next_command_id = 1_u64;
     let mut next_event_id = 1_u64;
     let mut event_router = EventRouter::new(EventQueueLimits {
@@ -622,6 +908,13 @@ fn run(config: BenchConfig) -> BenchStats {
     }
 
     for tick_index in 0..config.ticks {
+        if config
+            .time_budget_ms
+            .is_some_and(|budget| run_start.elapsed() >= Duration::from_millis(budget))
+        {
+            stats.time_budget_exhausted = true;
+            break;
+        }
         let tick_start = Instant::now();
         for station in &mut stations {
             station.advance_tick();
@@ -651,103 +944,144 @@ fn run(config: BenchConfig) -> BenchStats {
             &mut next_command_id,
             &mut stats,
         );
+        let viewer_batches = &viewer_schedules[tick_index % viewer_schedules.len()];
 
-        for (client_index, viewer_position) in clients.iter().copied().enumerate() {
-            let station_index = client_index % stations.len();
-            let station = &stations[station_index];
-            let updates = match config.baseline {
-                Baseline::FullBroadcast => config.entities,
-                Baseline::RoomBroadcast => config.entities / stations.len(),
-                Baseline::NaiveGrid => indexes[station_index]
-                    .query_sphere(viewer_position, 256.0)
-                    .len(),
-                Baseline::SectorSync => {
-                    let viewer = ViewerQuery {
-                        client_id: ClientId::new(client_index as u64),
-                        position: viewer_position,
-                        radius: 256.0,
-                        max_entities: 300,
-                    };
-                    let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
-                        station,
-                        &indexes[station_index],
-                        &policies,
-                        &viewer,
-                        &RangeOnlyVisibility,
-                        ReplicationBudget::default(),
-                        &mut replication_scratch,
-                    );
-                    stats.replication_scratch_queries =
-                        stats.replication_scratch_queries.saturating_add(1);
-                    stats.replication_scratch_candidates = stats
-                        .replication_scratch_candidates
-                        .saturating_add(replication_scratch.candidate_count());
-                    let query_stats = replication_scratch.query_stats();
-                    match query_stats.strategy {
-                        CellQueryStrategy::Grid => {
-                            stats.replication_scratch_grid_queries =
-                                stats.replication_scratch_grid_queries.saturating_add(1);
+        match config.baseline {
+            Baseline::SectorSync => {
+                if config.planner == PlannerMode::Parallel {
+                    #[cfg(feature = "parallel")]
+                    {
+                        let outputs = run_parallel_station_pipeline(
+                            parallel_pool
+                                .as_ref()
+                                .expect("parallel planner requires explicit pool"),
+                            &stations,
+                            &indexes,
+                            viewer_batches,
+                            &policies,
+                            &mut batch_scratch,
+                            config.payload_materialization.entity_limit(),
+                        );
+                        let planning_ms = outputs
+                            .iter()
+                            .map(|output| output.planning_ms)
+                            .fold(0.0_f64, f64::max);
+                        let encoding_ms = outputs
+                            .iter()
+                            .map(|output| output.encoding_ms)
+                            .fold(0.0_f64, f64::max);
+                        stats.planning_ms.push(planning_ms);
+                        stats.encoding_ms.push(encoding_ms);
+                        let mut encoded = Vec::with_capacity(config.clients);
+                        for output in outputs {
+                            record_replication_batch_stats(&mut stats, output.stats);
+                            encoded.extend(output.encoded);
                         }
-                        CellQueryStrategy::OccupiedCells => {
-                            stats.replication_scratch_occupied_queries =
-                                stats.replication_scratch_occupied_queries.saturating_add(1);
+                        submit_encoded_updates(&mut stats, &mut transport, encoded);
+                    }
+                    #[cfg(not(feature = "parallel"))]
+                    unreachable!("parallel planner is resolved away without its feature");
+                } else {
+                    let planning_start = Instant::now();
+                    let planned_batches = match config.planner {
+                        PlannerMode::Scalar => stations
+                            .iter()
+                            .zip(&indexes)
+                            .zip(viewer_batches)
+                            .map(|((station, index), viewers)| {
+                                ReplicationPlanner::plan_for_viewers_with_scratch(
+                                    station,
+                                    index,
+                                    &policies,
+                                    viewers,
+                                    &RangeOnlyVisibility,
+                                    ReplicationBudget::default(),
+                                    &mut replication_scratch,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        PlannerMode::Batch => stations
+                            .iter()
+                            .zip(&indexes)
+                            .zip(viewer_batches)
+                            .zip(&mut batch_scratch)
+                            .map(|(((station, index), viewers), scratch)| {
+                                ReplicationPlanner::plan_for_viewers_range_with_scratch(
+                                    station,
+                                    index,
+                                    &policies,
+                                    viewers,
+                                    ReplicationBudget::default(),
+                                    scratch,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        PlannerMode::Parallel => unreachable!(),
+                    };
+                    stats
+                        .planning_ms
+                        .push(planning_start.elapsed().as_secs_f64() * 1000.0);
+                    let encoding_start = Instant::now();
+                    let mut work = Vec::with_capacity(config.clients);
+                    for (station_index, batch) in planned_batches.iter().enumerate() {
+                        record_replication_batch_stats(&mut stats, batch.stats);
+                        for (viewer, plan) in viewer_batches[station_index].iter().zip(&batch.plans)
+                        {
+                            let client_index = usize::try_from(viewer.client_id.get())
+                                .expect("benchmark client id fits usize");
+                            work.push(UpdateWork {
+                                client_index,
+                                server_tick: stations[station_index].tick(),
+                                updates: plan.stats.selected,
+                                entity_limit: config.payload_materialization.entity_limit(),
+                            });
                         }
                     }
-                    stats.replication_scratch_grid_cells_probed = stats
-                        .replication_scratch_grid_cells_probed
-                        .saturating_add(query_stats.grid_cells_probed);
-                    stats.replication_scratch_occupied_cells_scanned = stats
-                        .replication_scratch_occupied_cells_scanned
-                        .saturating_add(query_stats.occupied_cells_scanned);
-                    stats.replication_scratch_matched_cells = stats
-                        .replication_scratch_matched_cells
-                        .saturating_add(query_stats.matched_cells);
-                    stats.replication_scratch_candidate_capacity_max = stats
-                        .replication_scratch_candidate_capacity_max
-                        .max(replication_scratch.candidate_capacity());
-                    stats.replication_scratch_dedup_capacity_max = stats
-                        .replication_scratch_dedup_capacity_max
-                        .max(replication_scratch.candidate_dedup_capacity());
-                    stats.replication_scratch_matching_cell_capacity_max = stats
-                        .replication_scratch_matching_cell_capacity_max
-                        .max(replication_scratch.matching_cell_capacity());
-                    stats.replication_scratch_priority_capacity_max = stats
-                        .replication_scratch_priority_capacity_max
-                        .max(replication_scratch.prioritized_capacity());
-                    plan.stats.selected
+                    let encoded = encode_update_batch(config.planner, work);
+                    submit_encoded_updates(&mut stats, &mut transport, encoded);
+                    stats
+                        .encoding_ms
+                        .push(encoding_start.elapsed().as_secs_f64() * 1000.0);
                 }
-            };
-
-            stats.updates += updates;
-            stats.replication_candidates_selected = stats
-                .replication_candidates_selected
-                .saturating_add(updates);
-            stats.estimated_payload_bytes += updates * 32;
-            let entity_deltas = build_sample_deltas(updates, client_index, station.tick());
-            stats.payload_entity_deltas += entity_deltas.len();
-            stats.payload_component_deltas += entity_deltas
-                .iter()
-                .map(|delta| delta.components.len())
-                .sum::<usize>();
-
-            let frame = ReplicationFrame {
-                client_id: ClientId::new(client_index as u64),
-                server_tick: station.tick(),
-                entity_count: u32::try_from(updates).unwrap_or(u32::MAX),
-                estimated_payload_bytes: u32::try_from(updates.saturating_mul(32))
-                    .unwrap_or(u32::MAX),
-                entities: entity_deltas,
-            };
-            let mut bytes = Vec::with_capacity(32);
-            encoder
-                .encode_replication(&frame, &mut bytes)
-                .expect("binary encoder is infallible");
-            transport
-                .send(OutboundPacket {
-                    client_id: frame.client_id,
-                    bytes,
-                })
-                .expect("fake transport is infallible");
+            }
+            baseline => {
+                let planning_start = Instant::now();
+                let updates = clients
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(client_index, viewer_position)| {
+                        let station_index = client_index % stations.len();
+                        let updates = match baseline {
+                            Baseline::FullBroadcast => config.entities,
+                            Baseline::RoomBroadcast => config.entities / stations.len(),
+                            Baseline::NaiveGrid => indexes[station_index]
+                                .query_sphere(viewer_position, WorkloadShape::viewer_radius())
+                                .len(),
+                            Baseline::SectorSync => unreachable!(),
+                        };
+                        (client_index, station_index, updates)
+                    })
+                    .collect::<Vec<_>>();
+                stats
+                    .planning_ms
+                    .push(planning_start.elapsed().as_secs_f64() * 1000.0);
+                let encoding_start = Instant::now();
+                let work = updates
+                    .into_iter()
+                    .map(|(client_index, station_index, updates)| UpdateWork {
+                        client_index,
+                        server_tick: stations[station_index].tick(),
+                        updates,
+                        entity_limit: config.payload_materialization.entity_limit(),
+                    })
+                    .collect();
+                let encoded = encode_update_batch(config.planner, work);
+                submit_encoded_updates(&mut stats, &mut transport, encoded);
+                stats
+                    .encoding_ms
+                    .push(encoding_start.elapsed().as_secs_f64() * 1000.0);
+            }
         }
 
         apply_commands(&mut command_queues, &stations, &mut stats);
@@ -765,8 +1099,192 @@ fn run(config: BenchConfig) -> BenchStats {
     stats
 }
 
-fn build_sample_deltas(update_count: usize, client_index: usize, tick: Tick) -> Vec<EntityDelta> {
-    let sample_count = update_count.min(16);
+fn create_viewer_schedules(
+    clients: &[Position3],
+    stations: usize,
+    phases: usize,
+) -> Vec<Vec<Vec<ViewerQuery>>> {
+    let mut schedules = vec![vec![Vec::new(); stations]; phases];
+    for (client_index, position) in clients.iter().copied().enumerate() {
+        let station_index = client_index % stations;
+        let phase = (client_index / stations) % phases;
+        schedules[phase][station_index].push(ViewerQuery {
+            client_id: ClientId::new(client_index as u64),
+            position,
+            radius: WorkloadShape::viewer_radius(),
+            max_entities: 300,
+        });
+    }
+    schedules
+}
+
+fn record_replication_batch_stats(stats: &mut BenchStats, batch: ReplicationBatchStats) {
+    stats.replication_scratch_queries = stats
+        .replication_scratch_queries
+        .saturating_add(batch.viewers);
+    stats.replication_scratch_candidates = stats
+        .replication_scratch_candidates
+        .saturating_add(batch.candidates);
+    stats.replication_scratch_grid_queries = stats
+        .replication_scratch_grid_queries
+        .saturating_add(batch.grid_queries);
+    stats.replication_scratch_occupied_queries = stats
+        .replication_scratch_occupied_queries
+        .saturating_add(batch.occupied_queries);
+    stats.replication_scratch_grid_cells_probed = stats
+        .replication_scratch_grid_cells_probed
+        .saturating_add(batch.grid_cells_probed);
+    stats.replication_scratch_occupied_cells_scanned = stats
+        .replication_scratch_occupied_cells_scanned
+        .saturating_add(batch.occupied_cells_scanned);
+    stats.replication_scratch_matched_cells = stats
+        .replication_scratch_matched_cells
+        .saturating_add(batch.matched_cells);
+    stats.replication_scratch_candidate_capacity_max = stats
+        .replication_scratch_candidate_capacity_max
+        .max(batch.candidate_capacity_max);
+    stats.replication_scratch_dedup_capacity_max = stats
+        .replication_scratch_dedup_capacity_max
+        .max(batch.dedup_capacity_max);
+    stats.replication_scratch_matching_cell_capacity_max = stats
+        .replication_scratch_matching_cell_capacity_max
+        .max(batch.matching_cell_capacity_max);
+    stats.replication_scratch_priority_capacity_max = stats
+        .replication_scratch_priority_capacity_max
+        .max(batch.priority_capacity_max);
+}
+
+#[cfg(feature = "parallel")]
+fn run_parallel_station_pipeline(
+    pool: &ReplicationThreadPool,
+    stations: &[Station],
+    indexes: &[CellIndex],
+    viewer_batches: &[Vec<ViewerQuery>],
+    policies: &PolicyTable,
+    scratch: &mut [ReplicationScratch],
+    entity_limit: usize,
+) -> Vec<StationPipelineOutput> {
+    let work = stations
+        .iter()
+        .zip(indexes)
+        .zip(viewer_batches)
+        .zip(scratch)
+        .map(
+            |(((station, index), viewers), scratch)| StationPipelineWork {
+                station,
+                index,
+                viewers,
+                scratch,
+            },
+        )
+        .collect();
+    pool.map_ordered(work, |work| {
+        let planning_start = Instant::now();
+        let batch = ReplicationPlanner::plan_for_viewers_range_with_scratch(
+            work.station,
+            work.index,
+            policies,
+            work.viewers,
+            ReplicationBudget::default(),
+            work.scratch,
+        );
+        let planning_ms = planning_start.elapsed().as_secs_f64() * 1000.0;
+        let encoding_start = Instant::now();
+        let encoded = work
+            .viewers
+            .iter()
+            .zip(&batch.plans)
+            .map(|(viewer, plan)| {
+                encode_update(UpdateWork {
+                    client_index: usize::try_from(viewer.client_id.get())
+                        .expect("benchmark client id fits usize"),
+                    server_tick: work.station.tick(),
+                    updates: plan.stats.selected,
+                    entity_limit,
+                })
+            })
+            .collect();
+        StationPipelineOutput {
+            stats: batch.stats,
+            encoded,
+            planning_ms,
+            encoding_ms: encoding_start.elapsed().as_secs_f64() * 1000.0,
+        }
+    })
+}
+
+fn encode_update_batch(_planner: PlannerMode, work: Vec<UpdateWork>) -> Vec<EncodedUpdate> {
+    work.into_iter().map(encode_update).collect()
+}
+
+fn encode_update(work: UpdateWork) -> EncodedUpdate {
+    let entity_deltas = build_sample_deltas(
+        work.updates,
+        work.client_index,
+        work.server_tick,
+        work.entity_limit,
+    );
+    let entity_delta_count = entity_deltas.len();
+    let component_delta_count = entity_deltas
+        .iter()
+        .map(|delta| delta.components.len())
+        .sum();
+    let frame = ReplicationFrame {
+        client_id: ClientId::new(work.client_index as u64),
+        server_tick: work.server_tick,
+        entity_count: u32::try_from(work.updates).unwrap_or(u32::MAX),
+        estimated_payload_bytes: u32::try_from(work.updates.saturating_mul(32)).unwrap_or(u32::MAX),
+        entities: entity_deltas,
+    };
+    let mut bytes = Vec::with_capacity(32);
+    BinaryFrameEncoder
+        .encode_replication(&frame, &mut bytes)
+        .expect("binary encoder is infallible");
+    EncodedUpdate {
+        packet: OutboundPacket {
+            client_id: frame.client_id,
+            bytes,
+        },
+        updates: work.updates,
+        entity_deltas: entity_delta_count,
+        component_deltas: component_delta_count,
+    }
+}
+
+fn submit_encoded_updates(
+    stats: &mut BenchStats,
+    transport: &mut FakeTransport,
+    encoded: Vec<EncodedUpdate>,
+) {
+    let mut batch = PacketBatch::new();
+    for update in encoded {
+        stats.updates = stats.updates.saturating_add(update.updates);
+        stats.replication_candidates_selected = stats
+            .replication_candidates_selected
+            .saturating_add(update.updates);
+        stats.estimated_payload_bytes = stats
+            .estimated_payload_bytes
+            .saturating_add(update.updates.saturating_mul(32));
+        stats.payload_entity_deltas = stats
+            .payload_entity_deltas
+            .saturating_add(update.entity_deltas);
+        stats.payload_component_deltas = stats
+            .payload_component_deltas
+            .saturating_add(update.component_deltas);
+        batch.push(update.packet);
+    }
+    transport
+        .send_batch(batch)
+        .expect("fake transport batch is infallible");
+}
+
+fn build_sample_deltas(
+    update_count: usize,
+    client_index: usize,
+    tick: Tick,
+    entity_limit: usize,
+) -> Vec<EntityDelta> {
+    let sample_count = update_count.min(entity_limit);
     (0..sample_count)
         .map(|offset| {
             let entity_id = EntityId::new(((client_index * 31) + offset) as u64);
@@ -800,7 +1318,14 @@ fn percentile_ms(values: &[f64], percentile: f64) -> f64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
-fn create_stations(count: usize) -> Vec<Station> {
+fn print_phase_percentiles(name: &str, values: &[f64]) {
+    println!("{name}_p50={:.3}", percentile_ms(values, 0.50));
+    println!("{name}_p95={:.3}", percentile_ms(values, 0.95));
+    println!("{name}_p99={:.3}", percentile_ms(values, 0.99));
+    println!("{name}_max={:.3}", percentile_ms(values, 1.00));
+}
+
+fn create_stations(count: usize, tick_rate_hz: u16) -> Vec<Station> {
     (0..count)
         .map(|index| {
             Station::new(StationConfig {
@@ -809,7 +1334,7 @@ fn create_stations(count: usize) -> Vec<Station> {
                 ),
                 node_id: NodeId::new(u32::try_from(index % 4).expect("node shard must fit in u32")),
                 instance_id: InstanceId::new(1),
-                tick_rate_hz: 20,
+                tick_rate_hz,
             })
         })
         .collect()
@@ -1058,7 +1583,7 @@ fn exercise_client_bridge(
             server_tick: tick,
             entity_count: 1,
             estimated_payload_bytes: 4,
-            entities: build_sample_deltas(1, client_index, tick),
+            entities: build_sample_deltas(1, client_index, tick, 1),
         };
         let mut replication_bytes = Vec::new();
         encoder
@@ -1258,14 +1783,21 @@ fn apply_commands(
     }
 }
 
-fn populate_entities(count: usize, stations: &mut [Station], indexes: &mut [CellIndex]) {
+fn populate_entities(
+    count: usize,
+    shape: WorkloadShape,
+    stations: &mut [Station],
+    indexes: &mut [CellIndex],
+) {
     let mut rng = Lcg::new(0x5E_C7_0C);
+    let horizontal_extent = shape.horizontal_extent();
+    let vertical_extent = shape.vertical_extent();
     for entity_index in 0..count {
         let station_index = entity_index % stations.len();
         let position = Position3::new(
-            rng.next_range(-5_000.0, 5_000.0),
-            rng.next_range(-500.0, 500.0),
-            rng.next_range(-5_000.0, 5_000.0),
+            rng.next_range(-horizontal_extent, horizontal_extent),
+            rng.next_range(-vertical_extent, vertical_extent),
+            rng.next_range(-horizontal_extent, horizontal_extent),
         );
         let bounds = if entity_index % 97 == 0 {
             Bounds::Aabb {
@@ -1352,7 +1884,7 @@ fn apply_scheduler_report(
     samples: &[StationLoadSample],
 ) {
     let mut stations = StationSet::default();
-    for station in create_stations(config.stations) {
+    for station in create_stations(config.stations, config.tick_rate_hz) {
         stations.push(station);
     }
     let plan = StationScheduler::default().plan_loaded(
@@ -1423,14 +1955,16 @@ fn hotspot_thresholds(config: BenchConfig) -> HotspotThresholds {
     }
 }
 
-fn create_clients(count: usize) -> Vec<Position3> {
+fn create_clients(count: usize, shape: WorkloadShape) -> Vec<Position3> {
     let mut rng = Lcg::new(0xC1_13_17);
+    let horizontal_extent = shape.horizontal_extent();
+    let vertical_extent = shape.vertical_extent();
     (0..count)
         .map(|_| {
             Position3::new(
-                rng.next_range(-5_000.0, 5_000.0),
-                rng.next_range(-500.0, 500.0),
-                rng.next_range(-5_000.0, 5_000.0),
+                rng.next_range(-horizontal_extent, horizontal_extent),
+                rng.next_range(-vertical_extent, vertical_extent),
+                rng.next_range(-horizontal_extent, horizontal_extent),
             )
         })
         .collect()
@@ -1508,6 +2042,18 @@ mod tests {
     }
 
     #[test]
+    fn custom_scale_cannot_disable_benchmark_work() {
+        let config = BenchConfig::from_args_with_host(
+            args(&["--entities=0", "--clients=0", "--ticks=0"]),
+            HostResources { parallelism: 4 },
+        );
+
+        assert_eq!(config.entities, 1);
+        assert_eq!(config.clients, 1);
+        assert_eq!(config.ticks, 1);
+    }
+
+    #[test]
     fn allow_heavy_admits_large_profile() {
         let config = BenchConfig::from_args_with_host(
             args(&["--profile=large", "--allow-heavy"]),
@@ -1521,6 +2067,82 @@ mod tests {
         assert!(!config.default_resource_guard_applied);
         assert_eq!(config.entities, 1_000_000);
         assert_eq!(config.clients, 10_000);
+    }
+
+    #[test]
+    fn local_profile_is_gated_and_scales_to_the_current_host_cap() {
+        let denied = BenchConfig::from_args_with_host(
+            args(&["--profile=local"]),
+            HostResources { parallelism: 12 },
+        );
+        assert_eq!(denied.requested_profile, "local");
+        assert_eq!(denied.profile_name, "smoke");
+        assert!(denied.heavy_profile_denied);
+
+        let config = BenchConfig::from_args_with_host(
+            args(&["--profile=local", "--allow-heavy"]),
+            HostResources { parallelism: 12 },
+        );
+        assert_eq!(config.profile_name, "local");
+        assert_eq!(config.entities, LOCAL_MAX_ENTITIES);
+        assert_eq!(config.clients, LOCAL_MAX_CLIENTS);
+        assert_eq!(config.stations, LOCAL_MAX_STATIONS);
+        assert_eq!(config.ticks, LOCAL_TICKS);
+        assert_eq!(config.payload_materialization, PayloadMaterialization::Full);
+        assert_eq!(config.workload_shape, WorkloadShape::Dense);
+        assert_eq!(config.time_budget_ms, Some(LOCAL_TIME_BUDGET_MS));
+        assert_eq!(config.tick_rate_hz, 128);
+        assert_eq!(config.replication_hz, 128);
+    }
+
+    #[test]
+    fn local_profile_clamps_manual_overrides_even_with_allow_heavy() {
+        let config = BenchConfig::from_args_with_host(
+            args(&[
+                "--profile=local",
+                "--allow-heavy",
+                "--entities=1000000",
+                "--clients=10000",
+                "--stations=64",
+                "--ticks=100",
+            ]),
+            HostResources { parallelism: 12 },
+        );
+
+        assert_eq!(config.entities, LOCAL_MAX_ENTITIES);
+        assert_eq!(config.clients, LOCAL_MAX_CLIENTS);
+        assert_eq!(config.stations, LOCAL_MAX_STATIONS);
+        assert_eq!(config.ticks, LOCAL_TICKS);
+        assert!(config.default_resource_guard_applied);
+    }
+
+    #[test]
+    fn replication_rate_builds_balanced_station_phases() {
+        let config = BenchConfig::from_args_with_host(
+            args(&["--profile=local", "--allow-heavy", "--replication-hz=32"]),
+            HostResources { parallelism: 12 },
+        );
+        let clients = create_clients(32, WorkloadShape::Dense);
+        let schedules = create_viewer_schedules(&clients, 4, config.replication_phase_count());
+
+        assert_eq!(config.replication_phase_count(), 4);
+        assert_eq!(schedules.len(), 4);
+        assert!(schedules.iter().flatten().all(|viewers| viewers.len() == 2));
+    }
+
+    #[test]
+    fn parallel_planner_request_matches_compile_time_availability() {
+        let config = BenchConfig::from_args_with_host(
+            args(&["--planner=parallel"]),
+            HostResources { parallelism: 4 },
+        );
+
+        assert_eq!(config.requested_planner, PlannerMode::Parallel);
+        if cfg!(feature = "parallel") {
+            assert_eq!(config.planner, PlannerMode::Parallel);
+        } else {
+            assert_eq!(config.planner, PlannerMode::Scalar);
+        }
     }
 
     #[test]
@@ -1541,10 +2163,24 @@ mod tests {
             ..BenchStats::default()
         };
 
-        let verdict = BenchVerdict::evaluate(BenchThresholds::default(), &stats, 0.0);
+        let verdict = BenchVerdict::evaluate(BenchConfig::default(), &stats, 0.0);
 
         assert!(!verdict.command_queue_drops_ok);
         assert!(!verdict.router_event_drops_ok);
+        assert!(!verdict.is_ok());
+    }
+
+    #[test]
+    fn denied_profile_fails_the_benchmark_verdict() {
+        let config = BenchConfig {
+            heavy_profile_denied: true,
+            ..BenchConfig::default()
+        };
+        let stats = BenchStats::default();
+
+        let verdict = BenchVerdict::evaluate(config, &stats, 0.0);
+
+        assert!(!verdict.profile_admitted_ok);
         assert!(!verdict.is_ok());
     }
 
@@ -1579,5 +2215,23 @@ mod tests {
         assert_eq!(stats.scheduler_candidates_considered, 2);
         assert_eq!(stats.scheduler_stations_selected, 2);
         assert_eq!(stats.scheduler_total_advances, 2);
+    }
+
+    #[test]
+    fn full_payload_run_materializes_every_selected_update() {
+        let config = BenchConfig {
+            entities: 64,
+            clients: 8,
+            stations: 2,
+            ticks: 2,
+            payload_materialization: PayloadMaterialization::Full,
+            ..BenchConfig::default()
+        };
+        let stats = run(config);
+        let verdict = BenchVerdict::evaluate(config, &stats, percentile_ms(&stats.tick_ms, 0.99));
+
+        assert_eq!(stats.payload_entity_deltas, stats.updates);
+        assert!(verdict.payload_materialization_ok);
+        assert!(verdict.workload_completed_ok);
     }
 }

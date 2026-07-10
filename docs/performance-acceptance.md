@@ -38,6 +38,10 @@ collect OS metrics or change the middleware execution model.
 | Command delivery conservation | enqueue/dispatch/apply counters | all accepted workload commands reach apply | `threshold_command_delivery_ok` |
 | Router delivery conservation | routed/drained/drop counters | routed equals drained plus dropped | `threshold_router_delivery_ok` |
 | Client/gateway bridge roundtrip | command/ACK/replication bridge counters | all sampled commands ACK and all sampled frames arrive | `threshold_client_bridge_ok` |
+| Complete payload materialization | selected/materialized delta counters | full profiles materialize every selected delta | `threshold_payload_materialization_ok` |
+| Complete non-empty workload | completed ticks, packets, time budget | all requested ticks and encoded packets complete within budget | `threshold_workload_completed_ok` |
+| Requested planner available | requested/applied planner mode | requested mode is compiled and applied | `threshold_planner_mode_ok` |
+| Requested profile admitted | requested/applied profile and heavy guard | guarded profiles require `--allow-heavy` | `threshold_profile_admitted_ok` |
 
 `benchmark_ok` is the conjunction of every verdict field above. Override
 thresholds only when a benchmark scenario has a documented reason:
@@ -58,11 +62,11 @@ Every acceptance run records these field groups:
 
 | Area | Fields |
 | --- | --- |
-| Workload/guard | `requested_profile`, `profile`, `allow_heavy`, `heavy_profile_denied`, `default_resource_guard_applied`, guard limits, entity/client/station/tick counts |
-| Tick latency | `tick_ms_p50`, `tick_ms_p95`, `tick_ms_p99`, `tick_ms_max`, `elapsed_ms` |
+| Workload/guard | profile/guard fields, planner request/applied mode, SIMD/parallel availability, thread count, tick/replication rates and phases, entity/client/station/tick counts, completed ticks, time budget |
+| Tick latency | `tick_ms_p50`, `tick_ms_p95`, `tick_ms_p99`, `tick_ms_max`, planning/encoding phase percentiles, 128 Hz budget/headroom/verdict, `elapsed_ms` |
 | Replication selection | `replication_scratch_queries`, grid/occupied strategy query counts, probed/scanned/matched cell counts, `replication_scratch_candidates`, `replication_candidates_selected` |
 | Replication scratch capacity | `replication_scratch_candidate_capacity_max`, `replication_scratch_dedup_capacity_max`, `replication_scratch_matching_cell_capacity_max`, `replication_scratch_priority_capacity_max` |
-| Encoded payload | `encoded_packets`, `encoded_bytes`, `payload_entity_deltas`, `payload_component_deltas`, `estimated_payload_bytes` |
+| Encoded payload | per-frame materialization limit and requirement, `encoded_packets`, `encoded_bytes`, `payload_entity_deltas`, `payload_component_deltas`, `estimated_payload_bytes`, materialization verdict |
 | Direct commands | `commands_enqueued`, `commands_applied`, `command_latency_ticks_avg`, `command_latency_ticks_max`, `command_queue_max`, `command_queue_drops` |
 | Gateway/deployment dispatch | `gateway_commands_dispatched`, dispatch packet/byte/enqueue/apply/latency fields |
 | Client/gateway bridge | command bytes, gateway accepted/ACK/applied counts, received packet/byte/ACK/replication/entity/component counts |
@@ -101,10 +105,89 @@ query order while avoiding empty-cell probes. Strategy work counters and
 retained capacity fields make this choice visible without collecting OS metrics.
 
 Compare at least selected candidates, estimated payload bytes, encoded bytes,
-and tick percentiles. The benchmark intentionally materializes at most 16 sample
-entity deltas per frame to keep routine runs bounded, so
-`estimated_payload_bytes` is the comparable logical bandwidth estimate while
-`encoded_bytes` measures the bounded wire-codec workload actually executed.
+and tick percentiles. Smoke, medium, and large profiles intentionally
+materialize at most 16 sample entity deltas per frame to keep routine runs
+bounded, so `estimated_payload_bytes` is their comparable logical bandwidth
+estimate while `encoded_bytes` measures the bounded wire-codec workload actually
+executed. The guarded local profile below raises the limit to the planner's 300
+entity viewer budget and fails unless every selected update is materialized.
+
+## Guarded Local Host Measurement
+
+The `local` profile is a deliberate, release-mode measurement sized from the
+host's available parallelism. It remains behind `--allow-heavy` and is never run
+by CI. On the current 6-core/12-thread, 31.67 GiB development host it resolves
+to 24,000 entities, 480 clients, eight stations, and 30 measured ticks:
+
+```powershell
+$env:CARGO_BUILD_JOBS=4
+cargo run --release -q -p sectorsync-bench -- --profile=local --allow-heavy
+```
+
+The default profile uses one benchmark thread. The optional `parallel` planner
+creates an explicit bounded pool, partitions viewers deterministically by
+station, and fuses each station's planning, payload construction, and encoding
+inside one worker task. Both paths materialize every selected entity delta up to
+the planner's hard 300-entity viewer limit and stop before starting another tick
+once the 10-second run budget is exhausted.
+It prints `ticks_completed`, `time_budget_exhausted`,
+`threshold_payload_materialization_ok`, and
+`threshold_workload_completed_ok`; `benchmark_ok=true` requires all 30 ticks and
+full selected-payload materialization.
+
+The scale formula is conservative and capped: 2,000 entities and 40 clients per
+logical processor, clamped to 8,000-24,000 entities and 160-480 clients, with
+four to eight stations. Unlike the wide smoke workload, the local profile places
+entities and viewers in a deterministic dense 2,000 x 200 x 2,000 world with a
+256-unit AOI. This drives materially more selected updates without increasing
+the entity/client cap. The cap is intentionally far below the host's physical
+memory capacity, while the four-job Cargo setting bounds release-build CPU
+pressure. The 10-second budget is a cooperative guard between ticks, not a hard
+process watchdog.
+
+This measures real SectorSync spatial planning, queues, bridges, binary encoding,
+and in-process transports with a deterministic synthetic workload. It does not
+measure WAN behavior, kernel UDP throughput, cross-machine deployment, durable
+storage, or production gameplay code. Record the full output and run it at least
+three times before treating changes as a local regression.
+
+## Optional SIMD, Parallel, and 128 Hz Modes
+
+Feature behavior is explicit:
+
+- `sectorsync-core/simd` uses `wide` 0.7.33 for a safe eight-lane range-only
+  distance filter and keeps the generic visibility path scalar.
+- `sectorsync-runtime/parallel` exposes `ReplicationThreadPool`; constructing the
+  pool is the only operation that creates threads. Its default uses half of host
+  logical parallelism and caps at eight workers.
+- `sectorsync-bench/optimized` enables both features for comparison. SIMD remains
+  optional because gather overhead on the current AoS station layout can erase
+  its arithmetic benefit.
+
+The all-clients-every-tick stress comparison is:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --features optimized -- `
+  --profile=local --allow-heavy --planner=parallel --threads=8 `
+  --replication-hz=128
+```
+
+On the current development host this mode can fall below 7.8125 ms, but repeated
+runs have also exceeded it; it is not accepted as stable 128 Hz evidence.
+
+For a realistic 128 Hz simulation with 32 Hz client replication, use four
+deterministic viewer phases and make the 128 Hz budget an actual pass/fail gate:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --features optimized -- `
+  --profile=local --allow-heavy --planner=parallel --threads=8 `
+  --replication-hz=32 --tick-ms-p99-budget=7.8125
+```
+
+Three consecutive measurements on the current host reported 2.00-2.54 ms tick
+p99 and 5.28-5.81 ms of 128 Hz headroom while fully encoding 443,402 selected
+deltas per 30-tick run. This remains local deterministic evidence, not a hard
+real-time or production-network guarantee.
 
 ## Optional Heavy Calibration
 

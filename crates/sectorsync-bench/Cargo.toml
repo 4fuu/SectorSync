@@ -12,6 +12,17 @@ publish = false
 name = "sectorsync-bench"
 path = "src/main.rs"
 
+[[example]]
+name = "parallel_replication"
+path = "examples/parallel_replication.rs"
+required-features = ["parallel"]
+
+[features]
+default = []
+simd = ["sectorsync-core/simd"]
+parallel = ["sectorsync-runtime/parallel"]
+optimized = ["simd", "parallel"]
+
 [dependencies]
 sectorsync-core.workspace = true
 sectorsync-runtime.workspace = true

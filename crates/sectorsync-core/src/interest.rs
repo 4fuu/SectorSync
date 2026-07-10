@@ -28,6 +28,19 @@ impl ViewerQuery {
 pub trait VisibilityFilter {
     /// Returns whether an entity is visible enough to be considered.
     fn is_visible(&self, viewer: &ViewerQuery, entity: &EntityRecord) -> bool;
+
+    /// Returns visibility when the planner already computed squared distance.
+    ///
+    /// Custom filters can keep implementing only [`Self::is_visible`]. Range-aware
+    /// filters should override this method to avoid repeating distance work.
+    fn is_visible_with_distance(
+        &self,
+        viewer: &ViewerQuery,
+        entity: &EntityRecord,
+        _distance_squared: f32,
+    ) -> bool {
+        self.is_visible(viewer, entity)
+    }
 }
 
 /// Range-only visibility filter.
@@ -37,6 +50,15 @@ pub struct RangeOnlyVisibility;
 impl VisibilityFilter for RangeOnlyVisibility {
     fn is_visible(&self, viewer: &ViewerQuery, entity: &EntityRecord) -> bool {
         entity.position.distance_squared(viewer.position) <= viewer.radius_squared()
+    }
+
+    fn is_visible_with_distance(
+        &self,
+        viewer: &ViewerQuery,
+        _entity: &EntityRecord,
+        distance_squared: f32,
+    ) -> bool {
+        distance_squared <= viewer.radius_squared()
     }
 }
 
@@ -116,5 +138,18 @@ where
 {
     fn is_visible(&self, viewer: &ViewerQuery, entity: &EntityRecord) -> bool {
         self.left.is_visible(viewer, entity) && self.right.is_visible(viewer, entity)
+    }
+
+    fn is_visible_with_distance(
+        &self,
+        viewer: &ViewerQuery,
+        entity: &EntityRecord,
+        distance_squared: f32,
+    ) -> bool {
+        self.left
+            .is_visible_with_distance(viewer, entity, distance_squared)
+            && self
+                .right
+                .is_visible_with_distance(viewer, entity, distance_squared)
     }
 }

@@ -36,15 +36,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run strict Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: Build documentation with warnings denied
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --locked
+        run: cargo doc --workspace --all-features --no-deps --locked
 
       - name: Run guarded smoke benchmark
         run: cargo run -q -p sectorsync-bench --locked -- --profile=smoke
@@ -80,4 +80,4 @@ jobs:
           key: msrv
 
       - name: Check all targets
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets --all-features --locked
