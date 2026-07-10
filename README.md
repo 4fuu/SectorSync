@@ -23,6 +23,18 @@ is an integration guide, not a required game framework or process topology.
 The [production adapter boundaries](docs/production-adapters.md) map security,
 transport, route discovery, persistence, and GPU hooks to caller-owned systems.
 
+### Use-Case Map
+
+| Goal | Guide | Executable examples |
+| --- | --- | --- |
+| Integrate validated commands through replication | [SDK flow](docs/sdk-integration.md) | [`sdk_flow`](crates/sectorsync-bench/examples/sdk_flow.rs), [`client_bridge`](crates/sectorsync-bench/examples/client_bridge.rs) |
+| Plan AOI, cadence, priority, and delivery tracking | [SDK flow: replication](docs/sdk-integration.md#4-plan-and-send-replication) | [`replication_bridge`](crates/sectorsync-bench/examples/replication_bridge.rs), [`replication_bridge_priority`](crates/sectorsync-bench/examples/replication_bridge_priority.rs), [`replication_tracker`](crates/sectorsync-bench/examples/replication_tracker.rs) |
+| Route commands through gateway/deployment metadata | [Production adapters](docs/production-adapters.md#route-discovery-and-placement) | [`gateway_command_pipeline`](crates/sectorsync-bench/examples/gateway_command_pipeline.rs), [`gateway_deployment_dispatch`](crates/sectorsync-bench/examples/gateway_deployment_dispatch.rs) |
+| Freeze, snapshot, upgrade, and resume | [SDK flow: barriers](docs/sdk-integration.md#5-handle-barriers-explicitly) | [`barrier_transport`](crates/sectorsync-bench/examples/barrier_transport.rs), [`barrier_upgrade`](crates/sectorsync-bench/examples/barrier_upgrade.rs) |
+| Sample load, schedule, split, and migrate | [Performance acceptance](docs/performance-acceptance.md#hotspot-calibration) | [`load_sampling`](crates/sectorsync-bench/examples/load_sampling.rs), [`split_tuning`](crates/sectorsync-bench/examples/split_tuning.rs), [`split_migration`](crates/sectorsync-bench/examples/split_migration.rs) |
+| Add transport, security, and route adapters | [Production adapters](docs/production-adapters.md) | [`secure_command_ingress`](crates/sectorsync-bench/examples/secure_command_ingress.rs), [`secure_key_rotation`](crates/sectorsync-bench/examples/secure_key_rotation.rs), [`deployment_routing`](crates/sectorsync-bench/examples/deployment_routing.rs) |
+| Run regression and baseline acceptance | [Performance acceptance](docs/performance-acceptance.md) | `sectorsync-bench --profile=smoke` |
+
 ## Core Direction
 
 - Embedded Rust library first, not a daemon.
@@ -41,9 +53,9 @@ transport, route discovery, persistence, and GPU hooks to caller-owned systems.
 - Client connectivity, gateway processes, cluster orchestration, and production
   transport are integration concerns outside the core library.
 
-## Phase 1 Scope
+## Basic SDK Scope
 
-Phase 1 should produce a usable core library and a benchmark simulator:
+The basic SDK consists of a usable core library and benchmark simulator:
 
 - `sectorsync-core`: entity IDs, station IDs, cell IDs, 3D spatial grid,
   ownership model, station runtime primitives, command/event envelopes,
@@ -58,7 +70,7 @@ Phase 1 should produce a usable core library and a benchmark simulator:
   standard-library UDP adapters for client and station packets.
 - `sectorsync-runtime`: orchestration helpers for multi-station simulation.
 
-The first implementation should stay resource-aware. The development machine is
+Routine development stays resource-aware. The development machine is
 not assumed to be a production benchmark host, so expensive tests must be
 explicitly gated and default checks must stay lightweight.
 
@@ -112,6 +124,7 @@ Useful commands:
 
 ```bash
 cargo test --workspace
+cargo doc --workspace --no-deps
 cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=room
@@ -187,16 +200,17 @@ baseline comparisons, and the aggregate `benchmark_ok` verdict.
 - Mandatory GPU dependency.
 - Built-in GPU kernels, GPU resource scheduling, or mandatory accelerator
   runtime.
-- Mandatory production/full-featured client SDK in Phase 1.
-- Dynamic script/WASM/plugin hot loading in Phase 1.
+- Built-in production/full-featured client SDK.
+- Dynamic script/WASM/plugin hot loading inside the core runtime.
 
-## Development Status
+## SDK Status
 
-This repository is being built iteratively. The README and `AGENTS.md` are
-living documents and should be updated whenever the architecture, rules, or
-implementation scope changes materially.
+The basic embedded SDK is implemented and verified through workspace tests,
+rustdoc generation, executable integration examples, and guarded benchmark
+acceptance. The README and `AGENTS.md` remain living documents and should be
+updated whenever architecture, rules, or public scope changes materially.
 
-Initial status:
+Current SDK surface:
 
 - Git repository initialized on branch `main`.
 - Rust workspace scaffolded.
@@ -459,10 +473,11 @@ Initial status:
   externally generated component schema descriptor registering into the core
   registry, writing a typed component, and materializing a replication frame.
 
-Not complete yet:
+### Production And Extended Work
 
-See `docs/gaps.md` for the current delivery gap register and completion
-evidence checklist.
+The following work is environment-specific or intentionally external. It does
+not block the basic embedded SDK; see `docs/gaps.md` for the completion evidence
+and explicit non-gaps.
 
 - Production-specific split thresholds still require external telemetry and
   deliberate guarded heavy runs; deterministic smoke-safe classification and

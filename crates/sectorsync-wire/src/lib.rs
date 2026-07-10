@@ -1,4 +1,4 @@
-//! Wire frame traits and default frame shapes for SectorSync.
+//! Wire frame traits and default frame shapes for `SectorSync`.
 
 #![forbid(unsafe_code)]
 
@@ -311,7 +311,7 @@ pub struct CommandDispatchFrame {
     pub entity_id: EntityId,
     /// Client-side sequence number.
     pub sequence: u64,
-    /// Server tick observed when the command entered SectorSync.
+    /// Server tick observed when the command entered `SectorSync`.
     pub received_at: Tick,
     /// Game-defined command kind.
     pub kind: u32,

@@ -11,6 +11,9 @@
 - When a benchmark must consume substantial CPU or memory, add a small default
   profile and gate larger profiles behind explicit arguments.
 - Default Rust verification should start with `cargo test --workspace`.
+- Run `cargo doc --workspace --no-deps` when changing public APIs, rustdoc,
+  README use-case navigation, or SDK guide contracts. Documentation finish must
+  not introduce rustdoc warnings or broken local guide/example links.
 - Use `cargo run -p sectorsync-bench --example sdk_flow` when changing the
   recommended external integration order, command-to-state-to-replication flow,
   bounded SDK error handling, or `docs/sdk-integration.md`.
@@ -338,6 +341,8 @@ The core library does not own:
 ## Documentation Rules
 
 - Keep `README.md` current when project scope, goals, or module layout changes.
+- Keep the README use-case map and guides under `docs/` aligned with executable
+  examples so embedders can navigate by workflow instead of command inventory.
 - Keep this `AGENTS.md` current when development rules, safety constraints, or
   architectural invariants change.
 - Prefer short design notes near the code being introduced. Avoid large stale

@@ -1,4 +1,4 @@
-//! Core types and runtime primitives for SectorSync.
+//! Core types and runtime primitives for `SectorSync`.
 
 #![forbid(unsafe_code)]
 

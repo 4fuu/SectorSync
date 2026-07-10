@@ -129,16 +129,16 @@ fn exact_array<const N: usize>(input: &[u8]) -> Result<[u8; N], ComponentCodecEr
 /// Storage strategy declared by a registered component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentStorageKind {
-    /// SectorSync stores opaque component bytes in a sparse station-local column.
+    /// `SectorSync` stores opaque component bytes in a sparse station-local column.
     SparseBlob,
-    /// Component data lives outside SectorSync; the registry only documents it.
+    /// Component data lives outside `SectorSync`; the registry only documents it.
     External,
 }
 
 /// Synchronization behavior declared by a registered component.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentSyncMode {
-    /// Component is never replicated by SectorSync.
+    /// Component is never replicated by `SectorSync`.
     NotReplicated,
     /// Component is replicated as delta when dirty.
     Delta,
@@ -172,7 +172,7 @@ pub struct ComponentDescriptor {
     pub sync: ComponentSyncMode,
     /// Migration strategy.
     pub migration: ComponentMigrationMode,
-    /// Maximum accepted blob size in bytes for SectorSync-owned storage.
+    /// Maximum accepted blob size in bytes for `SectorSync`-owned storage.
     pub max_bytes: usize,
     /// Stable schema hash selected by the embedding application.
     pub schema_hash: u64,
@@ -646,7 +646,7 @@ pub struct ComponentBlob {
 /// Component storage error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentStoreError {
-    /// Descriptor does not use SectorSync-owned blob storage.
+    /// Descriptor does not use `SectorSync`-owned blob storage.
     NotBlobStorage(ComponentId),
     /// Blob exceeds descriptor limit.
     BlobTooLarge {

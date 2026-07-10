@@ -1,4 +1,4 @@
-//! Strongly typed identifiers used across SectorSync.
+//! Strongly typed identifiers used across `SectorSync`.
 
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident, $inner:ty) => {

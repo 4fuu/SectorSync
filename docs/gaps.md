@@ -44,27 +44,22 @@ Already implemented and covered by examples or tests:
   p99, command/replication/router/split/scheduler fields, smoke-safe baseline
   comparisons, and explicit heavy-profile opt-in.
 
-## Delivery Gaps
+## Delivery Status
 
-### 1. Documentation Finish
-
-Gap:
-
-- README and AGENTS are current enough for development, but not yet a polished
-  SDK manual.
-
-Why it matters:
-
-- A usable middleware SDK needs stable mental models, executable examples, and
-  explicit boundary rules, especially because low-level interfaces are exposed
-  intentionally.
+No SDK-blocking delivery gaps remain for the basic embedded deliverable.
 
 Completion evidence:
 
-- README links to examples by use case rather than only listing commands.
-- AGENTS names verification commands for every important SDK boundary.
-- Public APIs have enough rustdoc for `cargo doc` to be useful.
-- Gaps in this file are updated or removed as commits close them.
+- README provides a use-case map to the integration, replication, barrier,
+  load/migration, production-adapter, and performance workflows.
+- `docs/sdk-integration.md`, `docs/performance-acceptance.md`, and
+  `docs/production-adapters.md` define integration order, error handling,
+  verification gates, and external ownership boundaries.
+- AGENTS names lightweight verification commands for each important SDK
+  boundary and keeps heavy calibration behind explicit `--allow-heavy`.
+- `cargo doc --workspace --no-deps` completes without rustdoc warnings.
+- Executable examples and integration tests cover the recommended external
+  usage flows while core modules retain low-level middleware ownership.
 
 ## Explicit Non-Gaps
 
@@ -80,9 +75,8 @@ external adapters:
   accelerator runtime.
 - Dynamic script/WASM/plugin hot loading inside the core runtime.
 
-## Suggested Next Commit Order
+## Future Work
 
-1. Finish SDK documentation and public rustdoc coverage.
-
-Each step should keep default verification lightweight and should leave heavier
-work behind explicit command flags.
+Future changes should be driven by integration feedback, production-specific
+adapters, or explicitly guarded calibration. They must not move the explicit
+non-gaps above into SectorSync core by default.

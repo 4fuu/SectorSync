@@ -1,4 +1,4 @@
-//! Common imports for SectorSync embedders.
+//! Common imports for `SectorSync` embedders.
 
 pub use crate::barrier::{BarrierScope, BarrierState, CommandQueueMode, RuntimeBarrier};
 pub use crate::command::{

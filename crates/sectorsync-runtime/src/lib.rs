@@ -1,4 +1,4 @@
-//! Multi-station orchestration helpers for SectorSync.
+//! Multi-station orchestration helpers for `SectorSync`.
 
 #![forbid(unsafe_code)]
 
@@ -2249,7 +2249,7 @@ impl StationLoadSampler {
 
     /// Samples every station in deterministic station-set order.
     ///
-    /// `subscriber_counts` is explicit integration input: SectorSync can use it
+    /// `subscriber_counts` is explicit integration input: `SectorSync` can use it
     /// for load decisions, but does not own gateway/client/session business state.
     /// Counts with the same station id are aggregated with saturating arithmetic.
     /// Because the event router and subscriber input are station-scoped, their

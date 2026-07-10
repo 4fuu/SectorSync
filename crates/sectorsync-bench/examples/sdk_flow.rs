@@ -23,7 +23,7 @@ const HEALTH_COMPONENT_ID: ComponentId = ComponentId::new(1);
 /// Observable handoff from the cohesive SDK flow to an external metrics system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SdkFlowReport {
-    /// Requests rejected before entering SectorSync.
+    /// Requests rejected before entering `SectorSync`.
     pub external_rejections: usize,
     /// Commands accepted into bounded station queues.
     pub commands_enqueued: usize,

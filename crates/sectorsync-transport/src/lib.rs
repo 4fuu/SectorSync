@@ -1,4 +1,4 @@
-//! Transport traits and fake transport support for SectorSync.
+//! Transport traits and fake transport support for `SectorSync`.
 
 #![forbid(unsafe_code)]
 
@@ -192,7 +192,7 @@ impl Default for PacketSecurityConfig {
     }
 }
 
-/// Packet key lifecycle state tracked by SectorSync metadata.
+/// Packet key lifecycle state tracked by `SectorSync` metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketKeyState {
     /// Key can be used for sending and receiving packets.
@@ -215,7 +215,7 @@ impl PacketKeyState {
 
 /// Metadata for one externally managed packet security key.
 ///
-/// SectorSync never stores secret material. The descriptor only lets hot-path
+/// `SectorSync` never stores secret material. The descriptor only lets hot-path
 /// packet helpers choose send keys and reject stale receive keys deterministically.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketKeyDescriptor {
@@ -725,7 +725,7 @@ impl core::fmt::Display for PacketSecurityDecodeError {
 impl std::error::Error for PacketSecurityDecodeError {}
 
 /// Packet authenticator hook. Embedders should provide a real MAC/signature
-/// implementation and key management outside SectorSync.
+/// implementation and key management outside `SectorSync`.
 pub trait PacketAuthenticator {
     /// Authenticator error type.
     type Error;
@@ -750,7 +750,7 @@ pub trait PacketAuthenticator {
 }
 
 /// Packet cipher hook. Embedders should provide real encryption outside
-/// SectorSync when confidentiality is needed.
+/// `SectorSync` when confidentiality is needed.
 pub trait PacketCipher {
     /// Cipher error type.
     type Error;
@@ -3334,7 +3334,7 @@ impl From<io::Error> for UdpTransportError {
 ///
 /// This adapter intentionally operates at packet boundaries. Reliability,
 /// encryption, authentication, reconnects, and gateway/session semantics are
-/// expected to live outside the core SectorSync hot path.
+/// expected to live outside the core `SectorSync` hot path.
 #[derive(Debug)]
 pub struct UdpTransport {
     socket: UdpSocket,
