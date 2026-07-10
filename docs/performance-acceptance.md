@@ -189,6 +189,43 @@ p99 and 5.28-5.81 ms of 128 Hz headroom while fully encoding 443,402 selected
 deltas per 30-tick run. This remains local deterministic evidence, not a hard
 real-time or production-network guarantee.
 
+## Many-Room Single-Thread Measurement
+
+The guarded room benchmark models one `InstanceId` per room and assigns
+`ceil(players / players_per_station)` Stations, capped by
+`max_stations_per_room`. All room/Station work runs sequentially on the calling
+thread; every viewer performs a real Cell query and replication plan, and every
+selected entity becomes a concrete binary delta:
+
+```powershell
+$env:CARGO_BUILD_JOBS=4
+cargo run --release -q -p sectorsync-bench --example many_rooms
+```
+
+The default cap is 500 rooms, 4-32 players per room, eight Stations per room,
+16 entities per player, and ten sweeps. The default workload uses the smaller
+4-24 player, one Station per 12 players, eight entities per player, and eight
+sweep shape. Oversized manual values are clamped unless `--allow-heavy` is
+present, and the runner stops before another sweep after its 10-second budget.
+
+On the current development host, the default 500-room workload resolves to 784
+Stations, 6,966 players, and 55,728 entities. Repeated release runs reported
+37.18-46.83 ms sweep p99 while fully encoding 2,002,536 selected entities per
+run, which supports the configured 50 ms/20 Hz gate but not a stable 30 Hz
+claim. A guarded 300-room workload resolved to 468 Stations, 4,155 players, and
+33,240 entities, with three consecutive sweep p99 results of 21.68-21.79 ms,
+passing an explicit 33.333 ms/30 Hz gate:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example many_rooms -- `
+  --rooms=300 --sweep-p99-budget-ms=33.333
+```
+
+This workload does not include gameplay logic, room creation/destruction churn,
+idle-room scheduling, command/event pumps, kernel networking, persistence, or
+matchmaking. Treat it as evidence for active-room spatial planning and encoding,
+not a complete room-server capacity promise.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

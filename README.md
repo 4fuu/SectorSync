@@ -204,6 +204,21 @@ cargo run --release -q -p sectorsync-bench --features optimized -- `
 Use `--replication-hz=128` only as the harsher all-clients-every-tick comparison;
 it is not stable at 128 Hz on the current development host.
 
+For the guarded many-room shape, each room receives its own `InstanceId`, and
+its Station count grows deterministically with player count. The runner advances
+all rooms sequentially on one thread and fully encodes every selected delta:
+
+```powershell
+$env:CARGO_BUILD_JOBS=4
+cargo run --release -q -p sectorsync-bench --example many_rooms
+```
+
+The default run covers 500 rooms with 4-24 players each, one Station per 12
+players, eight entities per player, and eight measured sweeps. Use
+`--rooms=300 --sweep-p99-budget-ms=33.333` for the current host's guarded 30 Hz
+acceptance shape. This measures spatial planning and wire encoding, not gameplay,
+matchmaking, room lifecycle, persistence, or network capacity.
+
 ## Documentation
 
 - [SDK integration guide](docs/sdk-integration.md)
