@@ -132,9 +132,9 @@ cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
 ```
 
-The full example-to-feature map is maintained in
-[AGENTS.md](AGENTS.md#local-command-rules). Security examples use explicit test
-hooks and are not production cryptography.
+The focused example-to-feature map is maintained in
+[AGENTS.md](AGENTS.md#verification). Security examples use explicit test hooks
+and are not production cryptography.
 
 ## Performance
 
