@@ -29,6 +29,9 @@ Already implemented and covered by examples or tests:
 - A cohesive SDK integration guide and executable command-to-replication flow
   covering external validation, bounded failure handling, barrier/migration
   sequencing, and observability handoff.
+- Production adapter guidance maps authentication/cipher, transport, key
+  lifecycle, route discovery, persistence, and GPU hooks to external owners,
+  backed by bounded local security and deployment examples.
 - Runtime barriers for tick-boundary freeze/snapshot/resume and frozen
   snapshot upgrade hooks.
 - Conservative split scheduling, cell migration execution, deployment route
@@ -43,28 +46,7 @@ Already implemented and covered by examples or tests:
 
 ## Delivery Gaps
 
-### 1. Production Boundary Adapters
-
-Gap:
-
-- The core intentionally does not implement production auth, secret storage,
-  NAT traversal, service discovery, durable cluster state, failover, or process
-  supervision. The remaining work is to make sure adapter hooks are sufficient
-  without importing those responsibilities.
-
-Why it matters:
-
-- SectorSync should be embeddable into many server stacks. Over-owning
-  production infrastructure would make it less reusable and harder to keep fast.
-
-Completion evidence:
-
-- Transport/security traits remain bounded and dependency-light.
-- Examples show how external adapters provide authentication/encryption and
-  route discovery metadata without SectorSync owning those systems.
-- Documentation names unsupported production responsibilities directly.
-
-### 2. Documentation Finish
+### 1. Documentation Finish
 
 Gap:
 
@@ -100,8 +82,7 @@ external adapters:
 
 ## Suggested Next Commit Order
 
-1. Polish production-boundary adapter examples without moving production
-   ownership into SectorSync.
+1. Finish SDK documentation and public rustdoc coverage.
 
 Each step should keep default verification lightweight and should leave heavier
 work behind explicit command flags.

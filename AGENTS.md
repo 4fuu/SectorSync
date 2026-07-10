@@ -62,6 +62,10 @@
 - Use `cargo run -p sectorsync-bench --example secure_key_rotation` when
   changing packet key lifecycle metadata, send-key selection, receive-key
   acceptance, retirement, revocation, or expiration behavior.
+- When changing `docs/production-adapters.md` or production adapter boundaries,
+  run `secure_command_ingress`, `secure_key_rotation`, `deployment_routing`, and
+  `gateway_deployment_dispatch`; keep their providers illustrative, local, and
+  bounded rather than adding production infrastructure.
 - Use `cargo run -p sectorsync-bench --example reliable_command_ingress` when
   changing reliable client packet helpers, in-memory client transport hubs, or
   reliable command ingress examples.
@@ -286,6 +290,9 @@ The core library does not own:
   allowed, but secret material, mandatory crypto dependencies, hard-coded
   algorithms, key rotation services, certificate stores, and account auth
   systems stay outside SectorSync.
+- Adapter documentation and examples may inject test-only identity, cipher,
+  transport, or route metadata providers, but must label them non-production and
+  must not present illustrative algorithms as security recommendations.
 - The standard UDP adapter is a low-level packet adapter only. Reliability,
   encryption, authentication, reconnect, NAT traversal, and gateway/session
   semantics must not be hidden inside the UDP adapter. Use explicit reliable

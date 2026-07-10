@@ -5,9 +5,8 @@ use sectorsync_core::prelude::{
     EntityId, Tick,
 };
 use sectorsync_transport::{
-    ClientTransportLimits, InMemoryTransportHub, OutboundPacket, PacketAuthenticator,
-    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, PlaintextPacketCipher,
-    TransportReceiver, TransportSink,
+    ClientTransportLimits, InMemoryTransportHub, OutboundPacket, PacketAuthenticator, PacketCipher,
+    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, TransportReceiver, TransportSink,
 };
 use sectorsync_wire::{
     BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame, CommandFrame, FrameDecoder,
@@ -37,9 +36,9 @@ fn main() {
         max_replay_history: 16,
     };
     let mut client_security =
-        PacketSecurityBox::new(security_config, ExampleAuthenticator, PlaintextPacketCipher);
+        PacketSecurityBox::new(security_config, ExampleAuthenticator, ExampleCipher);
     let mut server_security =
-        PacketSecurityBox::new(security_config, ExampleAuthenticator, PlaintextPacketCipher);
+        PacketSecurityBox::new(security_config, ExampleAuthenticator, ExampleCipher);
 
     let command = CommandFrame {
         client_id,
@@ -140,7 +139,7 @@ fn main() {
     assert_eq!(decoded_ack, RuntimeFrame::CommandAck(ack));
 
     println!(
-        "secure_command_ingress sealed={} opened={} replay_rejected={} applied_command={} ack_command={}",
+        "secure_command_ingress external_authenticator=true external_cipher=true sealed={} opened={} replay_rejected={} applied_command={} ack_command={}",
         client_security.stats().sealed + server_security.stats().sealed,
         client_security.stats().opened + server_security.stats().opened,
         server_security.stats().replay_rejected,
@@ -174,6 +173,37 @@ impl PacketAuthenticator for ExampleAuthenticator {
         tag: &[u8],
     ) -> Result<bool, Self::Error> {
         Ok(tag == example_tag(key_id, nonce, payload))
+    }
+}
+
+/// Test-only reversible hook proving that encryption stays externally supplied.
+/// This is not cryptography and must never be used outside this example.
+#[derive(Clone, Debug, Default)]
+struct ExampleCipher;
+
+impl PacketCipher for ExampleCipher {
+    type Error = core::convert::Infallible;
+
+    fn seal(&mut self, key_id: u32, nonce: u64, payload: &mut Vec<u8>) -> Result<(), Self::Error> {
+        apply_example_cipher(key_id, nonce, payload);
+        Ok(())
+    }
+
+    fn open(&mut self, key_id: u32, nonce: u64, payload: &mut Vec<u8>) -> Result<(), Self::Error> {
+        apply_example_cipher(key_id, nonce, payload);
+        Ok(())
+    }
+}
+
+fn apply_example_cipher(key_id: u32, nonce: u64, payload: &mut [u8]) {
+    let mut stream = (key_id as u64)
+        .wrapping_mul(0xA24B_AED4_963E_E407)
+        .wrapping_add(nonce.rotate_left(23));
+    for byte in payload {
+        stream ^= stream << 13;
+        stream ^= stream >> 7;
+        stream ^= stream << 17;
+        *byte ^= stream as u8;
     }
 }
 

@@ -20,6 +20,8 @@ The [SDK integration flow](docs/sdk-integration.md) defines the recommended
 order for external validation, bounded command admission, station-local updates,
 replication, barriers, migration, error handling, and observability handoff. It
 is an integration guide, not a required game framework or process topology.
+The [production adapter boundaries](docs/production-adapters.md) map security,
+transport, route discovery, persistence, and GPU hooks to caller-owned systems.
 
 ## Core Direction
 
@@ -431,8 +433,9 @@ Initial status:
   bounded command queue entry, applied, and acknowledged back to the client.
 - `cargo run -p sectorsync-bench --example secure_command_ingress`
   demonstrates a client command and command ACK wrapped in packet security
-  envelopes with an external authenticator hook, plus replay rejection for a
-  duplicate secure command.
+  envelopes with external authenticator/cipher hooks, plus replay rejection for
+  a duplicate secure command. Its reversible cipher is test-only and explicitly
+  not production cryptography.
 - `cargo run -p sectorsync-bench --example secure_key_rotation`
   demonstrates bounded packet key metadata driving initial send/open, rotated
   key selection, receive-only old-key retirement, and revoked-key rejection
