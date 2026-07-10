@@ -176,8 +176,12 @@ impl CommandQueues {
             BarrierState::Requested | BarrierState::WaitingTickBoundary | BarrierState::Frozen => {
                 match ingress.command_mode {
                     CommandQueueMode::Buffer => {
-                        self.barrier_buffer.push_back(command);
-                        Ok(CommandPushOutcome::BufferedByBarrier)
+                        if self.barrier_buffer.len() >= self.barrier_buffer_capacity() {
+                            Err(CommandQueueError::QueueFull(command.priority))
+                        } else {
+                            self.barrier_buffer.push_back(command);
+                            Ok(CommandPushOutcome::BufferedByBarrier)
+                        }
                     }
                     CommandQueueMode::Reject | CommandQueueMode::Drain => {
                         Err(CommandQueueError::RejectedByBarrier(ingress.command_mode))
@@ -188,10 +192,24 @@ impl CommandQueues {
     }
 
     /// Moves commands buffered by a barrier back into priority queues.
+    ///
+    /// If a target priority queue is full, the first blocked command and all
+    /// commands after it remain in the barrier buffer for a later retry.
     pub fn release_barrier_buffer(&mut self) -> Result<usize, CommandQueueError> {
         let mut released = 0;
-        while let Some(command) = self.barrier_buffer.pop_front() {
-            self.push_ready(command)?;
+        while let Some(priority) = self.barrier_buffer.front().map(|command| command.priority) {
+            if !self.has_ready_capacity(priority) {
+                return Err(CommandQueueError::QueueFull(priority));
+            }
+            let command = self
+                .barrier_buffer
+                .pop_front()
+                .expect("front command was checked above");
+            match priority {
+                CommandPriority::High => self.high.push_back(command),
+                CommandPriority::Normal => self.normal.push_back(command),
+                CommandPriority::Low => self.low.push_back(command),
+            }
             released += 1;
         }
         Ok(released)
@@ -222,6 +240,17 @@ impl CommandQueues {
         self.barrier_buffer.len()
     }
 
+    /// Maximum commands retained while a barrier buffers ingress.
+    ///
+    /// The buffer uses the saturating sum of the three ready-queue limits so
+    /// integrations get a bounded default without a separate hidden capacity.
+    pub fn barrier_buffer_capacity(&self) -> usize {
+        self.limits
+            .high
+            .saturating_add(self.limits.normal)
+            .saturating_add(self.limits.low)
+    }
+
     /// Returns total command count including barrier buffer.
     pub fn total_len(&self) -> usize {
         self.ready_len() + self.barrier_buffer.len()
@@ -233,31 +262,28 @@ impl CommandQueues {
     }
 
     fn push_ready(&mut self, command: CommandEnvelope) -> Result<(), CommandQueueError> {
+        if !self.has_ready_capacity(command.priority) {
+            return Err(CommandQueueError::QueueFull(command.priority));
+        }
         match command.priority {
             CommandPriority::High => {
-                if self.high.len() >= self.limits.high {
-                    Err(CommandQueueError::QueueFull(CommandPriority::High))
-                } else {
-                    self.high.push_back(command);
-                    Ok(())
-                }
+                self.high.push_back(command);
             }
             CommandPriority::Normal => {
-                if self.normal.len() >= self.limits.normal {
-                    Err(CommandQueueError::QueueFull(CommandPriority::Normal))
-                } else {
-                    self.normal.push_back(command);
-                    Ok(())
-                }
+                self.normal.push_back(command);
             }
             CommandPriority::Low => {
-                if self.low.len() >= self.limits.low {
-                    Err(CommandQueueError::QueueFull(CommandPriority::Low))
-                } else {
-                    self.low.push_back(command);
-                    Ok(())
-                }
+                self.low.push_back(command);
             }
+        }
+        Ok(())
+    }
+
+    fn has_ready_capacity(&self, priority: CommandPriority) -> bool {
+        match priority {
+            CommandPriority::High => self.high.len() < self.limits.high,
+            CommandPriority::Normal => self.normal.len() < self.limits.normal,
+            CommandPriority::Low => self.low.len() < self.limits.low,
         }
     }
 }
@@ -340,6 +366,66 @@ mod tests {
         assert_eq!(
             error,
             CommandQueueError::RejectedByBarrier(CommandQueueMode::Reject)
+        );
+    }
+
+    #[test]
+    fn barrier_buffer_is_bounded_by_ready_queue_limits() {
+        let mut queues = CommandQueues::new(CommandQueueLimits {
+            high: 1,
+            normal: 0,
+            low: 0,
+        });
+        let ingress = CommandIngress {
+            barrier_state: BarrierState::Frozen,
+            command_mode: CommandQueueMode::Buffer,
+        };
+
+        assert_eq!(queues.barrier_buffer_capacity(), 1);
+        queues
+            .push(command(1, CommandPriority::High), ingress)
+            .expect("first command should buffer");
+        let error = queues
+            .push(command(2, CommandPriority::High), ingress)
+            .expect_err("bounded barrier buffer should reject overflow");
+
+        assert_eq!(error, CommandQueueError::QueueFull(CommandPriority::High));
+        assert_eq!(queues.barrier_buffer_len(), 1);
+    }
+
+    #[test]
+    fn failed_barrier_release_keeps_blocked_command_buffered() {
+        let mut queues = CommandQueues::new(CommandQueueLimits {
+            high: 1,
+            normal: 0,
+            low: 0,
+        });
+        queues
+            .push(command(1, CommandPriority::High), CommandIngress::RUNNING)
+            .expect("ready queue should accept first command");
+        queues
+            .push(
+                command(2, CommandPriority::High),
+                CommandIngress {
+                    barrier_state: BarrierState::Frozen,
+                    command_mode: CommandQueueMode::Buffer,
+                },
+            )
+            .expect("barrier buffer should accept second command");
+
+        let error = queues
+            .release_barrier_buffer()
+            .expect_err("full ready queue should block release");
+        assert_eq!(error, CommandQueueError::QueueFull(CommandPriority::High));
+        assert_eq!(queues.barrier_buffer_len(), 1);
+        assert_eq!(
+            queues.pop_next().expect("first command should remain").id,
+            CommandId::new(1)
+        );
+        assert_eq!(queues.release_barrier_buffer(), Ok(1));
+        assert_eq!(
+            queues.pop_next().expect("second command should release").id,
+            CommandId::new(2)
         );
     }
 }

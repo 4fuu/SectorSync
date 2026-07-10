@@ -11,6 +11,9 @@
 - When a benchmark must consume substantial CPU or memory, add a small default
   profile and gate larger profiles behind explicit arguments.
 - Default Rust verification should start with `cargo test --workspace`.
+- Use `cargo run -p sectorsync-bench --example sdk_flow` when changing the
+  recommended external integration order, command-to-state-to-replication flow,
+  bounded SDK error handling, or `docs/sdk-integration.md`.
 - Use `cargo run -p sectorsync-bench -- --profile=smoke` for the default
   benchmark smoke test, including the lightweight gateway/deployment command
   dispatch transport workload and bounded low-level client/gateway bridge
@@ -160,8 +163,9 @@ The core library does not own:
   replace station state before resume. They must not load scripts, own plugin
   systems, run game business migrations by default, persist snapshots, or
   bypass frozen-barrier checks.
-- Command queues must remain bounded and barrier-aware. Do not add unbounded
-  command buffers on hot paths.
+- Command queues must remain bounded and barrier-aware. Barrier-buffer overflow
+  must return explicit backpressure, and failed release must retain blocked
+  commands. Do not add unbounded command buffers on hot paths.
 - Visibility filters may provide range, frustum, tag, or integration-defined
   acceptance checks for replication planning. They must stay pure and
   allocation-light on hot paths, and they must not own camera systems,
@@ -201,6 +205,11 @@ The core library does not own:
   SectorSync may encode, decode, queue, stamp `received_at`, and acknowledge
   them, but schema validation, anti-cheat, and game-rule translation belong in
   external validators before commands are applied.
+- Cohesive SDK flows must preserve this ownership order: external validation,
+  bounded SectorSync admission/routing, external station-local business apply,
+  bounded replication, then external observability. They must surface queue,
+  route, barrier, and transport failures instead of hiding retries or side
+  buffers.
 - Internal command dispatch frames may carry gateway-stamped command envelopes
   from a gateway process to a station node. They must preserve `received_at`
   and target station metadata without interpreting the command payload or

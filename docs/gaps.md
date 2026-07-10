@@ -26,6 +26,9 @@ Already implemented and covered by examples or tests:
 - Gateway/session primitives, low-level client command ingress, command ACKs,
   gateway command pipeline, gateway-to-deployment dispatch metadata, and
   bounded client/gateway transport bridges.
+- A cohesive SDK integration guide and executable command-to-replication flow
+  covering external validation, bounded failure handling, barrier/migration
+  sequencing, and observability handoff.
 - Runtime barriers for tick-boundary freeze/snapshot/resume and frozen
   snapshot upgrade hooks.
 - Conservative split scheduling, cell migration execution, deployment route
@@ -36,29 +39,7 @@ Already implemented and covered by examples or tests:
 
 ## Delivery Gaps
 
-### 1. SDK Flow Hardening
-
-Gap:
-
-- Many low-level pieces exist, but the recommended external integration flow is
-  still spread across many examples rather than one cohesive SDK guide.
-
-Why it matters:
-
-- External business systems need a clear path for: command validation before
-  SectorSync, data-driven station-local updates, replication planning,
-  transport bridge use, barrier use, migration, and observability handoff.
-
-Completion evidence:
-
-- A concise SDK integration guide or expanded `sdk_flow` example that shows the
-  intended order of operations.
-- Error-handling expectations for bounded queues, transport rejections, barrier
-  states, and missing routes.
-- Clear examples of what external systems own: auth, anti-cheat, persistence,
-  matchmaking, process orchestration, GPU batches, and business ECS.
-
-### 2. Performance Acceptance Matrix
+### 1. Performance Acceptance Matrix
 
 Gap:
 
@@ -82,7 +63,7 @@ Completion evidence:
   grid AOI.
 - No heavy benchmark path runs implicitly without `--allow-heavy`.
 
-### 3. Hotspot Calibration
+### 2. Hotspot Calibration
 
 Gap:
 
@@ -102,7 +83,7 @@ Completion evidence:
 - Benchmarks report before/after pressure and migrated-cell/entity counts.
 - AGENTS keeps heavyweight calibration explicitly gated.
 
-### 4. Production Boundary Adapters
+### 3. Production Boundary Adapters
 
 Gap:
 
@@ -123,7 +104,7 @@ Completion evidence:
   route discovery metadata without SectorSync owning those systems.
 - Documentation names unsupported production responsibilities directly.
 
-### 5. Documentation Finish
+### 4. Documentation Finish
 
 Gap:
 
@@ -159,10 +140,9 @@ external adapters:
 
 ## Suggested Next Commit Order
 
-1. Add or expand a cohesive SDK integration flow.
-2. Add a benchmark acceptance matrix document and make smoke output map to it.
-3. Calibrate hotspot/scheduler examples against larger guarded workloads.
-4. Polish production-boundary adapter examples without moving production
+1. Add a benchmark acceptance matrix document and make smoke output map to it.
+2. Calibrate hotspot/scheduler examples against larger guarded workloads.
+3. Polish production-boundary adapter examples without moving production
    ownership into SectorSync.
 
 Each step should keep default verification lightweight and should leave heavier

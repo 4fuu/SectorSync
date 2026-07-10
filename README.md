@@ -14,6 +14,13 @@ discovery, or crash recovery. Game-specific systems are expected to integrate
 through station-local APIs, command/event hooks, custom components, and
 external transport/routing adapters.
 
+## SDK Integration
+
+The [SDK integration flow](docs/sdk-integration.md) defines the recommended
+order for external validation, bounded command admission, station-local updates,
+replication, barriers, migration, error handling, and observability handoff. It
+is an integration guide, not a required game framework or process topology.
+
 ## Core Direction
 
 - Embedded Rust library first, not a daemon.
@@ -203,7 +210,8 @@ Initial status:
 - Runtime migration executor can move an authoritative entity between in-process
   stations while leaving the old station with a short-lived ghost.
 - Bounded command queues support priority ordering and barrier-aware
-  buffer/reject/drain behavior.
+  buffer/reject/drain behavior. Barrier buffering is explicitly capped and a
+  failed release keeps blocked commands buffered for a later retry.
 - Gateway session table primitives support bounded client sessions, station
   routes, route epochs, reconnect generations, reconnect grace windows,
   disconnected-session expiry, replay/stale sequence rejection, and per-client
@@ -338,9 +346,10 @@ Initial status:
   replication scratch query/candidate counts, tick timing estimates, host
   parallelism, default resource guard limits, threshold checks, and an
   aggregate `benchmark_ok` verdict.
-- `cargo run -p sectorsync-bench --example sdk_flow` demonstrates an
-  end-to-end embeddable SDK path: station, cell index, component store,
-  replication plan, frame builder, binary codec, and fake transport.
+- `cargo run -p sectorsync-bench --example sdk_flow` demonstrates the cohesive
+  embeddable SDK order: external business validation, bounded gateway admission,
+  barrier-aware rejection, authoritative station-local component application,
+  replication transport, client frame validation, and metrics handoff.
 - `cargo run -p sectorsync-bench --example split_migration` demonstrates a
   load-sample-driven split scheduler producing and executing a cell migration.
 - `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
