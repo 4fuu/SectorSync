@@ -34,36 +34,13 @@ Already implemented and covered by examples or tests:
 - Conservative split scheduling, cell migration execution, deployment route
   metadata, runtime load sampling from station/index/router state plus explicit
   subscriber input, and bounded load-aware station scheduling.
-- Resource-guarded benchmarks with smoke defaults and explicit heavy-profile
-  opt-in.
+- A committed performance acceptance matrix backed by machine-readable p50/p95/
+  p99, command/replication/router/split/scheduler fields, smoke-safe baseline
+  comparisons, and explicit heavy-profile opt-in.
 
 ## Delivery Gaps
 
-### 1. Performance Acceptance Matrix
-
-Gap:
-
-- The benchmark runner has guarded profiles and baselines, but the project does
-  not yet have a committed acceptance matrix that maps performance targets to
-  concrete commands, expected fields, and pass/fail thresholds.
-
-Why it matters:
-
-- "High performance" needs evidence across entity scale, client scale, interest
-  set bounds, tick latency, command latency, bandwidth, event throughput,
-  replication throughput, split behavior, and resource guard behavior.
-
-Completion evidence:
-
-- Documented benchmark matrix with smoke-safe defaults and optional heavy runs.
-- Recorded fields for p50/p95/p99 tick time, command apply latency, selected
-  replication candidates, encoded entities/components, bytes, queue drops,
-  router pressure, and split/scheduler decisions.
-- Baseline comparison commands for full broadcast, room broadcast, and naive
-  grid AOI.
-- No heavy benchmark path runs implicitly without `--allow-heavy`.
-
-### 2. Hotspot Calibration
+### 1. Hotspot Calibration
 
 Gap:
 
@@ -83,7 +60,7 @@ Completion evidence:
 - Benchmarks report before/after pressure and migrated-cell/entity counts.
 - AGENTS keeps heavyweight calibration explicitly gated.
 
-### 3. Production Boundary Adapters
+### 2. Production Boundary Adapters
 
 Gap:
 
@@ -104,7 +81,7 @@ Completion evidence:
   route discovery metadata without SectorSync owning those systems.
 - Documentation names unsupported production responsibilities directly.
 
-### 4. Documentation Finish
+### 3. Documentation Finish
 
 Gap:
 
@@ -140,9 +117,8 @@ external adapters:
 
 ## Suggested Next Commit Order
 
-1. Add a benchmark acceptance matrix document and make smoke output map to it.
-2. Calibrate hotspot/scheduler examples against larger guarded workloads.
-3. Polish production-boundary adapter examples without moving production
+1. Calibrate hotspot/scheduler examples against larger guarded workloads.
+2. Polish production-boundary adapter examples without moving production
    ownership into SectorSync.
 
 Each step should keep default verification lightweight and should leave heavier

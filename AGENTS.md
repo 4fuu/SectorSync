@@ -20,6 +20,10 @@
   roundtrip workload. The default SectorSync replication benchmark path should
   exercise reusable replication planning scratch and report scratch query
   counters.
+- When changing benchmark report fields, acceptance thresholds, baseline logic,
+  or `docs/performance-acceptance.md`, run smoke with `sectorsync`, `full`,
+  `room`, and `naive-grid` baselines. Keep all four default-safe and require
+  `--allow-heavy` for larger calibration.
 - Use `cargo run -p sectorsync-bench --example replication_bridge` when changing
   runtime replication transport send/receive bridges, AOI-to-frame downlink
   flow, or client replication transport integration.
@@ -103,6 +107,10 @@
   `--entities`, `--clients`, `--stations`, or `--ticks` can exceed smoke-safe
   values, keep them clamped unless `--allow-heavy` is present, and print the
   applied guard metadata.
+- Benchmark acceptance output must retain machine-readable p50/p95/p99 tick
+  latency, command latency/queue/drop fields, replication selection and byte
+  fields, router pressure/drop fields, split/scheduler decisions, threshold
+  verdicts, and the aggregate `benchmark_ok` field.
 
 ## Project Boundary
 

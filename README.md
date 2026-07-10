@@ -112,6 +112,8 @@ Useful commands:
 cargo test --workspace
 cargo run -p sectorsync-bench -- --profile=smoke
 cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
+cargo run -p sectorsync-bench -- --profile=smoke --baseline=room
+cargo run -p sectorsync-bench -- --profile=smoke --baseline=naive-grid
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
@@ -169,6 +171,10 @@ The project is judged by multiple hard metrics together, not by a single number:
 The benchmark suite should include simple baselines such as full broadcast,
 room broadcast, and naive grid AOI so SectorSync's policy-driven approach can be
 measured against simpler strategies.
+
+The [performance acceptance matrix](docs/performance-acceptance.md) maps the
+guarded smoke and optional heavy commands to recorded fields, default thresholds,
+baseline comparisons, and the aggregate `benchmark_ok` verdict.
 
 ## Non-Goals
 
@@ -343,9 +349,10 @@ Initial status:
   gateway/deployment command dispatch transport counts, low-level
   client/gateway transport command/ACK/replication roundtrip counts, command
   latency in ticks, max queue depth, payload entity/component delta counts,
-  replication scratch query/candidate counts, tick timing estimates, host
-  parallelism, default resource guard limits, threshold checks, and an
-  aggregate `benchmark_ok` verdict.
+  replication scratch query/candidate/selection counts, p50/p95/p99 tick timing,
+  event-router pressure/drops, split and scheduler decisions, host parallelism,
+  default resource guard limits, delivery conservation checks, and an aggregate
+  `benchmark_ok` verdict.
 - `cargo run -p sectorsync-bench --example sdk_flow` demonstrates the cohesive
   embeddable SDK order: external business validation, bounded gateway admission,
   barrier-aware rejection, authoritative station-local component application,

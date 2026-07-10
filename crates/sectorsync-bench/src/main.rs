@@ -7,14 +7,16 @@ use std::time::Instant;
 use sectorsync_core::prelude::{
     Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
     CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
-    GatewayConfig, GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity,
-    HotspotThresholds, InstanceId, NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3,
-    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station,
-    StationConfig, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
+    EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig, GatewaySessionTable,
+    GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, OwnerEpoch,
+    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
+    ReplicationScratch, Station, StationConfig, StationEvent, StationId, StationLoadSample, Tick,
+    Vec3, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
-    DeploymentRouteTable, GatewayClientTransportBridge, GatewayCommandPipeline,
+    DeploymentRouteTable, EventRouter, GatewayClientTransportBridge, GatewayCommandPipeline,
+    StationScheduleConfig, StationScheduler, StationSet,
 };
 use sectorsync_transport::{
     ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportEndpoint,
@@ -60,6 +62,8 @@ struct BenchThresholds {
     tick_ms_p99: f64,
     command_latency_ticks_max: u64,
     command_queue_max: usize,
+    command_queue_drops_max: usize,
+    router_event_drops_max: usize,
     estimated_payload_bytes: usize,
 }
 
@@ -88,6 +92,8 @@ impl Default for BenchThresholds {
             tick_ms_p99: 35.0,
             command_latency_ticks_max: 2,
             command_queue_max: 1024,
+            command_queue_drops_max: 0,
+            router_event_drops_max: 0,
             estimated_payload_bytes: 64 * 1024 * 1024,
         }
     }
@@ -103,8 +109,10 @@ struct BenchStats {
     payload_component_deltas: usize,
     replication_scratch_queries: usize,
     replication_scratch_candidates: usize,
+    replication_candidates_selected: usize,
     commands_enqueued: usize,
     commands_applied: usize,
+    command_queue_drops: usize,
     gateway_commands_dispatched: usize,
     command_dispatch_packets: usize,
     command_dispatch_bytes: usize,
@@ -126,10 +134,17 @@ struct BenchStats {
     command_latency_ticks_total: u64,
     command_latency_ticks_max: u64,
     command_queue_max: usize,
+    router_events_routed: usize,
+    router_events_drained: usize,
+    router_event_drops: usize,
+    router_queue_max: usize,
     max_cell_entities: usize,
     warm_stations: usize,
     hotspot_stations: usize,
     split_candidate_cells: usize,
+    scheduler_candidates_considered: usize,
+    scheduler_stations_selected: usize,
+    scheduler_total_advances: usize,
     tick_ms: Vec<f64>,
 }
 
@@ -175,8 +190,13 @@ fn main() {
         "replication_scratch_candidates={}",
         stats.replication_scratch_candidates
     );
+    println!(
+        "replication_candidates_selected={}",
+        stats.replication_candidates_selected
+    );
     println!("commands_enqueued={}", stats.commands_enqueued);
     println!("commands_applied={}", stats.commands_applied);
+    println!("command_queue_drops={}", stats.command_queue_drops);
     println!(
         "gateway_commands_dispatched={}",
         stats.gateway_commands_dispatched
@@ -255,14 +275,32 @@ fn main() {
         stats.command_latency_ticks_max
     );
     println!("command_queue_max={}", stats.command_queue_max);
+    println!("router_events_routed={}", stats.router_events_routed);
+    println!("router_events_drained={}", stats.router_events_drained);
+    println!("router_event_drops={}", stats.router_event_drops);
+    println!("router_queue_max={}", stats.router_queue_max);
     println!("max_cell_entities={}", stats.max_cell_entities);
     println!("warm_stations={}", stats.warm_stations);
     println!("hotspot_stations={}", stats.hotspot_stations);
     println!("split_candidate_cells={}", stats.split_candidate_cells);
+    println!(
+        "scheduler_candidates_considered={}",
+        stats.scheduler_candidates_considered
+    );
+    println!(
+        "scheduler_stations_selected={}",
+        stats.scheduler_stations_selected
+    );
+    println!(
+        "scheduler_total_advances={}",
+        stats.scheduler_total_advances
+    );
     let tick_ms_p50 = percentile_ms(&stats.tick_ms, 0.50);
+    let tick_ms_p95 = percentile_ms(&stats.tick_ms, 0.95);
     let tick_ms_p99 = percentile_ms(&stats.tick_ms, 0.99);
     let tick_ms_max = percentile_ms(&stats.tick_ms, 1.00);
     println!("tick_ms_p50={tick_ms_p50:.3}");
+    println!("tick_ms_p95={tick_ms_p95:.3}");
     println!("tick_ms_p99={tick_ms_p99:.3}");
     println!("tick_ms_max={tick_ms_max:.3}");
     let verdict = BenchVerdict::evaluate(config.thresholds, &stats, tick_ms_p99);
@@ -276,6 +314,14 @@ fn main() {
         config.thresholds.command_queue_max
     );
     println!(
+        "threshold_command_queue_drops_max={}",
+        config.thresholds.command_queue_drops_max
+    );
+    println!(
+        "threshold_router_event_drops_max={}",
+        config.thresholds.router_event_drops_max
+    );
+    println!(
         "threshold_estimated_payload_bytes={}",
         config.thresholds.estimated_payload_bytes
     );
@@ -285,7 +331,23 @@ fn main() {
         verdict.command_latency_ok
     );
     println!("threshold_command_queue_ok={}", verdict.command_queue_ok);
+    println!(
+        "threshold_command_queue_drops_ok={}",
+        verdict.command_queue_drops_ok
+    );
+    println!(
+        "threshold_router_event_drops_ok={}",
+        verdict.router_event_drops_ok
+    );
     println!("threshold_payload_ok={}", verdict.payload_ok);
+    println!(
+        "threshold_command_delivery_ok={}",
+        verdict.command_delivery_ok
+    );
+    println!(
+        "threshold_router_delivery_ok={}",
+        verdict.router_delivery_ok
+    );
     println!("threshold_client_bridge_ok={}", verdict.client_bridge_ok);
     println!("benchmark_ok={}", verdict.is_ok());
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
@@ -306,7 +368,11 @@ struct BenchVerdict {
     tick_ok: bool,
     command_latency_ok: bool,
     command_queue_ok: bool,
+    command_queue_drops_ok: bool,
+    router_event_drops_ok: bool,
     payload_ok: bool,
+    command_delivery_ok: bool,
+    router_delivery_ok: bool,
     client_bridge_ok: bool,
 }
 
@@ -318,7 +384,17 @@ impl BenchVerdict {
             command_latency_ok: stats.command_latency_ticks_max
                 <= thresholds.command_latency_ticks_max,
             command_queue_ok: stats.command_queue_max <= thresholds.command_queue_max,
+            command_queue_drops_ok: stats.command_queue_drops <= thresholds.command_queue_drops_max,
+            router_event_drops_ok: stats.router_event_drops <= thresholds.router_event_drops_max,
             payload_ok: stats.estimated_payload_bytes <= thresholds.estimated_payload_bytes,
+            command_delivery_ok: stats.commands_enqueued == stats.commands_applied
+                && stats.gateway_commands_dispatched == stats.command_dispatch_packets
+                && stats.command_dispatch_packets == stats.command_dispatch_enqueued
+                && stats.command_dispatch_enqueued == stats.command_dispatch_applied,
+            router_delivery_ok: stats.router_events_routed
+                == stats
+                    .router_events_drained
+                    .saturating_add(stats.router_event_drops),
             client_bridge_ok: stats.client_bridge_gateway_commands_accepted
                 == expected_client_bridge_frames
                 && stats.client_bridge_gateway_acks_sent == expected_client_bridge_frames
@@ -332,7 +408,11 @@ impl BenchVerdict {
         self.tick_ok
             && self.command_latency_ok
             && self.command_queue_ok
+            && self.command_queue_drops_ok
+            && self.router_event_drops_ok
             && self.payload_ok
+            && self.command_delivery_ok
+            && self.router_delivery_ok
             && self.client_bridge_ok
     }
 }
@@ -410,6 +490,14 @@ impl BenchConfig {
             } else if let Some(value) = arg.strip_prefix("--command-queue-budget=") {
                 config.thresholds.command_queue_max =
                     value.parse().unwrap_or(config.thresholds.command_queue_max);
+            } else if let Some(value) = arg.strip_prefix("--command-queue-drops-budget=") {
+                config.thresholds.command_queue_drops_max = value
+                    .parse()
+                    .unwrap_or(config.thresholds.command_queue_drops_max);
+            } else if let Some(value) = arg.strip_prefix("--router-event-drops-budget=") {
+                config.thresholds.router_event_drops_max = value
+                    .parse()
+                    .unwrap_or(config.thresholds.router_event_drops_max);
             } else if let Some(value) = arg.strip_prefix("--payload-bytes-budget=") {
                 config.thresholds.estimated_payload_bytes = value
                     .parse()
@@ -466,7 +554,8 @@ fn run(config: BenchConfig) -> BenchStats {
     let clients = create_clients(config.clients);
 
     let mut stats = BenchStats::default();
-    apply_hotspot_report(&mut stats, config, &stations, &indexes);
+    let load_samples = apply_hotspot_report(&mut stats, config, &stations, &indexes);
+    apply_scheduler_report(&mut stats, config, &load_samples);
     let mut encoder = BinaryFrameEncoder;
     let mut transport = FakeTransport::default();
     let mut command_queues = create_command_queues(config.stations);
@@ -474,12 +563,22 @@ fn run(config: BenchConfig) -> BenchStats {
     let mut client_bridge = ClientBridgeBench::new(config);
     let mut replication_scratch = ReplicationScratch::default();
     let mut next_command_id = 1_u64;
+    let mut next_event_id = 1_u64;
+    let mut event_router = EventRouter::new(EventQueueLimits {
+        critical: 8,
+        important: 32,
+        best_effort: 64,
+    });
+    for station in &stations {
+        event_router.register_station(station.config().station_id);
+    }
 
     for tick_index in 0..config.ticks {
         let tick_start = Instant::now();
         for station in &mut stations {
             station.advance_tick();
         }
+        exercise_event_router(&stations, &mut event_router, &mut next_event_id, &mut stats);
 
         enqueue_commands(
             config,
@@ -540,6 +639,9 @@ fn run(config: BenchConfig) -> BenchStats {
             };
 
             stats.updates += updates;
+            stats.replication_candidates_selected = stats
+                .replication_candidates_selected
+                .saturating_add(updates);
             stats.estimated_payload_bytes += updates * 32;
             let entity_deltas = build_sample_deltas(updates, client_index, station.tick());
             stats.payload_entity_deltas += entity_deltas.len();
@@ -575,6 +677,10 @@ fn run(config: BenchConfig) -> BenchStats {
 
     stats.encoded_packets = transport.packets_sent();
     stats.encoded_bytes = transport.bytes_sent();
+    let router_stats = event_router.stats();
+    stats.router_events_routed = router_stats.routed_events;
+    stats.router_events_drained = router_stats.drained_events;
+    stats.router_event_drops = router_stats.dropped_best_effort_events;
     stats
 }
 
@@ -1027,11 +1133,11 @@ fn enqueue_commands(
             },
             payload: Vec::new(),
         };
-        if command_queues[station_index]
-            .push(command, CommandIngress::RUNNING)
-            .is_ok()
-        {
-            stats.commands_enqueued += 1;
+        match command_queues[station_index].push(command, CommandIngress::RUNNING) {
+            Ok(_) => stats.commands_enqueued = stats.commands_enqueued.saturating_add(1),
+            Err(_) => {
+                stats.command_queue_drops = stats.command_queue_drops.saturating_add(1);
+            }
         }
         stats.command_queue_max = stats
             .command_queue_max
@@ -1091,9 +1197,10 @@ fn apply_hotspot_report(
     config: BenchConfig,
     stations: &[Station],
     indexes: &[CellIndex],
-) {
+) -> Vec<StationLoadSample> {
     let thresholds = hotspot_thresholds(config);
     let subscribers_per_station = config.clients.div_ceil(config.stations);
+    let mut samples = Vec::with_capacity(stations.len());
 
     for (station, index) in stations.iter().zip(indexes) {
         let cells = index
@@ -1139,6 +1246,70 @@ fn apply_hotspot_report(
                     .len();
             }
         }
+        samples.push(sample);
+    }
+
+    samples
+}
+
+fn apply_scheduler_report(
+    stats: &mut BenchStats,
+    config: BenchConfig,
+    samples: &[StationLoadSample],
+) {
+    let mut stations = StationSet::default();
+    for station in create_stations(config.stations) {
+        stations.push(station);
+    }
+    let plan = StationScheduler::default().plan_loaded(
+        &stations,
+        samples,
+        StationScheduleConfig {
+            max_station_advances_per_step: config.stations.min(2),
+        },
+    );
+    stats.scheduler_candidates_considered = plan.candidates_considered;
+    stats.scheduler_stations_selected = plan.stations_selected;
+    stats.scheduler_total_advances = plan.total_advances;
+}
+
+fn exercise_event_router(
+    stations: &[Station],
+    router: &mut EventRouter,
+    next_event_id: &mut u64,
+    stats: &mut BenchStats,
+) {
+    for (station_index, station) in stations.iter().enumerate() {
+        let source_index = if station_index == 0 {
+            stations.len().saturating_sub(1)
+        } else {
+            station_index - 1
+        };
+        let event_id = *next_event_id;
+        *next_event_id = next_event_id.saturating_add(1);
+        router
+            .route(StationEvent {
+                id: EventId::new(event_id),
+                source: stations[source_index].config().station_id,
+                target: station.config().station_id,
+                source_tick: station.tick(),
+                target_tick: station.tick(),
+                priority: EventPriority::BestEffort,
+                kind: EventKind::Custom((event_id % u32::MAX as u64) as u32),
+            })
+            .expect("smoke event router should accept bounded event");
+    }
+
+    let queued = stations
+        .iter()
+        .filter_map(|station| router.queued_len(station.config().station_id))
+        .sum::<usize>();
+    stats.router_queue_max = stats.router_queue_max.max(queued);
+
+    for station in stations {
+        router
+            .drain_ready(station.config().station_id, station.tick())
+            .expect("smoke event router target should remain registered");
     }
 }
 
@@ -1252,5 +1423,51 @@ mod tests {
         assert!(!config.default_resource_guard_applied);
         assert_eq!(config.entities, 1_000_000);
         assert_eq!(config.clients, 10_000);
+    }
+
+    #[test]
+    fn percentile_reports_requested_tick_latency_cutoffs() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0];
+
+        assert_eq!(percentile_ms(&values, 0.50), 3.0);
+        assert_eq!(percentile_ms(&values, 0.95), 5.0);
+        assert_eq!(percentile_ms(&values, 0.99), 5.0);
+    }
+
+    #[test]
+    fn drop_thresholds_fail_the_benchmark_verdict() {
+        let stats = BenchStats {
+            command_queue_drops: 1,
+            router_event_drops: 1,
+            ..BenchStats::default()
+        };
+
+        let verdict = BenchVerdict::evaluate(BenchThresholds::default(), &stats, 0.0);
+
+        assert!(!verdict.command_queue_drops_ok);
+        assert!(!verdict.router_event_drops_ok);
+        assert!(!verdict.is_ok());
+    }
+
+    #[test]
+    fn smoke_run_records_acceptance_matrix_signals() {
+        let stats = run(BenchConfig {
+            entities: 64,
+            clients: 8,
+            stations: 2,
+            ticks: 2,
+            ..BenchConfig::default()
+        });
+
+        assert_eq!(stats.tick_ms.len(), 2);
+        assert!(stats.replication_candidates_selected > 0);
+        assert_eq!(stats.command_queue_drops, 0);
+        assert_eq!(stats.router_events_routed, 4);
+        assert_eq!(stats.router_events_drained, 4);
+        assert_eq!(stats.router_event_drops, 0);
+        assert_eq!(stats.router_queue_max, 2);
+        assert_eq!(stats.scheduler_candidates_considered, 2);
+        assert_eq!(stats.scheduler_stations_selected, 2);
+        assert_eq!(stats.scheduler_total_advances, 2);
     }
 }
