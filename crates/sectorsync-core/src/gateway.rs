@@ -719,12 +719,12 @@ mod tests {
         );
         assert_eq!(replaced.route.generation, connected.route.generation + 1);
         assert_eq!(replaced.route.station_id, StationId::new(2));
-        assert!(
+        assert_eq!(
             table
                 .admit_sequence(client_id, 1, Tick::new(21))
                 .expect("new generation should reset sequence")
-                .sequence
-                == 1
+                .sequence,
+            1
         );
     }
 
