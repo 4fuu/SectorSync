@@ -156,6 +156,11 @@ impl CellIndex {
         self.cells.get(&cell).cloned().unwrap_or_default()
     }
 
+    /// Returns handles indexed directly in one cell without allocating.
+    pub fn handles_in_cell_slice(&self, cell: CellCoord3) -> &[EntityHandle] {
+        self.cells.get(&cell).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Returns cells currently occupied by one entity handle.
     pub fn cells_for_handle(&self, handle: EntityHandle) -> Option<&[CellCoord3]> {
         self.entity_cells.get(&handle).map(Vec::as_slice)
@@ -199,6 +204,12 @@ mod tests {
         let cell = grid.cell_at(Position3::new(1.0, 2.0, 3.0));
 
         assert_eq!(index.handles_in_cell(cell), vec![handle]);
+        assert_eq!(index.handles_in_cell_slice(cell), &[handle]);
+        assert!(
+            index
+                .handles_in_cell_slice(CellCoord3::new(99, 99, 99))
+                .is_empty()
+        );
         assert_eq!(index.cells_for_handle(handle), Some([cell].as_slice()));
     }
 

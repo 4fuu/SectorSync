@@ -67,6 +67,10 @@
   or ACK/retry/duplicate-suppression behavior.
 - Use `cargo run -p sectorsync-bench --example generated_schema` when changing
   component schema helpers, generated layout descriptors, or schema hashes.
+- Use `cargo run -p sectorsync-bench --example load_sampling` when changing
+  runtime station load sampling, station/index-derived load accounting,
+  event-router queue pressure sampling, or caller-provided subscriber
+  aggregation.
 - Use `cargo run -p sectorsync-bench --example load_scheduler` when changing
   station scheduler behavior, load-aware scheduling, or station advancement
   planning.
@@ -141,6 +145,11 @@ The core library does not own:
   scheduling may prioritize station advances from `StationLoadSample`, but it
   must not add hidden threads, process placement, accelerator execution,
   blocking waits, or game business scheduling.
+- Runtime load sampling must stay explicit and caller-driven. It may classify
+  station records and indexed cells, read bounded event-router queue depth, and
+  aggregate caller-provided station subscriber counts. It must not infer
+  per-cell game semantics, inspect OS metrics, add hidden threads, place
+  processes, execute GPU work, or own cluster scheduling.
 - Runtime barrier work must preserve the sequence: request, align to tick
   boundary, freeze, snapshot or migrate, resume.
 - Runtime barrier notification bridges may encode and broadcast barrier states

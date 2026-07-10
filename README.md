@@ -93,8 +93,10 @@ Current crates:
   bounded client replication send/receive transport bridge, a low-level client
   command/inbound-frame transport bridge, a runtime barrier notification
   transport bridge, a frozen snapshot upgrade executor, a bounded gateway client
-  command transport bridge, a business-agnostic gateway command pipeline, and a
-  bounded load-aware station scheduler.
+  command transport bridge, a business-agnostic gateway command pipeline, a
+  runtime station load sampler that combines station storage, spatial indexes,
+  queued events, and caller-provided subscriber counts, plus a bounded
+  load-aware station scheduler.
 - `crates/sectorsync-bench`: deterministic lightweight benchmark executable.
 
 Useful commands:
@@ -106,6 +108,7 @@ cargo run -p sectorsync-bench -- --profile=smoke --baseline=full
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example split_tuning
+cargo run -p sectorsync-bench --example load_sampling
 cargo run -p sectorsync-bench --example load_scheduler
 cargo run -p sectorsync-bench --example frustum_visibility
 cargo run -p sectorsync-bench --example tag_visibility
@@ -318,6 +321,11 @@ Initial status:
   It includes planning guards for source cooldown, minimum source/target score
   improvement, target score capacity after move, warm-target admission, and
   explicit skip counters for tuning.
+- Runtime load sampling derives deterministic station samples from authoritative
+  and ghost records, station-local cell indexes, bounded event-router queues, and
+  caller-provided station subscriber counts. It keeps queue/subscriber pressure
+  station-scoped rather than inventing per-cell business distribution and does
+  not collect OS, thread, GPU, process-placement, or cluster metrics.
 - Runtime station scheduler can turn station load samples into a deterministic
   bounded advancement plan and advance only the selected high-pressure stations
   by one tick, leaving thread pools, process scheduling, and accelerator
@@ -338,6 +346,9 @@ Initial status:
 - `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
   scheduler cooldown and target-capacity guard behavior without running a heavy
   benchmark profile.
+- `cargo run -p sectorsync-bench --example load_sampling` derives runtime load
+  samples from station/index/router state and aggregated caller subscriber counts,
+  then feeds them into a bounded load-aware station scheduler pass.
 - `cargo run -p sectorsync-bench --example load_scheduler` demonstrates a
   bounded load-aware station scheduler pass that prioritizes high-pressure
   stations without owning thread pools, processes, or GPU execution.

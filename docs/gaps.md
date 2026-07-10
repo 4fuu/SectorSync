@@ -29,38 +29,14 @@ Already implemented and covered by examples or tests:
 - Runtime barriers for tick-boundary freeze/snapshot/resume and frozen
   snapshot upgrade hooks.
 - Conservative split scheduling, cell migration execution, deployment route
-  metadata, and bounded load-aware station scheduling.
+  metadata, runtime load sampling from station/index/router state plus explicit
+  subscriber input, and bounded load-aware station scheduling.
 - Resource-guarded benchmarks with smoke defaults and explicit heavy-profile
   opt-in.
 
 ## Delivery Gaps
 
-### 1. Runtime Load Sampling
-
-Gap:
-
-- Hotspot planning and load-aware station scheduling can consume
-  `StationLoadSample`, but the committed SDK still needs a documented,
-  verified path that derives those samples from runtime structures such as
-  station storage, spatial indexes, event queues, and caller-provided subscriber
-  counts.
-
-Why it matters:
-
-- Integrators should not have to hand-author load samples just to use hotspot
-  splitting or scheduler prioritization.
-- Sampling must stay middleware-level: no game semantics, hidden threads,
-  process placement, OS metrics, GPU execution, or cluster scheduler ownership.
-
-Completion evidence:
-
-- Public runtime sampler API.
-- Unit test covering owned/ghost counts, per-cell classification, queued event
-  pressure, and subscriber count aggregation.
-- Executable example showing sampling feeding load-aware scheduling.
-- README and AGENTS updates naming the example and boundary rules.
-
-### 2. SDK Flow Hardening
+### 1. SDK Flow Hardening
 
 Gap:
 
@@ -82,7 +58,7 @@ Completion evidence:
 - Clear examples of what external systems own: auth, anti-cheat, persistence,
   matchmaking, process orchestration, GPU batches, and business ECS.
 
-### 3. Performance Acceptance Matrix
+### 2. Performance Acceptance Matrix
 
 Gap:
 
@@ -106,7 +82,7 @@ Completion evidence:
   grid AOI.
 - No heavy benchmark path runs implicitly without `--allow-heavy`.
 
-### 4. Hotspot Calibration
+### 3. Hotspot Calibration
 
 Gap:
 
@@ -126,7 +102,7 @@ Completion evidence:
 - Benchmarks report before/after pressure and migrated-cell/entity counts.
 - AGENTS keeps heavyweight calibration explicitly gated.
 
-### 5. Production Boundary Adapters
+### 4. Production Boundary Adapters
 
 Gap:
 
@@ -147,7 +123,7 @@ Completion evidence:
   route discovery metadata without SectorSync owning those systems.
 - Documentation names unsupported production responsibilities directly.
 
-### 6. Documentation Finish
+### 5. Documentation Finish
 
 Gap:
 
@@ -183,11 +159,10 @@ external adapters:
 
 ## Suggested Next Commit Order
 
-1. Finish runtime load sampling and document the example.
-2. Add or expand a cohesive SDK integration flow.
-3. Add a benchmark acceptance matrix document and make smoke output map to it.
-4. Calibrate hotspot/scheduler examples against larger guarded workloads.
-5. Polish production-boundary adapter examples without moving production
+1. Add or expand a cohesive SDK integration flow.
+2. Add a benchmark acceptance matrix document and make smoke output map to it.
+3. Calibrate hotspot/scheduler examples against larger guarded workloads.
+4. Polish production-boundary adapter examples without moving production
    ownership into SectorSync.
 
 Each step should keep default verification lightweight and should leave heavier

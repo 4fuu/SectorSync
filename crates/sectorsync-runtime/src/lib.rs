@@ -7,14 +7,14 @@ pub mod deployment;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, ClientId, CommandEnvelope,
-    CommandId, CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues, ComponentStore,
-    EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues, GatewayError,
-    GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner, HotspotSeverity,
-    HotspotThresholds, NodeId, OwnerEpoch, PolicyTable, PushOutcome, ReplicationBudget,
-    ReplicationPlan, ReplicationPlanner, RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion,
-    SplitProposal, Station, StationError, StationEvent, StationId, StationLoadSample,
-    StationSnapshot, Tick, ViewerQuery, VisibilityFilter,
+    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CellLoadSample, ClientId,
+    CommandEnvelope, CommandId, CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues,
+    ComponentStore, EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues,
+    GatewayError, GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner,
+    HotspotSeverity, HotspotThresholds, NodeId, OwnerEpoch, PolicyTable, PushOutcome,
+    ReplicationBudget, ReplicationPlan, ReplicationPlanner, RuntimeBarrier, RuntimeUpgradeHook,
+    SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
+    StationLoadSample, StationSnapshot, Tick, ViewerQuery, VisibilityFilter,
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
@@ -2149,10 +2149,229 @@ impl StationIndexSet {
         self.indexes.len()
     }
 
+    /// Iterates over registered indexes.
+    pub fn iter(&self) -> impl Iterator<Item = (StationId, &CellIndex)> {
+        self.indexes
+            .iter()
+            .map(|(station_id, index)| (*station_id, index))
+    }
+
     /// Returns whether no indexes are registered.
     pub fn is_empty(&self) -> bool {
         self.indexes.is_empty()
     }
+}
+
+/// Lightweight coefficients used to derive hotspot/scheduler load samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationLoadSamplerConfig {
+    /// Estimated bytes contributed by one stored entity in the measurement window.
+    pub estimated_bytes_per_entity: usize,
+    /// Estimated bytes contributed by one subscriber routed to a station.
+    pub estimated_bytes_per_subscriber: usize,
+    /// Estimated bytes contributed by one queued station event.
+    pub estimated_bytes_per_event: usize,
+    /// Runtime cost units assigned to one authoritative entity.
+    pub tick_cost_per_owned_entity: u64,
+    /// Runtime cost units assigned to one read-only ghost entity.
+    pub tick_cost_per_ghost_entity: u64,
+    /// Runtime cost units assigned to one occupied spatial cell.
+    pub tick_cost_per_occupied_cell: u64,
+    /// Runtime cost units assigned to one queued station event.
+    pub tick_cost_per_queued_event: u64,
+}
+
+impl Default for StationLoadSamplerConfig {
+    fn default() -> Self {
+        Self {
+            estimated_bytes_per_entity: 48,
+            estimated_bytes_per_subscriber: 16,
+            estimated_bytes_per_event: 32,
+            tick_cost_per_owned_entity: 2,
+            tick_cost_per_ghost_entity: 1,
+            tick_cost_per_occupied_cell: 1,
+            tick_cost_per_queued_event: 1,
+        }
+    }
+}
+
+/// Runtime helper that derives `StationLoadSample` from existing low-level state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationLoadSampler {
+    config: StationLoadSamplerConfig,
+}
+
+impl StationLoadSampler {
+    /// Creates a station load sampler.
+    pub const fn new(config: StationLoadSamplerConfig) -> Self {
+        Self { config }
+    }
+
+    /// Returns the sampler configuration.
+    pub const fn config(&self) -> StationLoadSamplerConfig {
+        self.config
+    }
+
+    /// Samples one station from its storage, optional index, queued event count,
+    /// and caller-provided subscriber estimate.
+    pub fn sample_station(
+        &self,
+        station: &Station,
+        index: Option<&CellIndex>,
+        queued_events: usize,
+        subscribers: usize,
+    ) -> StationLoadSample {
+        let (owned_entities, ghost_entities) = count_station_roles(station);
+        let cells = index
+            .map(|index| self.sample_cells(station, index))
+            .unwrap_or_default();
+        StationLoadSample {
+            station_id: station.config().station_id,
+            owned_entities,
+            ghost_entities,
+            subscribers,
+            queued_events,
+            estimated_bytes: self.estimate_station_bytes(
+                owned_entities,
+                ghost_entities,
+                subscribers,
+                queued_events,
+            ),
+            tick_cost_units: self.estimate_tick_cost(
+                owned_entities,
+                ghost_entities,
+                cells.len(),
+                queued_events,
+            ),
+            cells,
+        }
+    }
+
+    /// Samples every station in deterministic station-set order.
+    ///
+    /// `subscriber_counts` is explicit integration input: SectorSync can use it
+    /// for load decisions, but does not own gateway/client/session business state.
+    /// Counts with the same station id are aggregated with saturating arithmetic.
+    /// Because the event router and subscriber input are station-scoped, their
+    /// pressure stays on the station sample instead of being invented per cell.
+    pub fn sample_all(
+        &self,
+        stations: &StationSet,
+        indexes: &StationIndexSet,
+        router: &EventRouter,
+        subscriber_counts: &[(StationId, usize)],
+    ) -> Vec<StationLoadSample> {
+        let subscribers_by_station = station_count_map(subscriber_counts);
+        stations
+            .iter()
+            .map(|station| {
+                let station_id = station.config().station_id;
+                self.sample_station(
+                    station,
+                    indexes.get(station_id),
+                    router.queued_len(station_id).unwrap_or(0),
+                    subscribers_by_station
+                        .get(&station_id)
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    fn sample_cells(&self, station: &Station, index: &CellIndex) -> Vec<CellLoadSample> {
+        index
+            .cell_occupancy()
+            .into_iter()
+            .map(|occupancy| {
+                let mut owned_entities = 0usize;
+                let mut ghost_entities = 0usize;
+                for handle in index.handles_in_cell_slice(occupancy.cell) {
+                    if let Some(record) = station.get(*handle) {
+                        if record.is_owned() {
+                            owned_entities = owned_entities.saturating_add(1);
+                        } else {
+                            ghost_entities = ghost_entities.saturating_add(1);
+                        }
+                    }
+                }
+                let entities = owned_entities.saturating_add(ghost_entities);
+                CellLoadSample {
+                    cell: occupancy.cell,
+                    owned_entities,
+                    ghost_entities,
+                    subscribers: 0,
+                    estimated_updates: entities,
+                    estimated_bytes: entities
+                        .saturating_mul(self.config.estimated_bytes_per_entity),
+                    tick_cost_units: self.estimate_tick_cost(owned_entities, ghost_entities, 1, 0),
+                    event_pressure: 0,
+                }
+            })
+            .collect()
+    }
+
+    fn estimate_station_bytes(
+        &self,
+        owned_entities: usize,
+        ghost_entities: usize,
+        subscribers: usize,
+        queued_events: usize,
+    ) -> usize {
+        owned_entities
+            .saturating_add(ghost_entities)
+            .saturating_mul(self.config.estimated_bytes_per_entity)
+            .saturating_add(subscribers.saturating_mul(self.config.estimated_bytes_per_subscriber))
+            .saturating_add(queued_events.saturating_mul(self.config.estimated_bytes_per_event))
+    }
+
+    fn estimate_tick_cost(
+        &self,
+        owned_entities: usize,
+        ghost_entities: usize,
+        occupied_cells: usize,
+        queued_events: usize,
+    ) -> u64 {
+        (owned_entities as u64)
+            .saturating_mul(self.config.tick_cost_per_owned_entity)
+            .saturating_add(
+                (ghost_entities as u64).saturating_mul(self.config.tick_cost_per_ghost_entity),
+            )
+            .saturating_add(
+                (occupied_cells as u64).saturating_mul(self.config.tick_cost_per_occupied_cell),
+            )
+            .saturating_add(
+                (queued_events as u64).saturating_mul(self.config.tick_cost_per_queued_event),
+            )
+    }
+}
+
+impl Default for StationLoadSampler {
+    fn default() -> Self {
+        Self::new(StationLoadSamplerConfig::default())
+    }
+}
+
+fn count_station_roles(station: &Station) -> (usize, usize) {
+    let mut owned_entities = 0usize;
+    let mut ghost_entities = 0usize;
+    for record in station.iter() {
+        if record.is_owned() {
+            owned_entities = owned_entities.saturating_add(1);
+        } else {
+            ghost_entities = ghost_entities.saturating_add(1);
+        }
+    }
+    (owned_entities, ghost_entities)
+}
+
+fn station_count_map(counts: &[(StationId, usize)]) -> BTreeMap<StationId, usize> {
+    let mut map = BTreeMap::new();
+    for (station_id, count) in counts {
+        let entry = map.entry(*station_id).or_insert(0usize);
+        *entry = entry.saturating_add(*count);
+    }
+    map
 }
 
 /// Result of an in-process entity owner migration.
@@ -5249,6 +5468,96 @@ mod tests {
         assert_eq!(
             stations.get(StationId::new(3)).expect("station").tick(),
             Tick::new(1)
+        );
+    }
+
+    #[test]
+    fn station_load_sampler_derives_cells_router_and_subscribers() {
+        let station_id = StationId::new(1);
+        let owner_position = Position3::new(1.0, 0.0, 0.0);
+        let ghost_position = Position3::new(12.0, 0.0, 0.0);
+        let policy_id = PolicyId::new(1);
+        let mut station = station(1, 10);
+        let owner = station
+            .spawn_owned(EntityId::new(10), owner_position, Bounds::Point, policy_id)
+            .expect("owner should spawn");
+        let ghost = station.upsert_ghost(
+            EntityId::new(20),
+            ghost_position,
+            Bounds::Point,
+            policy_id,
+            StationId::new(9),
+            OwnerEpoch::new(3),
+            Tick::new(30),
+        );
+
+        let grid = GridSpec::new(10.0).expect("grid should build");
+        let mut index = CellIndex::new(grid);
+        index.upsert(owner, owner_position, Bounds::Point);
+        index.upsert(ghost, ghost_position, Bounds::Point);
+        let mut indexes = StationIndexSet::default();
+        indexes.insert(station_id, index);
+
+        let mut stations = StationSet::default();
+        stations.push(station);
+        let mut router = EventRouter::default();
+        router.register_station(station_id);
+        for (event_id, kind) in [(1_u64, 1_u32), (2, 2)] {
+            router
+                .route(StationEvent {
+                    id: EventId::new(event_id),
+                    source: StationId::new(9),
+                    target: station_id,
+                    source_tick: Tick::new(0),
+                    target_tick: Tick::new(4),
+                    priority: EventPriority::Important,
+                    kind: EventKind::Custom(kind),
+                })
+                .expect("event should queue");
+        }
+
+        assert_eq!(indexes.iter().count(), 1);
+        let sampler = StationLoadSampler::default();
+        let samples = sampler.sample_all(
+            &stations,
+            &indexes,
+            &router,
+            &[(station_id, 2), (station_id, 3)],
+        );
+
+        assert_eq!(samples.len(), 1);
+        let sample = &samples[0];
+        assert_eq!(sample.station_id, station_id);
+        assert_eq!(sample.owned_entities, 1);
+        assert_eq!(sample.ghost_entities, 1);
+        assert_eq!(sample.subscribers, 5);
+        assert_eq!(sample.queued_events, 2);
+        assert_eq!(sample.estimated_bytes, 240);
+        assert_eq!(sample.tick_cost_units, 7);
+        assert_eq!(
+            sample.cells,
+            vec![
+                CellLoadSample {
+                    cell: grid.cell_at(owner_position),
+                    owned_entities: 1,
+                    ghost_entities: 0,
+                    subscribers: 0,
+                    estimated_updates: 1,
+                    estimated_bytes: 48,
+                    tick_cost_units: 3,
+                    event_pressure: 0,
+                },
+                CellLoadSample {
+                    cell: grid.cell_at(ghost_position),
+                    owned_entities: 0,
+                    ghost_entities: 1,
+                    subscribers: 0,
+                    estimated_updates: 1,
+                    estimated_bytes: 48,
+                    tick_cost_units: 2,
+                    event_pressure: 0,
+                },
+            ]
         );
     }
 
