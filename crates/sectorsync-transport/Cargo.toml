@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Bounded in-memory, reliable packet, and UDP transport adapters for SectorSync"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
 documentation = "https://docs.rs/sectorsync-transport"

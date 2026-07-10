@@ -1,5 +1,8 @@
 # SectorSync
 
+[![CI](https://github.com/4fuu/SectorSync/actions/workflows/ci.yml/badge.svg)](https://github.com/4fuu/SectorSync/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 SectorSync is a dependency-light Rust middleware workspace for spatial,
 real-time entity replication across large maps and multiple simulation
 stations. It provides low-level, bounded primitives that can be embedded in a
@@ -166,7 +169,6 @@ thresholds or running larger workloads.
 - [Performance acceptance matrix](docs/performance-acceptance.md)
 - [Production adapter boundaries](docs/production-adapters.md)
 - [Delivery status and explicit non-goals](docs/gaps.md)
-- [Release process](docs/releasing.md)
 
 Generate local API documentation with:
 
