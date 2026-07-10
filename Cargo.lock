@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "sectorsync-bench"
-version = "0.1.0"
+version = "2026.7.10"
 dependencies = [
  "sectorsync-core",
  "sectorsync-runtime",
@@ -14,11 +14,11 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-core"
-version = "0.1.0"
+version = "2026.7.10"
 
 [[package]]
 name = "sectorsync-runtime"
-version = "0.1.0"
+version = "2026.7.10"
 dependencies = [
  "sectorsync-core",
  "sectorsync-transport",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-transport"
-version = "0.1.0"
+version = "2026.7.10"
 dependencies = [
  "sectorsync-core",
  "sectorsync-wire",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-wire"
-version = "0.1.0"
+version = "2026.7.10"
 dependencies = [
  "sectorsync-core",
 ]

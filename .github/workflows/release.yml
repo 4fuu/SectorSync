@@ -55,11 +55,12 @@ jobs:
             | unique
             | if length == 1 then .[0] else error("published crate versions differ") end')"
 
-          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Automatic releases require a stable x.y.z workspace version: $current_version" >&2
+          if [[ ! "$current_version" =~ ^[1-9][0-9]{3}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])$ ]]; then
+            echo "Automatic releases require an unpadded YYYY.M.D workspace version: $current_version" >&2
             exit 1
           fi
 
+          calendar_version="$(TZ=Asia/Hong_Kong date '+%Y.%-m.%-d')"
           current_tag="v$current_version"
           head_commit="$(git rev-parse HEAD)"
           if git rev-parse --verify --quiet "refs/tags/$current_tag" >/dev/null; then
@@ -87,8 +88,13 @@ jobs:
               release_version="$current_version"
               needs_bump=false
             else
-              IFS=. read -r major minor patch <<< "$current_version"
-              release_version="$major.$minor.$((patch + 1))"
+              release_version="$calendar_version"
+              if [[ "$release_version" == "$current_version" ]]; then
+                echo "v$current_version already represents an earlier main commit today."
+                echo "Deferring additional commits until the next Asia/Hong_Kong calendar day."
+                echo "should_release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
               needs_bump=true
             fi
           else
@@ -110,7 +116,7 @@ jobs:
           echo "version=$release_version" >> "$GITHUB_OUTPUT"
           echo "needs_bump=$needs_bump" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare patch version
+      - name: Prepare calendar version
         if: steps.release.outputs.needs_bump == 'true'
         shell: bash
         env:
@@ -123,12 +129,27 @@ jobs:
           from pathlib import Path
 
           path = Path("Cargo.toml")
-          current = f'version = "{os.environ["CURRENT_VERSION"]}"'
-          release = f'version = "{os.environ["RELEASE_VERSION"]}"'
+          current_version = os.environ["CURRENT_VERSION"]
+          release_version = os.environ["RELEASE_VERSION"]
+          package_current = f'version = "{current_version}"'
+          package_release = f'version = "{release_version}"'
+          dependency_current = f'version = "={current_version}"'
+          dependency_release = f'version = "={release_version}"'
           text = path.read_text(encoding="utf-8")
-          if text.count(current) != 5:
-              raise SystemExit(f"expected five workspace version entries, found {text.count(current)}")
-          path.write_text(text.replace(current, release), encoding="utf-8")
+          if text.count(package_current) != 1 or text.count(dependency_current) != 4:
+              raise SystemExit("expected one package and four exact dependency version entries")
+          text = text.replace(package_current, package_release)
+          text = text.replace(dependency_current, dependency_release)
+          path.write_text(text, encoding="utf-8")
+
+          readme_path = Path("README.md")
+          readme = readme_path.read_text(encoding="utf-8")
+          if readme.count(dependency_current) != 4:
+              raise SystemExit("expected four exact dependency versions in README.md")
+          readme_path.write_text(
+              readme.replace(dependency_current, dependency_release),
+              encoding="utf-8",
+          )
           PY
           cargo check --workspace
 
@@ -153,7 +174,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock README.md
           git commit -m "Release v$RELEASE_VERSION"
           git push origin HEAD:main
 

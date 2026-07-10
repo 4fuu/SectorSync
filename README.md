@@ -9,9 +9,9 @@ stations. It provides low-level, bounded primitives that can be embedded in a
 game or simulation backend without imposing an engine, ECS, gateway process,
 or cluster platform.
 
-The current `0.1` line is the basic embedded SDK. Its public boundaries are
-covered by workspace tests, executable integration examples, strict Clippy,
-rustdoc, and a guarded performance acceptance runner.
+The current calendar-versioned line is the basic embedded SDK. Its public
+boundaries are covered by workspace tests, executable integration examples,
+strict Clippy, rustdoc, and a guarded performance acceptance runner.
 
 ## Features
 
@@ -53,10 +53,10 @@ application:
 
 ```toml
 [dependencies]
-sectorsync-core = "0.1"
-sectorsync-wire = "0.1"
-sectorsync-transport = "0.1"
-sectorsync-runtime = "0.1"
+sectorsync-core = "=2026.7.10"
+sectorsync-wire = "=2026.7.10"
+sectorsync-transport = "=2026.7.10"
+sectorsync-runtime = "=2026.7.10"
 ```
 
 `sectorsync-core` can be used by itself. The higher layers build on it without
@@ -192,12 +192,14 @@ git diff --check
 GitHub Actions runs the same quality gate on pushes and pull requests, plus a
 separate Rust 1.88 compatibility check. At 08:00 Asia/Hong_Kong each day, the
 Automatic release workflow checks `main` for commits after the current release.
-When work is pending, it increments the shared patch version, reruns the quality
-gate, publishes the four library crates to crates.io in dependency order, and
-creates a GitHub Release with source archives and checksums. The workflow can
-also be started manually and resumes safely when a crate version was already
-published by an earlier partial run. Registry authentication uses crates.io
-Trusted Publishing; the repository does not store a long-lived registry token.
+When work is pending, it assigns the current Asia/Hong_Kong calendar version,
+reruns the quality gate, publishes the four library crates to crates.io in
+dependency order, and creates a GitHub Release with source archives and
+checksums. At most one version is released per local calendar day; later commits
+wait for the next day. The workflow can also be started manually and resumes
+safely when a crate version was already published by an earlier partial run.
+Registry authentication uses crates.io Trusted Publishing; the repository does
+not store a long-lived registry token.
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. The
 project preserves a narrow middleware boundary and requires examples or tests
@@ -205,9 +207,12 @@ for public SDK changes.
 
 ## Stability
 
-SectorSync follows semantic versioning. While the project is below `1.0`, minor
-versions may refine public APIs, but authority, boundedness, and explicit-state
-invariants are treated as compatibility commitments.
+SectorSync uses calendar versions in unpadded `YYYY.M.D` form, such as
+`2026.7.10`. The three numeric fields remain valid for Cargo's SemVer parser,
+but the date identifies a release and does not claim API compatibility.
+Workspace crates depend on the exact same calendar version; consumers should
+review release notes before upgrading. Authority, boundedness, and
+explicit-state invariants remain compatibility commitments.
 
 ## Security
 

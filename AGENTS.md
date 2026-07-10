@@ -159,9 +159,13 @@ The embedding application owns:
 - The automatic release workflow runs daily at 08:00 Asia/Hong_Kong and may
   also be dispatched manually. It releases only when `main` is not fully
   represented by the current GitHub Release and crates.io versions.
-- Automatic releases increment only the shared patch version. Keep crate
-  publication ordered as core, wire, transport, then runtime, and keep retries
-  bounded and safe to resume after a partially completed publication.
+- Automatic releases use the unpadded Asia/Hong_Kong calendar version
+  `YYYY.M.D` and publish at most once per local day. Additional same-day commits
+  wait for the next day. Keep all internal crate requirements exact and equal,
+  and update README installation versions in the generated release commit.
+- Keep crate publication ordered as core, wire, transport, then runtime, and
+  keep retries bounded and safe to resume after a partially completed
+  publication.
 - Scheduled crates.io publishing uses only OIDC Trusted Publishing with a
   short-lived token. Do not add a long-lived crates.io token to repository
   secrets; bootstrap new crate names manually before configuring publishers.
