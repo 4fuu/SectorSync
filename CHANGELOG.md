@@ -3,9 +3,15 @@
 All notable changes to SectorSync will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-SectorSync uses unpadded `YYYY.M.D` calendar versions.
+SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
+`MMDD` field.
 
 ## [Unreleased]
+
+### Changed
+
+- Added an explicit revision field so multiple releases can be published on
+  the same Asia/Hong_Kong calendar day.
 
 ## [2026.7.10] - 2026-07-10
 

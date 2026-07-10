@@ -55,12 +55,12 @@ jobs:
             | unique
             | if length == 1 then .[0] else error("published crate versions differ") end')"
 
-          if [[ ! "$current_version" =~ ^[1-9][0-9]{3}\.([1-9]|1[0-2])\.([1-9]|[12][0-9]|3[01])$ ]]; then
-            echo "Automatic releases require an unpadded YYYY.M.D workspace version: $current_version" >&2
+          if [[ ! "$current_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Automatic releases require a stable three-part numeric version: $current_version" >&2
             exit 1
           fi
 
-          calendar_version="$(TZ=Asia/Hong_Kong date '+%Y.%-m.%-d')"
+          calendar_prefix="$(TZ=Asia/Hong_Kong date '+%Y.%-m%d')"
           current_tag="v$current_version"
           head_commit="$(git rev-parse HEAD)"
           if git rev-parse --verify --quiet "refs/tags/$current_tag" >/dev/null; then
@@ -89,12 +89,18 @@ jobs:
               release_version="$current_version"
               needs_bump=false
             else
-              release_version="$calendar_version"
-              if [[ "$release_version" == "$current_version" ]]; then
-                echo "v$current_version already represents an earlier main commit today."
-                echo "Deferring additional commits until the next Asia/Hong_Kong calendar day."
-                echo "should_release=false" >> "$GITHUB_OUTPUT"
-                exit 0
+              latest_calendar_tag="$(
+                git tag --list "v$calendar_prefix.*" --sort=-version:refname | head -n 1
+              )"
+              if [[ -n "$latest_calendar_tag" ]]; then
+                revision="${latest_calendar_tag##*.}"
+                if [[ ! "$revision" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                  echo "Invalid calendar revision in tag: $latest_calendar_tag" >&2
+                  exit 1
+                fi
+                release_version="$calendar_prefix.$((revision + 1))"
+              else
+                release_version="$calendar_prefix.0"
               fi
               needs_bump=true
             fi

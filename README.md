@@ -192,11 +192,11 @@ git diff --check
 GitHub Actions runs the same quality gate on pushes and pull requests, plus a
 separate Rust 1.88 compatibility check. At 08:00 Asia/Hong_Kong each day, the
 Automatic release workflow checks `main` for commits after the current release.
-When work is pending, it assigns the current Asia/Hong_Kong calendar version,
-reruns the quality gate, publishes the four library crates to crates.io in
-dependency order, and creates a GitHub Release with source archives and
-checksums. At most one version is released per local calendar day; later commits
-wait for the next day. The workflow can also be started manually and resumes
+When work is pending, it assigns the current Asia/Hong_Kong calendar prefix and
+next same-day revision, reruns the quality gate, publishes the four library
+crates to crates.io in dependency order, and creates a GitHub Release with
+source archives and checksums. The first release of a local day uses revision
+zero; later manual or scheduled releases increment it. The workflow resumes
 safely when a crate version was already published by an earlier partial run.
 Registry authentication uses crates.io Trusted Publishing; the repository does
 not store a long-lived registry token.
@@ -207,12 +207,14 @@ for public SDK changes.
 
 ## Stability
 
-SectorSync uses calendar versions in unpadded `YYYY.M.D` form, such as
-`2026.7.10`. The three numeric fields remain valid for Cargo's SemVer parser,
-but the date identifies a release and does not claim API compatibility.
-Workspace crates depend on the exact same calendar version; consumers should
-review release notes before upgrading. Authority, boundedness, and
-explicit-state invariants remain compatibility commitments.
+SectorSync uses calendar versions in `YYYY.MMDD.REVISION` form. The `MMDD`
+field is encoded as an unpadded integer, so July 10 starts at `2026.710.0` and
+January 5 starts at `2027.105.0`. Same-day releases increment the final field.
+The three numeric fields remain valid for Cargo's SemVer parser, but the date
+identifies a release and does not claim API compatibility. Workspace crates
+depend on the exact same calendar version; consumers should review release
+notes before upgrading. Authority, boundedness, and explicit-state invariants
+remain compatibility commitments.
 
 ## Security
 
