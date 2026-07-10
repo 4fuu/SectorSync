@@ -1,28 +1,17 @@
-name: Manual release
+name: Automatic release
 
 on:
+  schedule:
+    # GitHub cron is UTC. 00:00 UTC is 08:00 in Asia/Hong_Kong.
+    - cron: "0 0 * * *"
   workflow_dispatch:
-    inputs:
-      version:
-        description: Version shared by all published crates, without the v prefix
-        required: true
-        type: string
-      dry_run:
-        description: Build and upload artifacts without creating a GitHub Release
-        required: true
-        default: true
-        type: boolean
-      prerelease:
-        description: Mark the GitHub Release as a prerelease
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
-  group: manual-release
+  group: automatic-release
   cancel-in-progress: false
 
 env:
@@ -30,20 +19,13 @@ env:
 
 jobs:
   release:
-    name: Validate and package
+    name: Publish unreleased main commits
     runs-on: ubuntu-latest
     steps:
-      - name: Require the main branch
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            echo "Manual releases must run from the main branch." >&2
-            exit 1
-          fi
-
-      - name: Check out repository
+      - name: Check out main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Install stable Rust
@@ -55,19 +37,15 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Validate release version
+      - name: Detect unreleased commits
+        id: release
         shell: bash
         env:
-          RELEASE_VERSION: ${{ inputs.version }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid semantic version: $RELEASE_VERSION" >&2
-            exit 1
-          fi
 
-          versions="$(cargo metadata --no-deps --format-version=1 | jq -r '
+          current_version="$(cargo metadata --no-deps --format-version=1 | jq -r '
             [.packages[]
               | select(.name == "sectorsync-core"
                     or .name == "sectorsync-wire"
@@ -75,39 +53,164 @@ jobs:
                     or .name == "sectorsync-runtime")
               | .version]
             | unique
-            | .[]')"
-          if [[ "$versions" != "$RELEASE_VERSION" ]]; then
-            echo "Published crate versions do not all equal $RELEASE_VERSION:" >&2
-            echo "$versions" >&2
+            | if length == 1 then .[0] else error("published crate versions differ") end')"
+
+          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Automatic releases require a stable x.y.z workspace version: $current_version" >&2
             exit 1
           fi
 
-          if [[ "$DRY_RUN" == "false" ]] && ! grep -Fq "## [$RELEASE_VERSION]" CHANGELOG.md; then
-            echo "CHANGELOG.md must contain ## [$RELEASE_VERSION] before release." >&2
-            exit 1
+          current_tag="v$current_version"
+          head_commit="$(git rev-parse HEAD)"
+          if git rev-parse --verify --quiet "refs/tags/$current_tag" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "$current_tag")"
+            if [[ "$tag_commit" == "$head_commit" ]]; then
+              complete=true
+              if ! gh release view "$current_tag" >/dev/null 2>&1; then
+                complete=false
+              else
+                for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
+                  if ! curl --fail --silent --show-error \
+                    "https://crates.io/api/v1/crates/$crate/$current_version" >/dev/null; then
+                    complete=false
+                    break
+                  fi
+                done
+              fi
+              if [[ "$complete" == "true" ]]; then
+                echo "main is already fully released as $current_tag."
+                echo "should_release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              # Recover the same version when publishing or GitHub Release
+              # creation was interrupted after its tag reached main.
+              release_version="$current_version"
+              needs_bump=false
+            else
+              IFS=. read -r major minor patch <<< "$current_version"
+              release_version="$major.$minor.$((patch + 1))"
+              needs_bump=true
+            fi
+          else
+            # A missing current tag means either the first release or recovery
+            # from a partially completed run. Reuse the manifest version.
+            release_version="$current_version"
+            needs_bump=false
           fi
 
-          if git rev-parse --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
-            echo "Tag v$RELEASE_VERSION already exists." >&2
-            exit 1
+          if git rev-parse --verify --quiet "refs/tags/v$release_version" >/dev/null \
+            && [[ "$(git rev-list -n 1 "v$release_version")" != "$head_commit" ]]; then
+              echo "Cannot publish: tag v$release_version exists at another commit." >&2
+              exit 1
           fi
+
+          echo "Releasing main as v$release_version (version bump: $needs_bump)."
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "needs_bump=$needs_bump" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare patch version
+        if: steps.release.outputs.needs_bump == 'true'
+        shell: bash
+        env:
+          CURRENT_VERSION: ${{ steps.release.outputs.current_version }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("Cargo.toml")
+          current = f'version = "{os.environ["CURRENT_VERSION"]}"'
+          release = f'version = "{os.environ["RELEASE_VERSION"]}"'
+          text = path.read_text(encoding="utf-8")
+          if text.count(current) != 5:
+              raise SystemExit(f"expected five workspace version entries, found {text.count(current)}")
+          path.write_text(text.replace(current, release), encoding="utf-8")
+          PY
+          cargo check --workspace
 
       - name: Run release quality gate
+        if: steps.release.outputs.should_release == 'true'
         shell: bash
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
           cargo run -q -p sectorsync-bench --locked -- --profile=smoke
           git diff --check
-          git diff --exit-code
 
-      - name: Build source archives
+      - name: Commit release version
+        if: steps.release.outputs.needs_bump == 'true'
         shell: bash
         env:
-          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release v$RELEASE_VERSION"
+          git push origin HEAD:main
+
+      - name: Confirm release commit is current main
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "main changed during release preparation; refusing to publish." >&2
+            exit 1
+          fi
+
+      - name: Authenticate with crates.io trusted publishing
+        if: steps.release.outputs.should_release == 'true'
+        id: crates_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish crates.io packages
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          wait_for_registry() {
+            local crate="$1"
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error \
+                "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION" >/dev/null; then
+                return 0
+              fi
+              echo "Waiting for $crate $RELEASE_VERSION to reach the registry ($attempt/30)..."
+              sleep 10
+            done
+            echo "$crate $RELEASE_VERSION did not reach the registry in time." >&2
+            return 1
+          }
+
+          for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
+            if curl --fail --silent --show-error \
+              "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION" >/dev/null; then
+              echo "$crate $RELEASE_VERSION is already published; skipping."
+              continue
+            fi
+            cargo publish --package "$crate" --locked
+            wait_for_registry "$crate"
+          done
+
+      - name: Build source archives
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -118,10 +221,11 @@ jobs:
             --output="dist/SectorSync-$RELEASE_VERSION.zip" HEAD
           sha256sum dist/SectorSync-* > dist/SHA256SUMS
 
-      - name: Upload package artifacts
+      - name: Upload source archives
+        if: steps.release.outputs.should_release == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sectorsync-${{ inputs.version }}-source
+          name: sectorsync-${{ steps.release.outputs.version }}-source
           path: |
             dist/SectorSync-*.tar.gz
             dist/SectorSync-*.zip
@@ -130,24 +234,28 @@ jobs:
           retention-days: 14
 
       - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+        if: steps.release.outputs.should_release == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ inputs.version }}
-          PRERELEASE: ${{ inputs.prerelease }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          args=(
-            "v$RELEASE_VERSION"
-            dist/SectorSync-*.tar.gz
-            dist/SectorSync-*.zip
-            dist/SHA256SUMS
-            --target "$GITHUB_SHA"
-            --title "SectorSync v$RELEASE_VERSION"
-            --generate-notes
-          )
-          if [[ "$PRERELEASE" == "true" ]]; then
-            args+=(--prerelease)
+          if gh release view "v$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "GitHub Release v$RELEASE_VERSION already exists; skipping."
+          else
+            args=(
+              "v$RELEASE_VERSION"
+              dist/SectorSync-*.tar.gz
+              dist/SectorSync-*.zip
+              dist/SHA256SUMS
+              --title "SectorSync v$RELEASE_VERSION"
+              --generate-notes
+            )
+            if git rev-parse --verify --quiet "refs/tags/v$RELEASE_VERSION" >/dev/null; then
+              args+=(--verify-tag)
+            else
+              args+=(--target "$(git rev-parse HEAD)")
+            fi
+            gh release create "${args[@]}"
           fi
-          gh release create "${args[@]}"

@@ -1,6 +1,6 @@
 [package]
 name = "sectorsync-bench"
-version = "0.1.0"
+version.workspace = true
 description = "Guarded examples and performance acceptance runner for SectorSync"
 edition.workspace = true
 license.workspace = true

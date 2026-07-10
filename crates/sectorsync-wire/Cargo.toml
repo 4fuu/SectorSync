@@ -1,6 +1,6 @@
 [package]
 name = "sectorsync-wire"
-version = "0.1.0"
+version.workspace = true
 description = "Bounded binary wire frames and codecs for SectorSync"
 edition.workspace = true
 license.workspace = true

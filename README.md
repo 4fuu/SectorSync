@@ -115,7 +115,7 @@ and observability handoff are described in the
 | `sectorsync-runtime` | Transport bridges, gateway/deployment routing, barriers, load sampling, scheduling, and migration | Yes |
 | `sectorsync-bench` | Executable examples and guarded performance acceptance runner | No |
 
-Published crates use matching versions. The release order is core, wire,
+Published crates use one workspace version. The release order is core, wire,
 transport, then runtime.
 
 ## Examples
@@ -190,9 +190,14 @@ git diff --check
 ```
 
 GitHub Actions runs the same quality gate on pushes and pull requests, plus a
-separate Rust 1.88 compatibility check. The manual Release workflow defaults to
-a dry run that builds and uploads reviewable source archives and checksums;
-creating a GitHub Release requires an explicit workflow input.
+separate Rust 1.88 compatibility check. At 08:00 Asia/Hong_Kong each day, the
+Automatic release workflow checks `main` for commits after the current release.
+When work is pending, it increments the shared patch version, reruns the quality
+gate, publishes the four library crates to crates.io in dependency order, and
+creates a GitHub Release with source archives and checksums. The workflow can
+also be started manually and resumes safely when a crate version was already
+published by an earlier partial run. Registry authentication uses crates.io
+Trusted Publishing; the repository does not store a long-lived registry token.
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. The
 project preserves a narrow middleware boundary and requires examples or tests

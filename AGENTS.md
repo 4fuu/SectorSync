@@ -156,8 +156,15 @@ The embedding application owns:
 - Update this file when architectural invariants or release gates change.
 - Validate workflow changes with
   `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12`.
-- The manual release workflow remains `workflow_dispatch`-only, defaults to a
-  dry run, and does not publish crates.io packages or require registry secrets.
+- The automatic release workflow runs daily at 08:00 Asia/Hong_Kong and may
+  also be dispatched manually. It releases only when `main` is not fully
+  represented by the current GitHub Release and crates.io versions.
+- Automatic releases increment only the shared patch version. Keep crate
+  publication ordered as core, wire, transport, then runtime, and keep retries
+  bounded and safe to resume after a partially completed publication.
+- Scheduled crates.io publishing uses only OIDC Trusted Publishing with a
+  short-lived token. Do not add a long-lived crates.io token to repository
+  secrets; bootstrap new crate names manually before configuring publishers.
 - Published crate archives must include README and MIT LICENSE files.
 
 ## Git Rules
