@@ -1,0 +1,153 @@
+name: Manual release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version shared by all published crates, without the v prefix
+        required: true
+        type: string
+      dry_run:
+        description: Build and upload artifacts without creating a GitHub Release
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: manual-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Validate and package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the main branch
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Manual releases must run from the main branch." >&2
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@23869a5bd66b73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      - name: Validate release version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semantic version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+          versions="$(cargo metadata --no-deps --format-version=1 | jq -r '
+            [.packages[]
+              | select(.name == "sectorsync-core"
+                    or .name == "sectorsync-wire"
+                    or .name == "sectorsync-transport"
+                    or .name == "sectorsync-runtime")
+              | .version]
+            | unique
+            | .[]')"
+          if [[ "$versions" != "$RELEASE_VERSION" ]]; then
+            echo "Published crate versions do not all equal $RELEASE_VERSION:" >&2
+            echo "$versions" >&2
+            exit 1
+          fi
+
+          if [[ "$DRY_RUN" == "false" ]] && ! grep -Fq "## [$RELEASE_VERSION]" CHANGELOG.md; then
+            echo "CHANGELOG.md must contain ## [$RELEASE_VERSION] before release." >&2
+            exit 1
+          fi
+
+          if git rev-parse --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
+            echo "Tag v$RELEASE_VERSION already exists." >&2
+            exit 1
+          fi
+
+      - name: Run release quality gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+          cargo run -q -p sectorsync-bench --locked -- --profile=smoke
+          git diff --check
+          git diff --exit-code
+
+      - name: Build source archives
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          prefix="SectorSync-$RELEASE_VERSION/"
+          git archive --format=tar.gz --prefix="$prefix" \
+            --output="dist/SectorSync-$RELEASE_VERSION.tar.gz" HEAD
+          git archive --format=zip --prefix="$prefix" \
+            --output="dist/SectorSync-$RELEASE_VERSION.zip" HEAD
+          sha256sum dist/SectorSync-* > dist/SHA256SUMS
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sectorsync-${{ inputs.version }}-source
+          path: |
+            dist/SectorSync-*.tar.gz
+            dist/SectorSync-*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          args=(
+            "v$RELEASE_VERSION"
+            dist/SectorSync-*.tar.gz
+            dist/SectorSync-*.zip
+            dist/SHA256SUMS
+            --target "$GITHUB_SHA"
+            --title "SectorSync v$RELEASE_VERSION"
+            --generate-notes
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"

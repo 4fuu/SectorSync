@@ -1,17 +1,21 @@
 [package]
 name = "sectorsync-transport"
 version = "0.1.0"
+description = "Bounded in-memory, reliable packet, and UDP transport adapters for SectorSync"
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sectorsync-transport"
+keywords = ["gamedev", "networking", "reliability", "transport", "middleware"]
+categories = ["game-development", "network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-sectorsync-core = { path = "../sectorsync-core" }
-sectorsync-wire = { path = "../sectorsync-wire" }
+sectorsync-core.workspace = true
+sectorsync-wire.workspace = true
 
 [lints]
 workspace = true

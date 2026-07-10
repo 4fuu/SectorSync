@@ -11,6 +11,9 @@
 - When a benchmark must consume substantial CPU or memory, add a small default
   profile and gate larger profiles behind explicit arguments.
 - Default Rust verification should start with `cargo test --workspace`.
+- Release-quality verification must also run
+  `cargo clippy --workspace --all-targets -- -D warnings`; do not leave strict
+  Clippy debt hidden behind a weaker default command.
 - Run `cargo doc --workspace --no-deps` when changing public APIs, rustdoc,
   README use-case navigation, or SDK guide contracts. Documentation finish must
   not introduce rustdoc warnings or broken local guide/example links.
@@ -360,3 +363,10 @@ The core library does not own:
 - Do not rewrite or discard user changes.
 - Before committing, inspect `git status --short`.
 - Commit messages should state the project-level milestone, not just file names.
+- Before a public GitHub push, audit tracked/untracked files, ignored build
+  outputs, large files, private paths, credentials, private keys, generated
+  artifacts, placeholder URLs, and relevant Git history.
+- Validate changes under `.github/workflows` with
+  `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12`.
+- The manual release workflow must remain `workflow_dispatch`-only, default to a
+  dry run, and must not publish crates.io packages or require registry secrets.

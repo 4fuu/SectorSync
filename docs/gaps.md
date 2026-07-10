@@ -58,6 +58,13 @@ Completion evidence:
 - AGENTS names lightweight verification commands for each important SDK
   boundary and keeps heavy calibration behind explicit `--allow-heavy`.
 - `cargo doc --workspace --no-deps` completes without rustdoc warnings.
+- `cargo clippy --workspace --all-targets -- -D warnings` completes without
+  warnings across libraries, tests, examples, and the benchmark runner.
+- Published crate manifests carry MIT metadata, descriptions, documentation
+  links, categories, keywords, and versioned internal dependencies; package
+  lists include README and LICENSE.
+- Push/PR CI enforces the release quality gate and MSRV, while the manual GitHub
+  Release workflow defaults to reviewable dry-run artifacts.
 - Executable examples and integration tests cover the recommended external
   usage flows while core modules retain low-level middleware ownership.
 

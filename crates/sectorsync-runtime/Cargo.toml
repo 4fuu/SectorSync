@@ -1,18 +1,22 @@
 [package]
 name = "sectorsync-runtime"
 version = "0.1.0"
+description = "Bounded runtime bridges, load sampling, barriers, and migration orchestration for SectorSync"
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sectorsync-runtime"
+keywords = ["gamedev", "networking", "replication", "runtime", "middleware"]
+categories = ["game-development", "network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-sectorsync-core = { path = "../sectorsync-core" }
-sectorsync-transport = { path = "../sectorsync-transport" }
-sectorsync-wire = { path = "../sectorsync-wire" }
+sectorsync-core.workspace = true
+sectorsync-transport.workspace = true
+sectorsync-wire.workspace = true
 
 [lints]
 workspace = true

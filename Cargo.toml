@@ -10,9 +10,14 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/sectorsync"
+license = "MIT"
 rust-version = "1.88"
+
+[workspace.dependencies]
+sectorsync-core = { version = "0.1.0", path = "crates/sectorsync-core" }
+sectorsync-wire = { version = "0.1.0", path = "crates/sectorsync-wire" }
+sectorsync-transport = { version = "0.1.0", path = "crates/sectorsync-transport" }
+sectorsync-runtime = { version = "0.1.0", path = "crates/sectorsync-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

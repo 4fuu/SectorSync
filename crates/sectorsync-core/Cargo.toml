@@ -1,10 +1,14 @@
 [package]
 name = "sectorsync-core"
 version = "0.1.0"
+description = "Core spatial indexing, authority, AOI, and replication planning primitives for SectorSync"
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sectorsync-core"
+keywords = ["gamedev", "networking", "replication", "spatial", "middleware"]
+categories = ["game-development", "network-programming"]
 
 [lib]
 path = "src/lib.rs"

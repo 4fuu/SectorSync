@@ -1,16 +1,20 @@
 [package]
 name = "sectorsync-wire"
 version = "0.1.0"
+description = "Bounded binary wire frames and codecs for SectorSync"
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sectorsync-wire"
+keywords = ["gamedev", "networking", "protocol", "replication", "middleware"]
+categories = ["encoding", "game-development", "network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-sectorsync-core = { path = "../sectorsync-core" }
+sectorsync-core.workspace = true
 
 [lints]
 workspace = true

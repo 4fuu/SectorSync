@@ -1,20 +1,21 @@
 [package]
 name = "sectorsync-bench"
 version = "0.1.0"
+description = "Guarded examples and performance acceptance runner for SectorSync"
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
+publish = false
 
 [[bin]]
 name = "sectorsync-bench"
 path = "src/main.rs"
 
 [dependencies]
-sectorsync-core = { path = "../sectorsync-core" }
-sectorsync-runtime = { path = "../sectorsync-runtime" }
-sectorsync-transport = { path = "../sectorsync-transport" }
-sectorsync-wire = { path = "../sectorsync-wire" }
+sectorsync-core.workspace = true
+sectorsync-runtime.workspace = true
+sectorsync-transport.workspace = true
+sectorsync-wire.workspace = true
 
 [lints]
 workspace = true
