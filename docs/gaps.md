@@ -34,33 +34,16 @@ Already implemented and covered by examples or tests:
 - Conservative split scheduling, cell migration execution, deployment route
   metadata, runtime load sampling from station/index/router state plus explicit
   subscriber input, and bounded load-aware station scheduling.
+- Deterministic hotspot calibration covers Normal/Warm/Hot classification,
+  conservative scheduler guards, before/after pressure, and proposed/actual
+  moved cell/entity counts while keeping heavier calibration explicitly gated.
 - A committed performance acceptance matrix backed by machine-readable p50/p95/
   p99, command/replication/router/split/scheduler fields, smoke-safe baseline
   comparisons, and explicit heavy-profile opt-in.
 
 ## Delivery Gaps
 
-### 1. Hotspot Calibration
-
-Gap:
-
-- Split scheduling and load-aware scheduling are conservative and bounded, but
-  thresholds and scoring still need calibration against larger synthetic
-  workloads and, eventually, production telemetry.
-
-Why it matters:
-
-- Incorrect thresholds can cause avoidable migration churn, under-splitting, or
-  unfair station scheduling even if individual primitives are correct.
-
-Completion evidence:
-
-- Split tuning examples cover normal, warm, hot, cooldown, target capacity, and
-  insufficient-improvement cases.
-- Benchmarks report before/after pressure and migrated-cell/entity counts.
-- AGENTS keeps heavyweight calibration explicitly gated.
-
-### 2. Production Boundary Adapters
+### 1. Production Boundary Adapters
 
 Gap:
 
@@ -81,7 +64,7 @@ Completion evidence:
   route discovery metadata without SectorSync owning those systems.
 - Documentation names unsupported production responsibilities directly.
 
-### 3. Documentation Finish
+### 2. Documentation Finish
 
 Gap:
 
@@ -117,8 +100,7 @@ external adapters:
 
 ## Suggested Next Commit Order
 
-1. Calibrate hotspot/scheduler examples against larger guarded workloads.
-2. Polish production-boundary adapter examples without moving production
+1. Polish production-boundary adapter examples without moving production
    ownership into SectorSync.
 
 Each step should keep default verification lightweight and should leave heavier

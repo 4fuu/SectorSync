@@ -52,8 +52,6 @@ fn main() {
             cells: vec![CellLoadSample {
                 cell,
                 owned_entities: 100,
-                subscribers: 100,
-                event_pressure: 10,
                 ..CellLoadSample::default()
             }],
             ..StationLoadSample::default()
@@ -80,6 +78,23 @@ fn main() {
     let report = scheduler
         .execute(&schedule, &mut stations, &mut indexes, &mut ownership)
         .expect("split schedule should execute");
+    let action = schedule
+        .actions
+        .first()
+        .expect("hot source should produce one split action");
+    let source_pressure_after = action
+        .source_score
+        .saturating_sub(action.proposal.moved_pressure_score);
+    let migrated_cells = report
+        .ownership_updates
+        .iter()
+        .map(|update| update.moved_cells.len())
+        .sum::<usize>();
+    let migrated_entities = report
+        .cell_migrations
+        .iter()
+        .map(|migration| migration.entity_migrations.len())
+        .sum::<usize>();
 
     let target_index_entities = indexes
         .get(StationId::new(2))
@@ -87,18 +102,14 @@ fn main() {
         .entity_count();
 
     println!(
-        "split_migration actions={} cells={} migrated_entities={} target_index_entities={}",
+        "split_migration actions={} source_pressure_before={} source_pressure_after={} target_pressure_before={} target_pressure_after={} migrated_cells={} migrated_entities={} target_index_entities={}",
         schedule.actions.len(),
-        report
-            .ownership_updates
-            .iter()
-            .map(|update| update.moved_cells.len())
-            .sum::<usize>(),
-        report
-            .cell_migrations
-            .iter()
-            .map(|migration| migration.entity_migrations.len())
-            .sum::<usize>(),
+        action.source_score,
+        source_pressure_after,
+        action.target_score,
+        action.estimated_target_score_after_move,
+        migrated_cells,
+        migrated_entities,
         target_index_entities
     );
 }

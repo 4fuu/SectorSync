@@ -313,8 +313,13 @@ The core library does not own:
 - Split/migration changes should keep `cargo run -p sectorsync-bench --example
   split_migration` working as the executable usage example.
 - Split scheduler policy changes should also run
-  `cargo run -p sectorsync-bench --example split_tuning` and preserve cooldown,
-  target-capacity, and score-improvement guard behavior.
+  `cargo run -p sectorsync-bench --example split_tuning` and preserve
+  Normal/Warm/Hot classification, cooldown, target-capacity, and
+  score-improvement guard behavior. `split_migration` output must retain
+  before/after pressure and actual moved-cell/entity counts.
+- Keep deterministic hotspot calibration smoke-safe. Larger synthetic hotspot
+  or scheduler calibration must use a guarded benchmark profile and explicit
+  `--allow-heavy`; production thresholds remain caller/environment specific.
 - Runtime-configurable sync policies must compile into compact hot-path data.
   Avoid hot-path scripts, hash maps, per-entity dynamic dispatch, or avoidable
   allocation.

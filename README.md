@@ -358,10 +358,13 @@ Initial status:
   barrier-aware rejection, authoritative station-local component application,
   replication transport, client frame validation, and metrics handoff.
 - `cargo run -p sectorsync-bench --example split_migration` demonstrates a
-  load-sample-driven split scheduler producing and executing a cell migration.
+  load-sample-driven split scheduler producing and executing a cell migration,
+  including source/target pressure before and after the move plus actual moved
+  cell/entity counts.
 - `cargo run -p sectorsync-bench --example split_tuning` demonstrates split
-  scheduler cooldown and target-capacity guard behavior without running a heavy
-  benchmark profile.
+  scheduler Normal/Warm/Hot classification, admitted action pressure estimates,
+  and cooldown, target-capacity, and insufficient-improvement guards without
+  running a heavy benchmark profile.
 - `cargo run -p sectorsync-bench --example load_sampling` derives runtime load
   samples from station/index/router state and aggregated caller subscriber counts,
   then feeds them into a bounded load-aware station scheduler pass.
@@ -458,8 +461,9 @@ Not complete yet:
 See `docs/gaps.md` for the current delivery gap register and completion
 evidence checklist.
 
-- Long-running split scheduler calibration against production telemetry and
-  heavier workload profiles.
+- Production-specific split thresholds still require external telemetry and
+  deliberate guarded heavy runs; deterministic smoke-safe classification and
+  guard calibration is included.
 - Production authentication/encryption implementations, secret storage, key
   distribution, certificate rotation, NAT traversal, external service
   discovery, production cluster integration, and long-running reliability

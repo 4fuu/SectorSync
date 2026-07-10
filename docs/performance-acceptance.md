@@ -118,3 +118,24 @@ Without `--allow-heavy`, medium/large requests remain smoke-sized and print
 Do not promote heavy-run numbers into committed defaults from a single
 development host. Record hardware, profile, baseline, full output, and repeated
 run variance before changing thresholds.
+
+## Hotspot Calibration
+
+Use the deterministic examples before any heavier threshold experiment:
+
+```bash
+cargo run -p sectorsync-bench --example split_tuning
+cargo run -p sectorsync-bench --example split_migration
+cargo run -p sectorsync-bench --example load_scheduler
+```
+
+`split_tuning` must report Normal/Warm/Hot classification and positive coverage
+for cooldown, target-capacity, and insufficient-improvement guards. It also
+reports proposed source/target pressure before/after and proposed cell/entity
+counts. `split_migration` reports the corresponding before/after pressure plus
+actual migrated cell/entity counts from execution.
+
+Use `warm_stations`, `hotspot_stations`, `split_candidate_cells`, and scheduler
+decision fields from the guarded runner when calibrating larger synthetic
+profiles. Production thresholds must be chosen from caller telemetry and host
+budgets; SectorSync does not auto-tune them or collect production telemetry.
