@@ -14,6 +14,7 @@ use sectorsync_wire::{
     StationEventFrame,
 };
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let source_station = StationId::new(1);
     let target_station = StationId::new(2);

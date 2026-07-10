@@ -4,7 +4,7 @@ use crate::entity::EntityRecord;
 use crate::ids::{InstanceId, OwnerEpoch, StationId, Tick};
 
 /// Version metadata associated with a snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotVersion {
     /// Runtime version selected by the embedding application.
     pub runtime_version: u32,

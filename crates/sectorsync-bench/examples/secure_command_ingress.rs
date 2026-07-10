@@ -13,6 +13,7 @@ use sectorsync_wire::{
     FrameEncoder, RuntimeFrame,
 };
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let client_id = ClientId::new(7);
     let server_id = ClientId::new(0);
@@ -196,23 +197,23 @@ impl PacketCipher for ExampleCipher {
 }
 
 fn apply_example_cipher(key_id: u32, nonce: u64, payload: &mut [u8]) {
-    let mut stream = (key_id as u64)
+    let mut stream = u64::from(key_id)
         .wrapping_mul(0xA24B_AED4_963E_E407)
         .wrapping_add(nonce.rotate_left(23));
     for byte in payload {
         stream ^= stream << 13;
         stream ^= stream >> 7;
         stream ^= stream << 17;
-        *byte ^= stream as u8;
+        *byte ^= stream.to_le_bytes()[0];
     }
 }
 
 fn example_tag(key_id: u32, nonce: u64, payload: &[u8]) -> [u8; 8] {
-    let mut acc = (key_id as u64)
+    let mut acc = u64::from(key_id)
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(nonce.rotate_left(17));
     for (index, byte) in payload.iter().copied().enumerate() {
-        acc = acc.rotate_left(5) ^ ((byte as u64) << ((index % 8) * 8));
+        acc = acc.rotate_left(5) ^ (u64::from(byte) << ((index % 8) * 8));
         acc = acc.wrapping_mul(0x1000_0000_01B3);
     }
     acc.to_le_bytes()

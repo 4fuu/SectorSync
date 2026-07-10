@@ -15,6 +15,7 @@ use sectorsync_wire::{
     BinaryFrameDecoder, BinaryFrameEncoder, CommandFrame, FrameDecoder, FrameEncoder, RuntimeFrame,
 };
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let client_id = ClientId::new(7);
     let station_id = StationId::new(10);

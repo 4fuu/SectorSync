@@ -6,6 +6,7 @@ use sectorsync_core::prelude::{
     ReplicationScratch, Station, StationConfig, StationId, ViewerQuery,
 };
 
+#[allow(clippy::cast_precision_loss)]
 fn main() {
     let mut station = Station::new(StationConfig {
         station_id: StationId::new(1),

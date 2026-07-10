@@ -185,9 +185,10 @@ impl Frustum3 {
 }
 
 /// Entity bounds for spatial indexing and AOI overlap.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Bounds {
     /// Point-sized entity.
+    #[default]
     Point,
     /// Spherical entity bounds.
     Sphere {
@@ -199,12 +200,6 @@ pub enum Bounds {
         /// Half extents in world units.
         half_extents: Vec3,
     },
-}
-
-impl Default for Bounds {
-    fn default() -> Self {
-        Self::Point
-    }
 }
 
 impl Bounds {
@@ -263,9 +258,9 @@ impl GridSpec {
     pub fn cell_at(self, position: Position3) -> CellCoord3 {
         let inv = 1.0 / self.cell_size;
         CellCoord3::new(
-            (position.x * inv).floor() as i32,
-            (position.y * inv).floor() as i32,
-            (position.z * inv).floor() as i32,
+            floor_to_cell(position.x * inv),
+            floor_to_cell(position.y * inv),
+            floor_to_cell(position.z * inv),
         )
     }
 
@@ -273,10 +268,10 @@ impl GridSpec {
     pub fn cells_for_aabb(self, aabb: Aabb3) -> Vec<CellCoord3> {
         let min = self.cell_at(aabb.min);
         let max = self.cell_at(aabb.max);
-        let width = (i64::from(max.x) - i64::from(min.x) + 1)
-            * (i64::from(max.y) - i64::from(min.y) + 1)
-            * (i64::from(max.z) - i64::from(min.z) + 1);
-        let mut cells = Vec::with_capacity(width.max(0) as usize);
+        let capacity = axis_cell_count(min.x, max.x)
+            .saturating_mul(axis_cell_count(min.y, max.y))
+            .saturating_mul(axis_cell_count(min.z, max.z));
+        let mut cells = Vec::with_capacity(capacity);
 
         for x in min.x..=max.x {
             for y in min.y..=max.y {
@@ -293,6 +288,19 @@ impl GridSpec {
     pub fn cells_for_bounds(self, position: Position3, bounds: Bounds) -> Vec<CellCoord3> {
         self.cells_for_aabb(bounds.to_aabb(position))
     }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn floor_to_cell(value: f32) -> i32 {
+    // Rust float-to-int casts saturate infinities and map NaN to zero.
+    value.floor() as i32
+}
+
+fn axis_cell_count(min: i32, max: i32) -> usize {
+    if max < min {
+        return 0;
+    }
+    usize::try_from(i64::from(max) - i64::from(min) + 1).unwrap_or(usize::MAX)
 }
 
 /// Grid configuration error.

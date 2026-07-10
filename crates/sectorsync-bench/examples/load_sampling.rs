@@ -35,8 +35,8 @@ fn main() {
             .expect("bounded event queue should accept sample event");
     }
 
-    let sampler = StationLoadSampler::default();
-    let samples = sampler.sample_all(
+    let load_sampler = StationLoadSampler::default();
+    let samples = load_sampler.sample_all(
         &stations,
         &indexes,
         &router,
@@ -84,6 +84,7 @@ fn main() {
     );
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn populated_station(
     station_id: u32,
     owned_entities: usize,
@@ -104,7 +105,10 @@ fn populated_station(
         let position = Position3::new(base + offset as f32 * 11.0, 0.0, 0.0);
         let handle = station
             .spawn_owned(
-                EntityId::new(station_id as u64 * 1_000 + offset as u64),
+                EntityId::new(
+                    u64::from(station_id) * 1_000
+                        + u64::try_from(offset).expect("entity count must fit in u64"),
+                ),
                 position,
                 Bounds::Point,
                 policy_id,
@@ -115,7 +119,11 @@ fn populated_station(
     for offset in 0..ghost_entities {
         let position = Position3::new(base + (owned_entities + offset) as f32 * 11.0, 0.0, 0.0);
         let handle = station.upsert_ghost(
-            EntityId::new(100_000 + station_id as u64 * 1_000 + offset as u64),
+            EntityId::new(
+                100_000
+                    + u64::from(station_id) * 1_000
+                    + u64::try_from(offset).expect("entity count must fit in u64"),
+            ),
             position,
             Bounds::Point,
             policy_id,

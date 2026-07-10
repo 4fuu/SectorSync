@@ -64,6 +64,7 @@ fn main() {
 }
 
 /// Runs the recommended single-station integration order.
+#[allow(clippy::too_many_lines)]
 pub fn run() -> SdkFlowReport {
     let client_id = ClientId::new(7);
     let server_id = ClientId::new(0);

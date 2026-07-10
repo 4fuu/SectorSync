@@ -218,8 +218,8 @@ impl ReplicationFrameBuilder {
             frame: ReplicationFrame {
                 client_id,
                 server_tick,
-                entity_count: plan.entities.len().min(u32::MAX as usize) as u32,
-                estimated_payload_bytes: estimated_payload_bytes.min(u32::MAX as usize) as u32,
+                entity_count: u32::try_from(plan.entities.len()).unwrap_or(u32::MAX),
+                estimated_payload_bytes: u32::try_from(estimated_payload_bytes).unwrap_or(u32::MAX),
                 entities: entity_deltas,
             },
             stats,
@@ -1260,7 +1260,7 @@ mod tests {
             &station,
             &ReplicationPlan {
                 entities: vec![handle],
-                stats: Default::default(),
+                stats: sectorsync_core::prelude::ReplicationStats::default(),
             },
             &components,
             &ComponentSelection {

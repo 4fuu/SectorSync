@@ -13,6 +13,7 @@ use sectorsync_wire::{
     FrameEncoder, RuntimeFrame,
 };
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let client_id = ClientId::new(7);
     let server_id = ClientId::new(0);

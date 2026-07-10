@@ -34,21 +34,12 @@ pub use deployment::{
 };
 
 /// Client replication transport bridge configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReplicationTransportConfig {
     /// Planner budget used for every viewer unless the caller builds frames manually.
     pub budget: ReplicationBudget,
     /// Whether to send replication frames with no encoded entity deltas.
     pub send_empty_frames: bool,
-}
-
-impl Default for ReplicationTransportConfig {
-    fn default() -> Self {
-        Self {
-            budget: ReplicationBudget::default(),
-            send_empty_frames: false,
-        }
-    }
 }
 
 /// Client replication transport bridge statistics.
@@ -177,6 +168,7 @@ impl ReplicationTransportBridge {
     }
 
     /// Plans, builds, encodes, and sends one viewer replication frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_viewer<T, F>(
         &mut self,
         transport: &mut T,
@@ -212,6 +204,7 @@ impl ReplicationTransportBridge {
     }
 
     /// Plans with cadence, builds, encodes, and sends one viewer replication frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_viewer_with_cadence<T, F, L>(
         &mut self,
         transport: &mut T,
@@ -250,6 +243,7 @@ impl ReplicationTransportBridge {
     }
 
     /// Plans by priority, builds, encodes, and sends one viewer replication frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_viewer_prioritized<T, F>(
         &mut self,
         transport: &mut T,
@@ -285,6 +279,7 @@ impl ReplicationTransportBridge {
     }
 
     /// Plans by priority and cadence, builds, encodes, and sends one viewer replication frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_viewer_prioritized_with_cadence<T, F, L>(
         &mut self,
         transport: &mut T,
@@ -323,6 +318,7 @@ impl ReplicationTransportBridge {
     }
 
     /// Builds, encodes, and sends a caller-provided replication plan.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_plan<T>(
         &mut self,
         transport: &mut T,
@@ -435,6 +431,7 @@ impl ReplicationReceiveConfig {
     }
 
     /// Returns a copy that expects packets from `source`.
+    #[must_use]
     pub const fn with_expected_source(mut self, source: ClientId) -> Self {
         self.expected_source = Some(source);
         self
@@ -623,15 +620,15 @@ impl ReplicationReceiveBridge {
             pump.packets_received = pump.packets_received.saturating_add(1);
             pump.bytes_received = pump.bytes_received.saturating_add(packet.bytes.len());
 
-            if let Some(expected) = self.config.expected_source {
-                if packet.client_id != Some(expected) {
-                    self.stats.frames_rejected_source =
-                        self.stats.frames_rejected_source.saturating_add(1);
-                    return Err(ReplicationReceiveError::SourceMismatch {
-                        expected,
-                        actual: packet.client_id,
-                    });
-                }
+            if let Some(expected) = self.config.expected_source
+                && packet.client_id != Some(expected)
+            {
+                self.stats.frames_rejected_source =
+                    self.stats.frames_rejected_source.saturating_add(1);
+                return Err(ReplicationReceiveError::SourceMismatch {
+                    expected,
+                    actual: packet.client_id,
+                });
             }
 
             let decoded = match BinaryFrameDecoder.decode(&packet.bytes) {
@@ -696,6 +693,7 @@ impl ClientTransportConfig {
     }
 
     /// Returns a copy that expects inbound packets from `source`.
+    #[must_use]
     pub const fn with_expected_source(mut self, source: ClientId) -> Self {
         self.expected_source = Some(source);
         self
@@ -998,15 +996,15 @@ impl ClientTransportBridge {
             pump.packets_received = pump.packets_received.saturating_add(1);
             pump.bytes_received = pump.bytes_received.saturating_add(packet.bytes.len());
 
-            if let Some(expected) = self.config.expected_source {
-                if packet.client_id != Some(expected) {
-                    self.stats.frames_rejected_source =
-                        self.stats.frames_rejected_source.saturating_add(1);
-                    return Err(ClientTransportBridgeError::SourceMismatch {
-                        expected,
-                        actual: packet.client_id,
-                    });
-                }
+            if let Some(expected) = self.config.expected_source
+                && packet.client_id != Some(expected)
+            {
+                self.stats.frames_rejected_source =
+                    self.stats.frames_rejected_source.saturating_add(1);
+                return Err(ClientTransportBridgeError::SourceMismatch {
+                    expected,
+                    actual: packet.client_id,
+                });
             }
 
             let decoded = match BinaryFrameDecoder.decode(&packet.bytes) {
@@ -1839,7 +1837,7 @@ impl GatewayClientTransportPump {
 /// Error produced while pumping gateway-side client command packets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GatewayClientTransportError<E> {
-    /// Underlying client transport failed while receiving or ACKing.
+    /// Underlying client transport failed while receiving or sending acknowledgements.
     Transport(E),
     /// Wire decoding failed.
     Decode(BinaryDecodeError),
@@ -1916,6 +1914,7 @@ impl GatewayClientTransportBridge {
 
     /// Pumps up to `max_packets` client command packets into station queues and
     /// sends produced ACKs back through the same bounded client transport.
+    #[allow(clippy::too_many_arguments)]
     pub fn pump_ingress<T, E>(
         &mut self,
         transport: &mut T,
@@ -1960,14 +1959,14 @@ impl GatewayClientTransportBridge {
             self.stats.command_frames_received =
                 self.stats.command_frames_received.saturating_add(1);
 
-            if let Some(packet_client_id) = packet.client_id {
-                if packet_client_id != command_frame.client_id {
-                    self.stats.source_mismatches = self.stats.source_mismatches.saturating_add(1);
-                    return Err(GatewayClientTransportError::SourceMismatch {
-                        packet_client_id,
-                        frame_client_id: command_frame.client_id,
-                    });
-                }
+            if let Some(packet_client_id) = packet.client_id
+                && packet_client_id != command_frame.client_id
+            {
+                self.stats.source_mismatches = self.stats.source_mismatches.saturating_add(1);
+                return Err(GatewayClientTransportError::SourceMismatch {
+                    packet_client_id,
+                    frame_client_id: command_frame.client_id,
+                });
             }
 
             let ack_client_id = command_frame.client_id;
@@ -3727,8 +3726,7 @@ impl StationScheduler {
                 let station_id = station.config().station_id;
                 let load_score = samples_by_station
                     .get(&station_id)
-                    .map(|sample| station_schedule_score(*sample))
-                    .unwrap_or(0);
+                    .map_or(0, |sample| station_schedule_score(sample));
                 StationScheduleCandidate {
                     station_id,
                     load_score,
@@ -3894,8 +3892,7 @@ impl BarrierController {
             .filter_map(|station_id| stations.get(*station_id).map(Station::tick))
             .map(Tick::get)
             .max()
-            .map(Tick::new)
-            .unwrap_or(Tick::new(0));
+            .map_or(Tick::new(0), Tick::new);
 
         let mut barrier =
             RuntimeBarrier::requested(id, scope, requested_at, target_tick, command_mode);
@@ -3965,7 +3962,7 @@ impl BarrierController {
             let station = stations
                 .get(station_id)
                 .ok_or(BarrierRuntimeError::MissingStation(station_id))?;
-            snapshots.push(station.snapshot(version.clone()));
+            snapshots.push(station.snapshot(version));
         }
         self.metrics.snapshots_exported = self
             .metrics
@@ -4097,7 +4094,7 @@ impl BarrierUpgradeExecutor {
     where
         H: RuntimeUpgradeHook,
     {
-        let report_version = version.clone();
+        let report_version = version;
         let snapshots = controller.export_snapshots(stations, version)?;
         let mut restored = Vec::with_capacity(snapshots.len());
         let mut entities_restored = 0usize;
@@ -4238,19 +4235,19 @@ mod tests {
 
     #[derive(Default)]
     struct MoveSnapshotUpgrade {
-        pre_calls: usize,
-        migrate_calls: usize,
-        post_calls: usize,
+        pre: usize,
+        migrations: usize,
+        post: usize,
     }
 
     impl RuntimeUpgradeHook for MoveSnapshotUpgrade {
         fn pre_upgrade(&mut self, meta: &SnapshotMeta) {
-            self.pre_calls = self.pre_calls.saturating_add(1);
+            self.pre = self.pre.saturating_add(1);
             assert_eq!(meta.version.runtime_version, 2);
         }
 
         fn migrate_state(&mut self, mut snapshot: StationSnapshot) -> StationSnapshot {
-            self.migrate_calls = self.migrate_calls.saturating_add(1);
+            self.migrations = self.migrations.saturating_add(1);
             for entity in &mut snapshot.entities {
                 entity.position.x += 10.0;
             }
@@ -4258,7 +4255,7 @@ mod tests {
         }
 
         fn post_upgrade(&mut self, meta: &SnapshotMeta) {
-            self.post_calls = self.post_calls.saturating_add(1);
+            self.post = self.post.saturating_add(1);
             assert_eq!(meta.version.runtime_version, 2);
         }
     }
@@ -4306,7 +4303,7 @@ mod tests {
         let report = BarrierUpgradeExecutor::migrate_frozen(
             &mut controller,
             &mut stations,
-            version.clone(),
+            version,
             &mut hook,
         )
         .expect("upgrade should migrate frozen snapshots");
@@ -4315,9 +4312,9 @@ mod tests {
         assert_eq!(report.snapshots_migrated, 2);
         assert_eq!(report.stations_restored, 2);
         assert_eq!(report.entities_restored, 1);
-        assert_eq!(hook.pre_calls, 2);
-        assert_eq!(hook.migrate_calls, 2);
-        assert_eq!(hook.post_calls, 2);
+        assert_eq!(hook.pre, 2);
+        assert_eq!(hook.migrations, 2);
+        assert_eq!(hook.post, 2);
         let moved = stations
             .get(StationId::new(1))
             .expect("station should exist")
@@ -4513,6 +4510,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn replication_transport_bridge_prioritized_reports_budget_skips() {
         let client_id = ClientId::new(7);
         let server_id = ClientId::new(0);
@@ -4612,12 +4610,11 @@ mod tests {
             .try_recv()
             .expect("receive should work")
             .expect("packet should exist");
-        let frame = match BinaryFrameDecoder
+        let RuntimeFrame::Replication(frame) = BinaryFrameDecoder
             .decode(&packet.bytes)
             .expect("frame decodes")
-        {
-            RuntimeFrame::Replication(frame) => frame,
-            _ => panic!("expected replication frame"),
+        else {
+            panic!("expected replication frame");
         };
         assert_eq!(frame.entities.len(), 1);
         assert_eq!(frame.entities[0].entity_id, EntityId::new(200));
@@ -4738,6 +4735,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn client_transport_bridge_sends_command_and_receives_client_frames() {
         let client_id = ClientId::new(7);
         let server_id = ClientId::new(0);
@@ -5517,8 +5515,8 @@ mod tests {
         }
 
         assert_eq!(indexes.iter().count(), 1);
-        let sampler = StationLoadSampler::default();
-        let samples = sampler.sample_all(
+        let load_sampler = StationLoadSampler::default();
+        let samples = load_sampler.sample_all(
             &stations,
             &indexes,
             &router,
@@ -5641,12 +5639,12 @@ mod tests {
 
         assert_eq!(report.packets_received, 1);
         assert_eq!(report.commands_enqueued, 1);
-        let queued = queues
+        let queued_command = queues
             .get_mut(&target_station)
             .expect("queue should exist")
             .pop_next()
             .expect("command should queue");
-        assert_eq!(queued, command);
+        assert_eq!(queued_command, command);
         assert_eq!(bridge.stats().commands_sent, 1);
         assert_eq!(bridge.stats().commands_enqueued, 1);
         assert_eq!(transport.stats().packets_sent, 1);

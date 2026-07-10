@@ -250,6 +250,7 @@ impl PacketKeyDescriptor {
     }
 
     /// Returns a copy with an expiration tick.
+    #[must_use]
     pub const fn with_expiry(mut self, expires_at: Tick) -> Self {
         self.expires_at = Some(expires_at);
         self
@@ -270,9 +271,7 @@ impl PacketKeyDescriptor {
     }
 
     fn is_expired_at(self, now: Tick) -> bool {
-        self.expires_at
-            .map(|expires_at| now >= expires_at)
-            .unwrap_or(false)
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
     }
 }
 
@@ -1328,10 +1327,10 @@ impl InMemoryTransportHub {
         if let Some(previous_addr) = previous_addr {
             inner.addr_to_client.remove(&previous_addr);
         }
-        if let Some(old_client) = inner.addr_to_client.insert(remote_addr, client_id) {
-            if old_client != client_id {
-                inner.clients.remove(&old_client);
-            }
+        if let Some(old_client) = inner.addr_to_client.insert(remote_addr, client_id)
+            && old_client != client_id
+        {
+            inner.clients.remove(&old_client);
         }
         Ok(previous_addr)
     }
@@ -1646,7 +1645,7 @@ impl core::fmt::Display for ReliableClientEncodeError {
 impl std::error::Error for ReliableClientEncodeError {}
 
 /// Reliable client frame decode error.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReliableClientDecodeError {
     /// Frame magic did not match.
     BadMagic,
@@ -1834,7 +1833,7 @@ impl ReliableClientSender {
         }
 
         let sequence = self.allocate_sequence(packet.client_id);
-        self.send_data_frame(transport, packet.client_id, sequence, &packet.bytes)?;
+        Self::send_data_frame(transport, packet.client_id, sequence, &packet.bytes)?;
         self.in_flight.insert(
             (packet.client_id, sequence),
             InFlightReliableClientPacket {
@@ -1890,7 +1889,7 @@ impl ReliableClientSender {
                 continue;
             }
 
-            self.send_data_frame(
+            Self::send_data_frame(
                 transport,
                 packet.peer_client,
                 packet.sequence,
@@ -1926,7 +1925,6 @@ impl ReliableClientSender {
     }
 
     fn send_data_frame<T: TransportSink>(
-        &self,
         transport: &mut T,
         peer_client: ClientId,
         sequence: u64,
@@ -1998,6 +1996,12 @@ impl ReliableClientReceiver {
         sequence: u64,
         payload: Vec<u8>,
     ) -> Result<Option<InboundPacket>, ReliableClientError<T::Error>> {
+        let InboundPacket {
+            remote_addr,
+            bytes: wire_bytes,
+            ..
+        } = packet;
+        drop(wire_bytes);
         self.send_ack(transport, source_client, sequence)?;
         if !self.record_unique(source_client, sequence) {
             self.stats.duplicates_suppressed = self.stats.duplicates_suppressed.saturating_add(1);
@@ -2007,7 +2011,7 @@ impl ReliableClientReceiver {
         self.stats.data_delivered = self.stats.data_delivered.saturating_add(1);
         Ok(Some(InboundPacket {
             client_id: Some(source_client),
-            remote_addr: packet.remote_addr,
+            remote_addr,
             bytes: payload,
         }))
     }
@@ -2301,7 +2305,7 @@ impl core::fmt::Display for ReliableStationEncodeError {
 impl std::error::Error for ReliableStationEncodeError {}
 
 /// Reliable station frame decode error.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReliableStationDecodeError {
     /// Frame magic did not match.
     BadMagic,
@@ -2480,7 +2484,7 @@ impl ReliableStationSender {
         }
 
         let sequence = self.allocate_sequence(packet.target_station);
-        self.send_data_frame(
+        Self::send_data_frame(
             transport,
             packet.source_station,
             packet.target_station,
@@ -2543,7 +2547,7 @@ impl ReliableStationSender {
                 continue;
             }
 
-            self.send_data_frame(
+            Self::send_data_frame(
                 transport,
                 packet.source_station,
                 packet.target_station,
@@ -2580,7 +2584,6 @@ impl ReliableStationSender {
     }
 
     fn send_data_frame<T: StationTransportSink>(
-        &self,
         transport: &mut T,
         source_station: StationId,
         target_station: StationId,
@@ -2653,21 +2656,22 @@ impl ReliableStationReceiver {
         sequence: u64,
         payload: Vec<u8>,
     ) -> Result<Option<StationInboundPacket>, ReliableStationError<T::Error>> {
-        self.send_ack(
-            transport,
-            packet.target_station,
-            packet.source_station,
-            sequence,
-        )?;
-        if !self.record_unique(packet.source_station, sequence) {
+        let StationInboundPacket {
+            source_station,
+            target_station,
+            bytes: wire_bytes,
+        } = packet;
+        drop(wire_bytes);
+        self.send_ack(transport, target_station, source_station, sequence)?;
+        if !self.record_unique(source_station, sequence) {
             self.stats.duplicates_suppressed = self.stats.duplicates_suppressed.saturating_add(1);
             return Ok(None);
         }
 
         self.stats.data_delivered = self.stats.data_delivered.saturating_add(1);
         Ok(Some(StationInboundPacket {
-            source_station: packet.source_station,
-            target_station: packet.target_station,
+            source_station,
+            target_station,
             bytes: payload,
         }))
     }
@@ -3193,10 +3197,10 @@ impl UdpStationTransport {
         if let Some(old_addr) = old_addr {
             self.addr_to_station.remove(&old_addr);
         }
-        if let Some(old_station) = self.addr_to_station.insert(addr, station_id) {
-            if old_station != station_id {
-                self.stations.remove(&old_station);
-            }
+        if let Some(old_station) = self.addr_to_station.insert(addr, station_id)
+            && old_station != station_id
+        {
+            self.stations.remove(&old_station);
         }
         old_addr
     }
@@ -3382,10 +3386,10 @@ impl UdpTransport {
         if let Some(old_addr) = old_addr {
             self.addr_to_client.remove(&old_addr);
         }
-        if let Some(old_client) = self.addr_to_client.insert(addr, client_id) {
-            if old_client != client_id {
-                self.clients.remove(&old_client);
-            }
+        if let Some(old_client) = self.addr_to_client.insert(addr, client_id)
+            && old_client != client_id
+        {
+            self.clients.remove(&old_client);
         }
         old_addr
     }
@@ -3555,25 +3559,25 @@ impl<T: TransportSink> TransportSink for BudgetedTransport<T> {
 /// Fake transport for benchmarks and tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FakeTransport {
-    packets_sent: usize,
-    bytes_sent: usize,
-    batches_sent: usize,
+    packets: usize,
+    bytes: usize,
+    batches: usize,
 }
 
 impl FakeTransport {
     /// Returns sent packet count.
     pub const fn packets_sent(&self) -> usize {
-        self.packets_sent
+        self.packets
     }
 
     /// Returns sent byte count.
     pub const fn bytes_sent(&self) -> usize {
-        self.bytes_sent
+        self.bytes
     }
 
     /// Returns sent batch count.
     pub const fn batches_sent(&self) -> usize {
-        self.batches_sent
+        self.batches
     }
 }
 
@@ -3581,15 +3585,15 @@ impl TransportSink for FakeTransport {
     type Error = core::convert::Infallible;
 
     fn send(&mut self, packet: OutboundPacket) -> Result<(), Self::Error> {
-        self.packets_sent += 1;
-        self.bytes_sent += packet.bytes.len();
+        self.packets += 1;
+        self.bytes += packet.bytes.len();
         Ok(())
     }
 
     fn send_batch(&mut self, batch: PacketBatch) -> Result<(), Self::Error> {
-        self.batches_sent += 1;
-        self.packets_sent += batch.packets.len();
-        self.bytes_sent += batch.bytes_len();
+        self.batches += 1;
+        self.packets += batch.packets.len();
+        self.bytes += batch.bytes_len();
         Ok(())
     }
 }
@@ -3674,11 +3678,11 @@ mod tests {
     }
 
     fn test_tag(key_id: u32, nonce: u64, payload: &[u8]) -> [u8; 8] {
-        let mut acc = (key_id as u64)
+        let mut acc = u64::from(key_id)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(nonce.rotate_left(17));
         for (index, byte) in payload.iter().copied().enumerate() {
-            acc = acc.rotate_left(5) ^ ((byte as u64) << ((index % 8) * 8));
+            acc = acc.rotate_left(5) ^ (u64::from(byte) << ((index % 8) * 8));
             acc = acc.wrapping_mul(0x1000_0000_01B3);
         }
         acc.to_le_bytes()

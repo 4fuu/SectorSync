@@ -16,6 +16,7 @@ use sectorsync_runtime::{
 use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub};
 use sectorsync_wire::{CommandFrame, ComponentSelection};
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let client_id = ClientId::new(7);
     let server_id = ClientId::new(0);

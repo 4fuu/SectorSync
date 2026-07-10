@@ -323,7 +323,7 @@ impl ReplicationCadence {
             };
         let span = f32::from(max_hz - min_hz);
         let target = f32::from(min_hz) + span * closeness;
-        target.round().clamp(f32::from(min_hz), f32::from(max_hz)) as u16
+        rounded_frequency_to_u16(target, min_hz, max_hz)
     }
 
     /// Returns the tick interval for a policy at a squared distance.
@@ -357,6 +357,18 @@ impl ReplicationCadence {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReplicationPriority;
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rounded_frequency_to_u16(target: f32, min_hz: u16, max_hz: u16) -> u16 {
+    let bounded = target.round().clamp(f32::from(min_hz), f32::from(max_hz));
+    bounded as u16
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn normalized_score_to_u64(closeness: f32) -> u64 {
+    debug_assert!(closeness.is_finite() && (0.0..=1.0).contains(&closeness));
+    (closeness * 1_000_000.0).round() as u64
+}
+
 impl ReplicationPriority {
     /// Returns a deterministic priority score for budgeted selection.
     pub fn score(policy: &CompiledSyncPolicy, distance_squared: f32) -> u64 {
@@ -365,7 +377,7 @@ impl ReplicationPriority {
         let distance_score =
             if radius_squared.is_finite() && radius_squared > 0.0 && distance_squared.is_finite() {
                 let closeness = 1.0 - (distance_squared / radius_squared).clamp(0.0, 1.0);
-                (closeness * 1_000_000.0).round() as u64
+                normalized_score_to_u64(closeness)
             } else {
                 1_000_000
             };
@@ -513,6 +525,7 @@ impl ReplicationPlanner {
     }
 
     /// Plans a cadence-aware frame using caller-provided scratch storage.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_for_viewer_with_cadence_and_scratch<F, L>(
         station: &Station,
         index: &CellIndex,
@@ -636,6 +649,7 @@ impl ReplicationPlanner {
     }
 
     /// Plans a priority/cadence frame using caller-provided scratch storage.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_for_viewer_prioritized_with_cadence_and_scratch<F, L>(
         station: &Station,
         index: &CellIndex,
@@ -734,6 +748,7 @@ impl ReplicationPlanner {
         plan
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn plan_for_candidates_prioritized_inner<F, C>(
         station: &Station,
         candidates: &[EntityHandle],

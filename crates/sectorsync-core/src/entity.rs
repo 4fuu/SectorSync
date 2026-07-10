@@ -166,6 +166,7 @@ impl EntityRecord {
     }
 
     /// Creates a read-only ghost entity record.
+    #[allow(clippy::too_many_arguments)]
     pub fn ghost(
         id: EntityId,
         handle: EntityHandle,

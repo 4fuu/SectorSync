@@ -104,6 +104,7 @@ impl Station {
     }
 
     /// Inserts or refreshes a read-only ghost entity.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_ghost(
         &mut self,
         id: EntityId,

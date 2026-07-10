@@ -199,6 +199,7 @@ impl ComponentDescriptor {
     }
 
     /// Attaches a stable schema hash to this descriptor.
+    #[must_use]
     pub const fn with_schema_hash(mut self, schema_hash: u64) -> Self {
         self.schema_hash = schema_hash;
         self
@@ -790,11 +791,11 @@ impl ComponentStore {
     pub fn clear_dirty_for_entity(&mut self, entity: EntityHandle) -> usize {
         let mut cleared = 0;
         for column in self.columns.iter_mut().filter_map(Option::as_mut) {
-            if let Some(blob) = column.values.get_mut(&entity) {
-                if blob.dirty {
-                    blob.dirty = false;
-                    cleared += 1;
-                }
+            if let Some(blob) = column.values.get_mut(&entity)
+                && blob.dirty
+            {
+                blob.dirty = false;
+                cleared += 1;
             }
         }
         cleared
@@ -808,7 +809,9 @@ impl ComponentStore {
                 continue;
             };
             if let Some(blob) = column.values.remove(&entity) {
-                removed.push((ComponentId::new(index as u16), blob));
+                let component_id = u16::try_from(index)
+                    .expect("component columns are indexed by u16 component ids");
+                removed.push((ComponentId::new(component_id), blob));
             }
         }
         removed
@@ -1006,6 +1009,16 @@ mod tests {
             ComponentFieldDescriptor::new("x", ComponentFieldType::U32, 0),
             ComponentFieldDescriptor::new("x", ComponentFieldType::U32, 4),
         ];
+        const OVERLAP_FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor::new("left", ComponentFieldType::U32, 0),
+            ComponentFieldDescriptor::new("right", ComponentFieldType::U32, 2),
+        ];
+        const OOB_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor::new(
+            "wide",
+            ComponentFieldType::U64,
+            4,
+        )];
+
         let duplicate = GeneratedComponentSchema::new(
             ComponentId::new(1),
             "duplicate",
@@ -1020,10 +1033,6 @@ mod tests {
             ComponentSchemaError::DuplicateFieldName("x")
         );
 
-        const OVERLAP_FIELDS: &[ComponentFieldDescriptor] = &[
-            ComponentFieldDescriptor::new("left", ComponentFieldType::U32, 0),
-            ComponentFieldDescriptor::new("right", ComponentFieldType::U32, 2),
-        ];
         let overlap = GeneratedComponentSchema::new(
             ComponentId::new(2),
             "overlap",
@@ -1041,11 +1050,6 @@ mod tests {
             }
         );
 
-        const OOB_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor::new(
-            "wide",
-            ComponentFieldType::U64,
-            4,
-        )];
         let out_of_bounds = GeneratedComponentSchema::new(
             ComponentId::new(3),
             "oob",

@@ -157,6 +157,7 @@ struct BenchStats {
     tick_ms: Vec<f64>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let config = BenchConfig::from_args(env::args().skip(1));
     let start = Instant::now();
@@ -174,10 +175,10 @@ fn main() {
         config.default_resource_guard_applied
     );
     println!("host_parallelism={}", config.host_parallelism);
-    println!("guard_max_entities={}", DEFAULT_GUARD_MAX_ENTITIES);
-    println!("guard_max_clients={}", DEFAULT_GUARD_MAX_CLIENTS);
-    println!("guard_max_stations={}", DEFAULT_GUARD_MAX_STATIONS);
-    println!("guard_max_ticks={}", DEFAULT_GUARD_MAX_TICKS);
+    println!("guard_max_entities={DEFAULT_GUARD_MAX_ENTITIES}");
+    println!("guard_max_clients={DEFAULT_GUARD_MAX_CLIENTS}");
+    println!("guard_max_stations={DEFAULT_GUARD_MAX_STATIONS}");
+    println!("guard_max_ticks={DEFAULT_GUARD_MAX_TICKS}");
     println!("entities={}", config.entities);
     println!("clients={}", config.clients);
     println!("stations={}", config.stations);
@@ -399,6 +400,7 @@ fn main() {
 }
 
 impl BenchStats {
+    #[allow(clippy::cast_precision_loss)]
     fn command_latency_ticks_avg(&self) -> f64 {
         if self.commands_applied == 0 {
             0.0
@@ -409,6 +411,7 @@ impl BenchStats {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 struct BenchVerdict {
     tick_ok: bool,
     command_latency_ok: bool,
@@ -569,7 +572,7 @@ impl BenchConfig {
         let before = (self.entities, self.clients, self.stations, self.ticks);
         self.entities = self.entities.min(DEFAULT_GUARD_MAX_ENTITIES);
         self.clients = self.clients.min(DEFAULT_GUARD_MAX_CLIENTS);
-        self.stations = self.stations.min(DEFAULT_GUARD_MAX_STATIONS).max(1);
+        self.stations = self.stations.clamp(1, DEFAULT_GUARD_MAX_STATIONS);
         self.ticks = self.ticks.min(DEFAULT_GUARD_MAX_TICKS);
         self.default_resource_guard_applied =
             before != (self.entities, self.clients, self.stations, self.ticks);
@@ -585,12 +588,12 @@ impl HostResources {
     fn detect() -> Self {
         Self {
             parallelism: std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1),
+                .map_or(1, std::num::NonZeroUsize::get),
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(config: BenchConfig) -> BenchStats {
     let mut stations = create_stations(config.stations);
     let mut indexes = create_indexes(config.stations);
@@ -730,8 +733,9 @@ fn run(config: BenchConfig) -> BenchStats {
             let frame = ReplicationFrame {
                 client_id: ClientId::new(client_index as u64),
                 server_tick: station.tick(),
-                entity_count: updates.min(u32::MAX as usize) as u32,
-                estimated_payload_bytes: (updates * 32).min(u32::MAX as usize) as u32,
+                entity_count: u32::try_from(updates).unwrap_or(u32::MAX),
+                estimated_payload_bytes: u32::try_from(updates.saturating_mul(32))
+                    .unwrap_or(u32::MAX),
                 entities: entity_deltas,
             };
             let mut bytes = Vec::with_capacity(32);
@@ -766,7 +770,7 @@ fn build_sample_deltas(update_count: usize, client_index: usize, tick: Tick) -> 
     (0..sample_count)
         .map(|offset| {
             let entity_id = EntityId::new(((client_index * 31) + offset) as u64);
-            let tick_value = tick.get() as u32;
+            let tick_value = u32::try_from(tick.get()).unwrap_or(u32::MAX);
             EntityDelta {
                 entity_id,
                 owner_epoch: OwnerEpoch::new(0),
@@ -781,6 +785,11 @@ fn build_sample_deltas(update_count: usize, client_index: usize, tick: Tick) -> 
         .collect()
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn percentile_ms(values: &[f64], percentile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -795,8 +804,10 @@ fn create_stations(count: usize) -> Vec<Station> {
     (0..count)
         .map(|index| {
             Station::new(StationConfig {
-                station_id: StationId::new(index as u32),
-                node_id: NodeId::new((index % 4) as u32),
+                station_id: StationId::new(
+                    u32::try_from(index).expect("station count must fit in u32"),
+                ),
+                node_id: NodeId::new(u32::try_from(index % 4).expect("node shard must fit in u32")),
                 instance_id: InstanceId::new(1),
                 tick_rate_hz: 20,
             })
@@ -855,8 +866,9 @@ impl DispatchBench {
         let mut station_queues = BTreeMap::new();
 
         for station_index in 0..config.stations {
-            let station_id = StationId::new(station_index as u32);
-            let node_id = NodeId::new(station_index as u32);
+            let numeric_id = u32::try_from(station_index).expect("station count must fit in u32");
+            let station_id = StationId::new(numeric_id);
+            let node_id = NodeId::new(numeric_id);
             deployment
                 .register_node(node_id, 1, Tick::new(0))
                 .expect("benchmark deployment node should register");
@@ -875,7 +887,10 @@ impl DispatchBench {
         }
 
         for client_index in 0..config.clients {
-            let station_id = StationId::new((client_index % config.stations.max(1)) as u32);
+            let station_id = StationId::new(
+                u32::try_from(client_index % config.stations.max(1))
+                    .expect("station count must fit in u32"),
+            );
             gateway
                 .connect(ClientId::new(client_index as u64), station_id, Tick::new(0))
                 .expect("benchmark client should connect");
@@ -963,6 +978,7 @@ impl ClientBridgeBench {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn exercise_client_bridge(
     config: BenchConfig,
     tick_index: usize,
@@ -1145,7 +1161,8 @@ fn dispatch_gateway_commands(
     }
 
     for station_index in 0..config.stations {
-        let station_id = StationId::new(station_index as u32);
+        let station_id =
+            StationId::new(u32::try_from(station_index).expect("station count must fit in u32"));
         let pump = dispatch
             .bridge
             .pump_target(
@@ -1372,7 +1389,10 @@ fn exercise_event_router(
                 source_tick: station.tick(),
                 target_tick: station.tick(),
                 priority: EventPriority::BestEffort,
-                kind: EventKind::Custom((event_id % u32::MAX as u64) as u32),
+                kind: EventKind::Custom(
+                    u32::try_from(event_id % u64::from(u32::MAX))
+                        .expect("reduced event id must fit in u32"),
+                ),
             })
             .expect("smoke event router should accept bounded event");
     }
@@ -1434,6 +1454,7 @@ impl Lcg {
         (self.state >> 32) as u32
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn next_range(&mut self, min: f32, max: f32) -> f32 {
         let unit = self.next_u32() as f32 / u32::MAX as f32;
         min + (max - min) * unit
@@ -1447,7 +1468,7 @@ mod tests {
     fn args(values: &[&str]) -> std::vec::IntoIter<String> {
         values
             .iter()
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -1503,6 +1524,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn percentile_reports_requested_tick_latency_cutoffs() {
         let values = [1.0, 2.0, 3.0, 4.0, 5.0];
 

@@ -120,11 +120,11 @@ impl PacketAuthenticator for ExampleAuthenticator {
 }
 
 fn example_tag(key_id: u32, nonce: u64, payload: &[u8]) -> [u8; 8] {
-    let mut acc = (key_id as u64)
+    let mut acc = u64::from(key_id)
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(nonce.rotate_left(17));
     for (index, byte) in payload.iter().copied().enumerate() {
-        acc = acc.rotate_left(5) ^ ((byte as u64) << ((index % 8) * 8));
+        acc = acc.rotate_left(5) ^ (u64::from(byte) << ((index % 8) * 8));
         acc = acc.wrapping_mul(0x1000_0000_01B3);
     }
     acc.to_le_bytes()
