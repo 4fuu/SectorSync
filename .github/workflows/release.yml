@@ -72,6 +72,7 @@ jobs:
               else
                 for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
                   if ! curl --fail --silent --show-error \
+                    --user-agent "SectorSync release workflow (https://github.com/4fuu/SectorSync)" \
                     "https://crates.io/api/v1/crates/$crate/$current_version" >/dev/null; then
                     complete=false
                     break
@@ -207,6 +208,7 @@ jobs:
             local crate="$1"
             for attempt in $(seq 1 30); do
               if curl --fail --silent --show-error \
+                --user-agent "SectorSync release workflow (https://github.com/4fuu/SectorSync)" \
                 "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION" >/dev/null; then
                 return 0
               fi
@@ -219,6 +221,7 @@ jobs:
 
           for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
             if curl --fail --silent --show-error \
+              --user-agent "SectorSync release workflow (https://github.com/4fuu/SectorSync)" \
               "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION" >/dev/null; then
               echo "$crate $RELEASE_VERSION is already published; skipping."
               continue
