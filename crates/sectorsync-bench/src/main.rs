@@ -5,13 +5,13 @@ use std::env;
 use std::time::Instant;
 
 use sectorsync_core::prelude::{
-    Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
-    CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
-    EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig, GatewaySessionTable,
-    GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, OwnerEpoch,
-    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
-    ReplicationScratch, Station, StationConfig, StationEvent, StationId, StationLoadSample, Tick,
-    Vec3, ViewerQuery,
+    Bounds, CellIndex, CellLoadSample, CellQueryStrategy, ClientId, CommandEnvelope, CommandId,
+    CommandIngress, CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy,
+    ComponentId, EntityId, EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig,
+    GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId,
+    NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
+    ReplicationPlanner, ReplicationScratch, Station, StationConfig, StationEvent, StationId,
+    StationLoadSample, Tick, Vec3, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
@@ -109,6 +109,15 @@ struct BenchStats {
     payload_component_deltas: usize,
     replication_scratch_queries: usize,
     replication_scratch_candidates: usize,
+    replication_scratch_grid_queries: usize,
+    replication_scratch_occupied_queries: usize,
+    replication_scratch_grid_cells_probed: usize,
+    replication_scratch_occupied_cells_scanned: usize,
+    replication_scratch_matched_cells: usize,
+    replication_scratch_candidate_capacity_max: usize,
+    replication_scratch_dedup_capacity_max: usize,
+    replication_scratch_matching_cell_capacity_max: usize,
+    replication_scratch_priority_capacity_max: usize,
     replication_candidates_selected: usize,
     commands_enqueued: usize,
     commands_applied: usize,
@@ -189,6 +198,42 @@ fn main() {
     println!(
         "replication_scratch_candidates={}",
         stats.replication_scratch_candidates
+    );
+    println!(
+        "replication_scratch_grid_queries={}",
+        stats.replication_scratch_grid_queries
+    );
+    println!(
+        "replication_scratch_occupied_queries={}",
+        stats.replication_scratch_occupied_queries
+    );
+    println!(
+        "replication_scratch_grid_cells_probed={}",
+        stats.replication_scratch_grid_cells_probed
+    );
+    println!(
+        "replication_scratch_occupied_cells_scanned={}",
+        stats.replication_scratch_occupied_cells_scanned
+    );
+    println!(
+        "replication_scratch_matched_cells={}",
+        stats.replication_scratch_matched_cells
+    );
+    println!(
+        "replication_scratch_candidate_capacity_max={}",
+        stats.replication_scratch_candidate_capacity_max
+    );
+    println!(
+        "replication_scratch_dedup_capacity_max={}",
+        stats.replication_scratch_dedup_capacity_max
+    );
+    println!(
+        "replication_scratch_matching_cell_capacity_max={}",
+        stats.replication_scratch_matching_cell_capacity_max
+    );
+    println!(
+        "replication_scratch_priority_capacity_max={}",
+        stats.replication_scratch_priority_capacity_max
     );
     println!(
         "replication_candidates_selected={}",
@@ -634,6 +679,38 @@ fn run(config: BenchConfig) -> BenchStats {
                     stats.replication_scratch_candidates = stats
                         .replication_scratch_candidates
                         .saturating_add(replication_scratch.candidate_count());
+                    let query_stats = replication_scratch.query_stats();
+                    match query_stats.strategy {
+                        CellQueryStrategy::Grid => {
+                            stats.replication_scratch_grid_queries =
+                                stats.replication_scratch_grid_queries.saturating_add(1);
+                        }
+                        CellQueryStrategy::OccupiedCells => {
+                            stats.replication_scratch_occupied_queries =
+                                stats.replication_scratch_occupied_queries.saturating_add(1);
+                        }
+                    }
+                    stats.replication_scratch_grid_cells_probed = stats
+                        .replication_scratch_grid_cells_probed
+                        .saturating_add(query_stats.grid_cells_probed);
+                    stats.replication_scratch_occupied_cells_scanned = stats
+                        .replication_scratch_occupied_cells_scanned
+                        .saturating_add(query_stats.occupied_cells_scanned);
+                    stats.replication_scratch_matched_cells = stats
+                        .replication_scratch_matched_cells
+                        .saturating_add(query_stats.matched_cells);
+                    stats.replication_scratch_candidate_capacity_max = stats
+                        .replication_scratch_candidate_capacity_max
+                        .max(replication_scratch.candidate_capacity());
+                    stats.replication_scratch_dedup_capacity_max = stats
+                        .replication_scratch_dedup_capacity_max
+                        .max(replication_scratch.candidate_dedup_capacity());
+                    stats.replication_scratch_matching_cell_capacity_max = stats
+                        .replication_scratch_matching_cell_capacity_max
+                        .max(replication_scratch.matching_cell_capacity());
+                    stats.replication_scratch_priority_capacity_max = stats
+                        .replication_scratch_priority_capacity_max
+                        .max(replication_scratch.prioritized_capacity());
                     plan.stats.selected
                 }
             };
@@ -1461,6 +1538,17 @@ mod tests {
 
         assert_eq!(stats.tick_ms.len(), 2);
         assert!(stats.replication_candidates_selected > 0);
+        assert_eq!(
+            stats.replication_scratch_grid_queries + stats.replication_scratch_occupied_queries,
+            stats.replication_scratch_queries
+        );
+        assert!(
+            stats.replication_scratch_grid_cells_probed
+                + stats.replication_scratch_occupied_cells_scanned
+                > 0
+        );
+        assert!(stats.replication_scratch_candidate_capacity_max > 0);
+        assert!(stats.replication_scratch_dedup_capacity_max > 0);
         assert_eq!(stats.command_queue_drops, 0);
         assert_eq!(stats.router_events_routed, 4);
         assert_eq!(stats.router_events_drained, 4);

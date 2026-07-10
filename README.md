@@ -289,7 +289,9 @@ Current SDK surface:
   not a gameplay priority system.
 - `CellQueryScratch` and `ReplicationScratch` let high-frequency AOI and
   replication planning loops reuse candidate/dedup/sort buffers instead of
-  allocating fresh temporary collections for every viewer query.
+  allocating fresh temporary collections for every viewer query. Queries choose
+  deterministically between direct grid probing and sorted occupied-cell scans
+  for sparse volumes, with explicit work and retained-capacity counters.
 - Bounded replication trackers record per-client/entity last-sent and ACK ticks
   for caller-managed cadence and delivery bookkeeping. They do not define a
   wire ACK protocol or automatically clear global dirty flags; explicit station
@@ -400,7 +402,8 @@ Current SDK surface:
   budget-aware replication selection preferring a higher-priority entity even
   when it is farther away.
 - `cargo run -p sectorsync-bench --example scratch_planning` demonstrates
-  reusable replication planning scratch across multiple viewer queries.
+  reusable replication planning scratch across multiple viewer queries and
+  reports adaptive query strategy plus retained buffer capacities.
 - `cargo run -p sectorsync-bench --example replication_tracker` demonstrates a
   bounded low-level send/ACK tracker feeding cadence lookups and explicit dirty
   cleanup after caller-confirmed delivery.

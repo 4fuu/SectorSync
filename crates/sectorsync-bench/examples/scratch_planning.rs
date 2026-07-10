@@ -51,6 +51,8 @@ fn main() {
     let mut scratch = ReplicationScratch::default();
     let mut selected = 0_usize;
     let mut last_candidates = 0_usize;
+    let mut grid_queries = 0_usize;
+    let mut occupied_queries = 0_usize;
     for viewer in &viewers {
         let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
             &station,
@@ -63,13 +65,22 @@ fn main() {
         );
         selected += plan.stats.selected;
         last_candidates = scratch.candidate_count();
+        match scratch.query_stats().strategy {
+            sectorsync_core::prelude::CellQueryStrategy::Grid => grid_queries += 1,
+            sectorsync_core::prelude::CellQueryStrategy::OccupiedCells => occupied_queries += 1,
+        }
     }
 
     println!(
-        "scratch_planning viewers={} selected={} last_candidates={} priority_capacity={}",
+        "scratch_planning viewers={} selected={} last_candidates={} grid_queries={} occupied_queries={} candidate_capacity={} dedup_capacity={} matching_cell_capacity={} priority_capacity={}",
         viewers.len(),
         selected,
         last_candidates,
+        grid_queries,
+        occupied_queries,
+        scratch.candidate_capacity(),
+        scratch.candidate_dedup_capacity(),
+        scratch.matching_cell_capacity(),
         scratch.prioritized_capacity()
     );
 }

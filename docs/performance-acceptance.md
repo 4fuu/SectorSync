@@ -60,7 +60,8 @@ Every acceptance run records these field groups:
 | --- | --- |
 | Workload/guard | `requested_profile`, `profile`, `allow_heavy`, `heavy_profile_denied`, `default_resource_guard_applied`, guard limits, entity/client/station/tick counts |
 | Tick latency | `tick_ms_p50`, `tick_ms_p95`, `tick_ms_p99`, `tick_ms_max`, `elapsed_ms` |
-| Replication selection | `replication_scratch_queries`, `replication_scratch_candidates`, `replication_candidates_selected` |
+| Replication selection | `replication_scratch_queries`, grid/occupied strategy query counts, probed/scanned/matched cell counts, `replication_scratch_candidates`, `replication_candidates_selected` |
+| Replication scratch capacity | `replication_scratch_candidate_capacity_max`, `replication_scratch_dedup_capacity_max`, `replication_scratch_matching_cell_capacity_max`, `replication_scratch_priority_capacity_max` |
 | Encoded payload | `encoded_packets`, `encoded_bytes`, `payload_entity_deltas`, `payload_component_deltas`, `estimated_payload_bytes` |
 | Direct commands | `commands_enqueued`, `commands_applied`, `command_latency_ticks_avg`, `command_latency_ticks_max`, `command_queue_max`, `command_queue_drops` |
 | Gateway/deployment dispatch | `gateway_commands_dispatched`, dispatch packet/byte/enqueue/apply/latency fields |
@@ -92,6 +93,12 @@ Interpretation:
 - `naive-grid` uses a direct spatial sphere query without compiled policy,
   visibility, cadence, priority, or replication budget logic.
 - `sectorsync` uses the policy-driven planner with reusable scratch storage.
+
+The scratch-backed spatial query chooses deterministically between probing the
+full query cell volume and scanning the index's non-empty cells. Large sparse
+queries sort matched occupied cells before collecting handles, preserving grid
+query order while avoiding empty-cell probes. Strategy work counters and
+retained capacity fields make this choice visible without collecting OS metrics.
 
 Compare at least selected candidates, estimated payload bytes, encoded bytes,
 and tick percentiles. The benchmark intentionally materializes at most 16 sample

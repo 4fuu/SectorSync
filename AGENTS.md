@@ -21,8 +21,8 @@
   benchmark smoke test, including the lightweight gateway/deployment command
   dispatch transport workload and bounded low-level client/gateway bridge
   roundtrip workload. The default SectorSync replication benchmark path should
-  exercise reusable replication planning scratch and report scratch query
-  counters.
+  exercise reusable replication planning scratch and report query strategy,
+  work, and retained-capacity counters.
 - When changing benchmark report fields, acceptance thresholds, baseline logic,
   or `docs/performance-acceptance.md`, run smoke with `sectorsync`, `full`,
   `room`, and `naive-grid` baselines. Keep all four default-safe and require
@@ -257,6 +257,10 @@ The core library does not own:
   storage for high-frequency AOI/replication planning. They must remain
   caller-owned, explicit, and bounded by caller use; do not hide thread-local
   scratch state, global caches, or implicit cross-client state.
+- Adaptive cell queries must choose from current query volume and index
+  occupancy deterministically. Occupied-cell scans must restore grid-order
+  results before candidate collection and retain temporary storage only in
+  caller-owned scratch.
 - Replication trackers must stay bounded and explicit. They may record
   per-client/entity sent and ACK ticks, but they must not invent a wire ACK
   protocol, clear global dirty flags implicitly, own client world state, or keep

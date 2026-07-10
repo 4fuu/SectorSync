@@ -14,11 +14,38 @@ pub struct CellOccupancy {
     pub entities: usize,
 }
 
+/// Strategy used by the last scratch-backed cell query.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CellQueryStrategy {
+    /// Probe every cell touched by the query bounds.
+    #[default]
+    Grid,
+    /// Scan non-empty cells when the query covers a larger sparse volume.
+    OccupiedCells,
+}
+
+/// Work counters from the last scratch-backed cell query.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellQueryStats {
+    /// Query strategy selected from query volume and current index occupancy.
+    pub strategy: CellQueryStrategy,
+    /// Grid cells probed directly by a grid query.
+    pub grid_cells_probed: usize,
+    /// Non-empty cells inspected by an occupied-cell scan.
+    pub occupied_cells_scanned: usize,
+    /// Non-empty cells overlapping the query bounds.
+    pub matched_cells: usize,
+    /// Unique candidate handles produced by the query.
+    pub candidate_handles: usize,
+}
+
 /// Reusable scratch storage for allocation-aware cell queries.
 #[derive(Clone, Debug, Default)]
 pub struct CellQueryScratch {
     seen: HashSet<EntityHandle>,
     handles: Vec<EntityHandle>,
+    matching_cells: Vec<CellCoord3>,
+    stats: CellQueryStats,
 }
 
 impl CellQueryScratch {
@@ -26,6 +53,8 @@ impl CellQueryScratch {
     pub fn clear(&mut self) {
         self.seen.clear();
         self.handles.clear();
+        self.matching_cells.clear();
+        self.stats = CellQueryStats::default();
     }
 
     /// Returns handles produced by the last query.
@@ -41,6 +70,26 @@ impl CellQueryScratch {
     /// Returns whether the last query produced no handles.
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
+    }
+
+    /// Work counters produced by the last query.
+    pub const fn stats(&self) -> CellQueryStats {
+        self.stats
+    }
+
+    /// Capacity retained for unique candidate handles.
+    pub fn handle_capacity(&self) -> usize {
+        self.handles.capacity()
+    }
+
+    /// Capacity retained by the candidate deduplication set.
+    pub fn dedup_capacity(&self) -> usize {
+        self.seen.capacity()
+    }
+
+    /// Capacity retained for occupied cells matched by sparse queries.
+    pub fn matching_cell_capacity(&self) -> usize {
+        self.matching_cells.capacity()
     }
 }
 
@@ -102,7 +151,7 @@ impl CellIndex {
     pub fn query_aabb(&self, aabb: Aabb3) -> Vec<EntityHandle> {
         let mut scratch = CellQueryScratch::default();
         self.query_aabb_into(aabb, &mut scratch);
-        scratch.handles.clone()
+        scratch.handles
     }
 
     /// Queries candidate handles overlapping an AABB using caller scratch.
@@ -115,13 +164,33 @@ impl CellIndex {
         let min = self.grid.cell_at(aabb.min);
         let max = self.grid.cell_at(aabb.max);
 
-        for x in min.x..=max.x {
-            for y in min.y..=max.y {
-                for z in min.z..=max.z {
-                    self.collect_cell(CellCoord3::new(x, y, z), scratch);
+        let grid_cells = query_cell_volume(min, max);
+        if grid_cells <= self.cells.len() {
+            scratch.stats.strategy = CellQueryStrategy::Grid;
+            scratch.stats.grid_cells_probed = grid_cells;
+            for x in min.x..=max.x {
+                for y in min.y..=max.y {
+                    for z in min.z..=max.z {
+                        self.collect_cell(CellCoord3::new(x, y, z), scratch);
+                    }
                 }
             }
+        } else {
+            scratch.stats.strategy = CellQueryStrategy::OccupiedCells;
+            scratch.stats.occupied_cells_scanned = self.cells.len();
+            scratch.matching_cells.extend(
+                self.cells
+                    .keys()
+                    .copied()
+                    .filter(|cell| cell_in_range(*cell, min, max)),
+            );
+            scratch.matching_cells.sort_unstable();
+            for index in 0..scratch.matching_cells.len() {
+                self.collect_cell(scratch.matching_cells[index], scratch);
+            }
         }
+
+        scratch.stats.candidate_handles = scratch.handles.len();
 
         scratch.handles()
     }
@@ -143,6 +212,7 @@ impl CellIndex {
 
     fn collect_cell(&self, cell: CellCoord3, scratch: &mut CellQueryScratch) {
         if let Some(handles) = self.cells.get(&cell) {
+            scratch.stats.matched_cells = scratch.stats.matched_cells.saturating_add(1);
             for handle in handles {
                 if scratch.seen.insert(*handle) {
                     scratch.handles.push(*handle);
@@ -158,7 +228,7 @@ impl CellIndex {
 
     /// Returns handles indexed directly in one cell without allocating.
     pub fn handles_in_cell_slice(&self, cell: CellCoord3) -> &[EntityHandle] {
-        self.cells.get(&cell).map(Vec::as_slice).unwrap_or(&[])
+        self.cells.get(&cell).map_or(&[], Vec::as_slice)
     }
 
     /// Returns cells currently occupied by one entity handle.
@@ -189,6 +259,28 @@ impl CellIndex {
         cells.sort_by_key(|occupancy| occupancy.cell);
         cells
     }
+}
+
+fn query_cell_volume(min: CellCoord3, max: CellCoord3) -> usize {
+    fn axis_cells(min: i32, max: i32) -> usize {
+        if max < min {
+            return 0;
+        }
+        usize::try_from(i64::from(max) - i64::from(min) + 1).unwrap_or(usize::MAX)
+    }
+
+    axis_cells(min.x, max.x)
+        .saturating_mul(axis_cells(min.y, max.y))
+        .saturating_mul(axis_cells(min.z, max.z))
+}
+
+const fn cell_in_range(cell: CellCoord3, min: CellCoord3, max: CellCoord3) -> bool {
+    cell.x >= min.x
+        && cell.x <= max.x
+        && cell.y >= min.y
+        && cell.y <= max.y
+        && cell.z >= min.z
+        && cell.z <= max.z
 }
 
 #[cfg(test)]
@@ -231,6 +323,10 @@ mod tests {
         );
         assert_eq!(first, &[handle]);
         assert_eq!(scratch.len(), 1);
+        assert_eq!(scratch.stats().strategy, CellQueryStrategy::Grid);
+        assert_eq!(scratch.stats().candidate_handles, 1);
+        assert!(scratch.handle_capacity() >= 1);
+        assert!(scratch.dedup_capacity() >= 1);
 
         let second = index.query_aabb_into(
             Bounds::Point.to_aabb(Position3::new(100.0, 0.0, 0.0)),
@@ -238,5 +334,31 @@ mod tests {
         );
         assert!(second.is_empty());
         assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn sparse_large_query_scans_occupied_cells_deterministically() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::new(grid);
+        let high = EntityHandle::new(2, 0);
+        let low = EntityHandle::new(1, 0);
+        index.upsert(high, Position3::new(95.0, 0.0, 0.0), Bounds::Point);
+        index.upsert(low, Position3::new(-95.0, 0.0, 0.0), Bounds::Point);
+        let mut scratch = CellQueryScratch::default();
+
+        let handles = index.query_aabb_into(
+            Aabb3::new(
+                Position3::new(-100.0, -100.0, -100.0),
+                Position3::new(100.0, 100.0, 100.0),
+            ),
+            &mut scratch,
+        );
+
+        assert_eq!(handles, &[low, high]);
+        assert_eq!(scratch.stats().strategy, CellQueryStrategy::OccupiedCells);
+        assert_eq!(scratch.stats().occupied_cells_scanned, 2);
+        assert_eq!(scratch.stats().matched_cells, 2);
+        assert_eq!(scratch.stats().candidate_handles, 2);
+        assert!(scratch.matching_cell_capacity() >= 2);
     }
 }

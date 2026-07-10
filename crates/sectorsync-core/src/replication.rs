@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::ids::{ClientId, EntityHandle, Tick};
 use crate::interest::{ViewerQuery, VisibilityFilter};
 use crate::policy::{CompiledSyncPolicy, PolicyTable};
-use crate::spatial_index::{CellIndex, CellQueryScratch};
+use crate::spatial_index::{CellIndex, CellQueryScratch, CellQueryStats};
 use crate::station::Station;
 
 /// Per-client replication budget.
@@ -404,6 +404,26 @@ impl ReplicationScratch {
     /// Capacity retained for priority candidate sorting.
     pub fn prioritized_capacity(&self) -> usize {
         self.prioritized.capacity()
+    }
+
+    /// Work counters from the last spatial candidate query.
+    pub const fn query_stats(&self) -> CellQueryStats {
+        self.cell_query.stats()
+    }
+
+    /// Capacity retained for spatial candidate handles.
+    pub fn candidate_capacity(&self) -> usize {
+        self.cell_query.handle_capacity()
+    }
+
+    /// Capacity retained by spatial candidate deduplication.
+    pub fn candidate_dedup_capacity(&self) -> usize {
+        self.cell_query.dedup_capacity()
+    }
+
+    /// Capacity retained for cells matched by sparse spatial queries.
+    pub fn matching_cell_capacity(&self) -> usize {
+        self.cell_query.matching_cell_capacity()
     }
 }
 
@@ -1091,6 +1111,9 @@ mod tests {
         assert_eq!(scratch_plan.stats, plan.stats);
         assert_eq!(scratch.candidate_count(), 2);
         assert!(scratch.prioritized_capacity() >= 2);
+        assert_eq!(scratch.query_stats().candidate_handles, 2);
+        assert!(scratch.candidate_capacity() >= 2);
+        assert!(scratch.candidate_dedup_capacity() >= 2);
     }
 
     #[test]

@@ -44,5 +44,7 @@ pub use crate::replication::{
 };
 pub use crate::snapshot::{RuntimeUpgradeHook, SnapshotMeta, SnapshotVersion, StationSnapshot};
 pub use crate::spatial::{Aabb3, Bounds, CellCoord3, Frustum3, GridSpec, Plane3, Position3, Vec3};
-pub use crate::spatial_index::{CellIndex, CellOccupancy, CellQueryScratch};
+pub use crate::spatial_index::{
+    CellIndex, CellOccupancy, CellQueryScratch, CellQueryStats, CellQueryStrategy,
+};
 pub use crate::station::{Station, StationConfig, StationError};
