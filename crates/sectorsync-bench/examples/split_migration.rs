@@ -5,7 +5,8 @@ use sectorsync_core::prelude::{
     InstanceId, NodeId, PolicyId, Position3, Station, StationConfig, StationId, StationLoadSample,
 };
 use sectorsync_runtime::{
-    CellOwnershipTable, SplitScheduler, SplitSchedulerConfig, StationIndexSet, StationSet,
+    CellOwnershipTable, SplitScheduler, SplitSchedulerConfig, SplitSchedulerScratch,
+    StationIndexSet, StationSet,
 };
 
 fn main() {
@@ -74,9 +75,10 @@ fn main() {
         ghost_ttl_ticks: 4,
         ..SplitSchedulerConfig::default()
     });
-    let schedule = scheduler.plan(&samples);
+    let mut scheduler_scratch = SplitSchedulerScratch::new();
+    let schedule = scheduler.plan_into(&samples, &mut scheduler_scratch);
     let report = scheduler
-        .execute(&schedule, &mut stations, &mut indexes, &mut ownership)
+        .execute_view(schedule, &mut stations, &mut indexes, &mut ownership)
         .expect("split schedule should execute");
     let action = schedule
         .actions

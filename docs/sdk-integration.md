@@ -190,6 +190,14 @@ the planner partitions deterministic top-k cells only when the move budget is
 less than half the sample. Scratch does not retain cooldown or ownership state,
 and it does not bypass target-capacity, improvement, action, or migration guards.
 
+When the complete split pass repeats, prefer `SplitSchedulerScratch` with
+`plan_into` or `plan_with_state_into`. The returned `SplitScheduleView` exposes
+only active decision/action slots while retaining decision reason vectors,
+action proposal coordinates, and hotspot candidates across passes. Use
+`execute_view` and `SplitSchedulerState::record_schedule_view` directly before
+the next planning call; owned schedule APIs remain available when results must
+outlive the scratch borrow.
+
 Execute ownership changes through `CellMigrationExecutor` or
 `EntityMigrationExecutor` so target ghosts are prewarmed, owner commit is
 single-authority, source ghosts survive the handoff window, and both spatial

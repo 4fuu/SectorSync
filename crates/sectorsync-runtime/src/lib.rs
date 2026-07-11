@@ -2785,7 +2785,7 @@ impl Default for SplitSchedulerConfig {
 }
 
 /// One scheduled split action.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplitAction {
     /// Source station selected for split.
     pub source_station: StationId,
@@ -2822,6 +2822,125 @@ pub struct SplitSchedule {
     pub skipped_insufficient_improvement: usize,
 }
 
+/// Borrowed split schedule produced from reusable scheduler output slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitScheduleView<'a> {
+    /// Hotspot decisions in input sample order.
+    pub decisions: &'a [HotspotDecision],
+    /// Admitted split actions in deterministic source order.
+    pub actions: &'a [SplitAction],
+    /// Hot stations skipped because no distinct target existed.
+    pub skipped_no_target: usize,
+    /// Hot stations skipped because no cells were proposed.
+    pub skipped_no_cells: usize,
+    /// Hot stations skipped because source station is inside split cooldown.
+    pub skipped_cooldown: usize,
+    /// Hot stations skipped because all targets were too warm or hot.
+    pub skipped_target_severity: usize,
+    /// Hot stations skipped because target capacity would be exceeded.
+    pub skipped_target_capacity: usize,
+    /// Hot stations skipped because target score improvement was too small.
+    pub skipped_insufficient_improvement: usize,
+}
+
+impl From<SplitScheduleView<'_>> for SplitSchedule {
+    fn from(view: SplitScheduleView<'_>) -> Self {
+        Self {
+            decisions: view.decisions.to_vec(),
+            actions: view.actions.to_vec(),
+            skipped_no_target: view.skipped_no_target,
+            skipped_no_cells: view.skipped_no_cells,
+            skipped_cooldown: view.skipped_cooldown,
+            skipped_target_severity: view.skipped_target_severity,
+            skipped_target_capacity: view.skipped_target_capacity,
+            skipped_insufficient_improvement: view.skipped_insufficient_improvement,
+        }
+    }
+}
+
+/// Caller-owned reusable output and working storage for split scheduling.
+#[derive(Clone, Debug, Default)]
+pub struct SplitSchedulerScratch {
+    decisions: Vec<HotspotDecision>,
+    active_decisions: usize,
+    actions: Vec<SplitAction>,
+    active_actions: usize,
+    hotspot: HotspotSplitScratch,
+    proposal: SplitProposal,
+    skipped_no_target: usize,
+    skipped_no_cells: usize,
+    skipped_cooldown: usize,
+    skipped_target_severity: usize,
+    skipped_target_capacity: usize,
+    skipped_insufficient_improvement: usize,
+}
+
+impl SplitSchedulerScratch {
+    /// Creates empty scheduler storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decision slots retained across passes.
+    pub fn retained_decision_slots(&self) -> usize {
+        self.decisions.len()
+    }
+
+    /// Action slots retained across passes.
+    pub fn retained_action_slots(&self) -> usize {
+        self.actions.len()
+    }
+
+    /// Total reason capacity retained across decision slots.
+    pub fn retained_reason_capacity(&self) -> usize {
+        self.decisions
+            .iter()
+            .map(|decision| decision.reasons.capacity())
+            .sum()
+    }
+
+    /// Total cell-coordinate capacity retained across action proposal slots.
+    pub fn retained_action_cell_capacity(&self) -> usize {
+        self.actions
+            .iter()
+            .map(|action| action.proposal.cells_to_move.capacity())
+            .sum()
+    }
+
+    /// Hotspot candidate capacity retained across passes.
+    pub fn retained_candidate_capacity(&self) -> usize {
+        self.hotspot.candidate_capacity()
+    }
+
+    fn prepare(&mut self, decisions: usize) {
+        if self.decisions.len() < decisions {
+            self.decisions
+                .resize_with(decisions, HotspotDecision::default);
+        }
+        self.active_decisions = decisions;
+        self.active_actions = 0;
+        self.skipped_no_target = 0;
+        self.skipped_no_cells = 0;
+        self.skipped_cooldown = 0;
+        self.skipped_target_severity = 0;
+        self.skipped_target_capacity = 0;
+        self.skipped_insufficient_improvement = 0;
+    }
+
+    fn view(&self) -> SplitScheduleView<'_> {
+        SplitScheduleView {
+            decisions: &self.decisions[..self.active_decisions],
+            actions: &self.actions[..self.active_actions],
+            skipped_no_target: self.skipped_no_target,
+            skipped_no_cells: self.skipped_no_cells,
+            skipped_cooldown: self.skipped_cooldown,
+            skipped_target_severity: self.skipped_target_severity,
+            skipped_target_capacity: self.skipped_target_capacity,
+            skipped_insufficient_improvement: self.skipped_insufficient_improvement,
+        }
+    }
+}
+
 /// Mutable planning state for conservative split scheduling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplitSchedulerState {
@@ -2842,6 +2961,13 @@ impl SplitSchedulerState {
     /// Records all actions in a schedule at the same tick.
     pub fn record_schedule(&mut self, schedule: &SplitSchedule, tick: Tick) {
         for action in &schedule.actions {
+            self.record_action(action, tick);
+        }
+    }
+
+    /// Records all actions from a borrowed reusable schedule view.
+    pub fn record_schedule_view(&mut self, schedule: SplitScheduleView<'_>, tick: Tick) {
+        for action in schedule.actions {
             self.record_action(action, tick);
         }
     }
@@ -2916,8 +3042,17 @@ impl SplitScheduler {
 
     /// Plans split actions from station load samples.
     pub fn plan(&self, samples: &[StationLoadSample]) -> SplitSchedule {
-        let mut scratch = HotspotSplitScratch::new();
-        self.plan_with_state_and_scratch(samples, None, Tick::new(0), &mut scratch)
+        let mut scratch = SplitSchedulerScratch::new();
+        self.plan_into(samples, &mut scratch).into()
+    }
+
+    /// Plans into fully reusable caller-owned output and working storage.
+    pub fn plan_into<'a>(
+        &self,
+        samples: &[StationLoadSample],
+        scratch: &'a mut SplitSchedulerScratch,
+    ) -> SplitScheduleView<'a> {
+        self.plan_with_state_into(samples, None, Tick::new(0), scratch)
     }
 
     /// Plans split actions using reusable hotspot cell candidate storage.
@@ -2936,8 +3071,9 @@ impl SplitScheduler {
         state: Option<&SplitSchedulerState>,
         current_tick: Tick,
     ) -> SplitSchedule {
-        let mut scratch = HotspotSplitScratch::new();
-        self.plan_with_state_and_scratch(samples, state, current_tick, &mut scratch)
+        let mut scratch = SplitSchedulerScratch::new();
+        self.plan_with_state_into(samples, state, current_tick, &mut scratch)
+            .into()
     }
 
     /// Plans with optional cooldown state and reusable hotspot candidate storage.
@@ -2948,21 +3084,33 @@ impl SplitScheduler {
         current_tick: Tick,
         scratch: &mut HotspotSplitScratch,
     ) -> SplitSchedule {
-        let decisions = samples
-            .iter()
-            .map(|sample| HotspotPlanner::evaluate(sample, self.config.thresholds))
-            .collect::<Vec<_>>();
-        let mut schedule = SplitSchedule {
-            decisions,
-            ..SplitSchedule::default()
-        };
+        let mut scheduler_scratch = SplitSchedulerScratch::new();
+        core::mem::swap(&mut scheduler_scratch.hotspot, scratch);
+        let schedule = self
+            .plan_with_state_into(samples, state, current_tick, &mut scheduler_scratch)
+            .into();
+        core::mem::swap(&mut scheduler_scratch.hotspot, scratch);
+        schedule
+    }
+
+    /// Plans with optional cooldown state into fully reusable scheduler storage.
+    pub fn plan_with_state_into<'a>(
+        &self,
+        samples: &[StationLoadSample],
+        state: Option<&SplitSchedulerState>,
+        current_tick: Tick,
+        scratch: &'a mut SplitSchedulerScratch,
+    ) -> SplitScheduleView<'a> {
+        scratch.prepare(samples.len());
+        for (decision, sample) in scratch.decisions[..samples.len()].iter_mut().zip(samples) {
+            HotspotPlanner::evaluate_into(sample, self.config.thresholds, decision);
+        }
 
         for source in samples {
-            if schedule.actions.len() >= self.config.max_actions_per_pass {
+            if scratch.active_actions >= self.config.max_actions_per_pass {
                 break;
             }
-            let Some(source_decision) = schedule
-                .decisions
+            let Some(source_decision) = scratch.decisions[..scratch.active_decisions]
                 .iter()
                 .find(|decision| decision.station_id == source.station_id)
             else {
@@ -2978,48 +3126,67 @@ impl SplitScheduler {
                     self.config.split_cooldown_ticks,
                 )
             }) {
-                schedule.skipped_cooldown += 1;
+                scratch.skipped_cooldown = scratch.skipped_cooldown.saturating_add(1);
                 continue;
             }
 
-            let proposal = HotspotPlanner::propose_cell_split_with_scratch(
+            HotspotPlanner::propose_cell_split_into(
                 source,
                 self.config.max_cells_per_action,
-                scratch,
+                &mut scratch.hotspot,
+                &mut scratch.proposal,
             );
-            if proposal.cells_to_move.is_empty() {
-                schedule.skipped_no_cells += 1;
+            if scratch.proposal.cells_to_move.is_empty() {
+                scratch.skipped_no_cells = scratch.skipped_no_cells.saturating_add(1);
                 continue;
             }
-            let target_selection =
-                select_split_target(source, &proposal, samples, &schedule.decisions, self.config);
+            let target_selection = select_split_target(
+                source,
+                &scratch.proposal,
+                samples,
+                &scratch.decisions[..scratch.active_decisions],
+                self.config,
+            );
             let Some(target) = target_selection.target else {
                 if target_selection.considered_targets == 0 {
-                    schedule.skipped_no_target += 1;
+                    scratch.skipped_no_target = scratch.skipped_no_target.saturating_add(1);
                 } else {
-                    schedule.skipped_target_severity +=
-                        usize::from(target_selection.rejected_by_severity > 0);
-                    schedule.skipped_target_capacity +=
-                        usize::from(target_selection.rejected_by_capacity > 0);
-                    schedule.skipped_insufficient_improvement +=
-                        usize::from(target_selection.rejected_by_improvement > 0);
+                    scratch.skipped_target_severity = scratch
+                        .skipped_target_severity
+                        .saturating_add(usize::from(target_selection.rejected_by_severity > 0));
+                    scratch.skipped_target_capacity = scratch
+                        .skipped_target_capacity
+                        .saturating_add(usize::from(target_selection.rejected_by_capacity > 0));
+                    scratch.skipped_insufficient_improvement = scratch
+                        .skipped_insufficient_improvement
+                        .saturating_add(usize::from(target_selection.rejected_by_improvement > 0));
                 }
                 continue;
             };
             let target_score = station_load_score(target);
             let estimated_target_score_after_move =
-                target_score.saturating_add(proposal.moved_pressure_score);
-            schedule.actions.push(SplitAction {
-                source_station: source.station_id,
-                target_station: target.station_id,
-                proposal,
-                source_score: station_load_score(source),
-                target_score,
-                estimated_target_score_after_move,
-            });
+                target_score.saturating_add(scratch.proposal.moved_pressure_score);
+            let action_index = scratch.active_actions;
+            if action_index == scratch.actions.len() {
+                scratch.actions.push(SplitAction::default());
+            }
+            let action = &mut scratch.actions[action_index];
+            action.source_station = source.station_id;
+            action.target_station = target.station_id;
+            action.proposal.source_station = scratch.proposal.source_station;
+            action.proposal.cells_to_move.clear();
+            action
+                .proposal
+                .cells_to_move
+                .extend_from_slice(&scratch.proposal.cells_to_move);
+            action.proposal.moved_pressure_score = scratch.proposal.moved_pressure_score;
+            action.source_score = station_load_score(source);
+            action.target_score = target_score;
+            action.estimated_target_score_after_move = estimated_target_score_after_move;
+            scratch.active_actions = scratch.active_actions.saturating_add(1);
         }
 
-        schedule
+        scratch.view()
     }
 
     /// Executes a split schedule by applying ownership updates and migrating entities.
@@ -3030,9 +3197,30 @@ impl SplitScheduler {
         indexes: &mut StationIndexSet,
         ownership: &mut CellOwnershipTable,
     ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
+        self.execute_actions(&schedule.actions, stations, indexes, ownership)
+    }
+
+    /// Executes actions directly from a borrowed reusable schedule view.
+    pub fn execute_view(
+        &self,
+        schedule: SplitScheduleView<'_>,
+        stations: &mut StationSet,
+        indexes: &mut StationIndexSet,
+        ownership: &mut CellOwnershipTable,
+    ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
+        self.execute_actions(schedule.actions, stations, indexes, ownership)
+    }
+
+    fn execute_actions(
+        &self,
+        actions: &[SplitAction],
+        stations: &mut StationSet,
+        indexes: &mut StationIndexSet,
+        ownership: &mut CellOwnershipTable,
+    ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
         let mut report = SplitScheduleExecutionReport::default();
 
-        for action in &schedule.actions {
+        for action in actions {
             if indexes.get(action.source_station).is_none() {
                 return Err(SplitScheduleExecutionError::MissingSourceIndex(
                     action.source_station,
@@ -6230,6 +6418,47 @@ mod tests {
         let improvement_schedule = improvement_guard.plan(&samples);
         assert!(improvement_schedule.actions.is_empty());
         assert_eq!(improvement_schedule.skipped_insufficient_improvement, 1);
+    }
+
+    #[test]
+    fn split_scheduler_view_matches_owned_and_retains_nested_capacity() {
+        let hot_cell = CellCoord3::new(0, 0, 0);
+        let samples = split_test_samples(hot_cell);
+        let scheduler = SplitScheduler::new(SplitSchedulerConfig {
+            thresholds: split_test_thresholds(),
+            max_actions_per_pass: 1,
+            max_cells_per_action: 1,
+            ..SplitSchedulerConfig::default()
+        });
+        let expected = scheduler.plan(&samples);
+        let mut scratch = SplitSchedulerScratch::new();
+
+        {
+            let view = scheduler.plan_into(&samples, &mut scratch);
+            assert_eq!(SplitSchedule::from(view), expected);
+        }
+        let decision_slots = scratch.retained_decision_slots();
+        let action_slots = scratch.retained_action_slots();
+        let reason_capacity = scratch.retained_reason_capacity();
+        let action_cell_capacity = scratch.retained_action_cell_capacity();
+        let candidate_capacity = scratch.retained_candidate_capacity();
+        assert_eq!(decision_slots, samples.len());
+        assert_eq!(action_slots, 1);
+        assert!(reason_capacity > 0);
+        assert!(action_cell_capacity > 0);
+        assert!(candidate_capacity > 0);
+
+        let reduced = scheduler.plan_into(&samples[1..], &mut scratch);
+        assert_eq!(reduced.decisions.len(), 1);
+        assert!(reduced.actions.is_empty());
+        assert_eq!(scratch.retained_decision_slots(), decision_slots);
+        assert_eq!(scratch.retained_action_slots(), action_slots);
+        assert_eq!(scratch.retained_reason_capacity(), reason_capacity);
+        assert_eq!(
+            scratch.retained_action_cell_capacity(),
+            action_cell_capacity
+        );
+        assert_eq!(scratch.retained_candidate_capacity(), candidate_capacity);
     }
 
     fn split_test_thresholds() -> HotspotThresholds {

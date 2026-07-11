@@ -510,6 +510,38 @@ with full sorting across zero, small, half, full, and oversized budgets. A
 `limit=1500` run reports `top_k_partition_applied=false` and the same
 `2,601,231,850` checksum in both modes, confirming high-budget fallback.
 
+## Split Schedule Nested Output Measurement
+
+`SplitSchedulerScratch` retains fixed decision and action slots while exposing
+only active prefixes through `SplitScheduleView`. Each decision retains its
+reason capacity, each action retains its proposal coordinate capacity, and the
+same storage owns hotspot cell candidates and the pending proposal. Borrowed
+views can be executed or recorded into cooldown state without materializing an
+owned schedule:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example split_schedule_reuse
+cargo run --release -q -p sectorsync-bench --example split_schedule_reuse -- --fresh-output
+```
+
+The default workload contains 64 Stations, four hot sources, 128 cells per hot
+source, four actions per pass, 100 calls per tick, and 20 ticks. Guards cap 256
+Stations, 512 cells per hot source, 16 actions, 200 calls per tick, and 30 ticks
+without `--allow-heavy`; execution has a 10-second budget. Output includes an
+exact checksum covering decision severity/reasons, actions, pressure scores and
+all skip counters, fresh-output count, every retained-capacity class, latency
+percentiles, guard metadata, path/workload verdicts, and `benchmark_ok`.
+
+Five alternating release A/B runs produced the same `270,716,000` checksum. The
+reusable path created zero fresh schedules and retained 64 decision slots, four
+action slots, reason/proposal capacity, and 128 hotspot candidates; the owned
+path created 2,000 fresh schedules. Median tick p99 was effectively neutral at
+2.466 ms with reuse versus 2.506 ms with fresh output because cell-pressure and
+target scans dominated. A larger guarded Station/action shape was highly noisy,
+so no latency improvement is claimed. Acceptance is based on exact full-field
+equivalence, removed nested allocation paths, retained-capacity tests, and the
+executable borrowed `split_migration` flow.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

@@ -133,6 +133,17 @@ pub struct HotspotDecision {
     pub reasons: Vec<&'static str>,
 }
 
+impl Default for HotspotDecision {
+    fn default() -> Self {
+        Self {
+            station_id: StationId::default(),
+            severity: HotspotSeverity::Normal,
+            score: 0,
+            reasons: Vec::new(),
+        }
+    }
+}
+
 /// Cell split proposal for external schedulers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplitProposal {
@@ -169,46 +180,52 @@ pub struct HotspotPlanner;
 impl HotspotPlanner {
     /// Evaluates a station load sample against thresholds.
     pub fn evaluate(sample: &StationLoadSample, thresholds: HotspotThresholds) -> HotspotDecision {
+        let mut decision = HotspotDecision::default();
+        Self::evaluate_into(sample, thresholds, &mut decision);
+        decision
+    }
+
+    /// Evaluates a station into caller-owned output while retaining reason capacity.
+    pub fn evaluate_into(
+        sample: &StationLoadSample,
+        thresholds: HotspotThresholds,
+        decision: &mut HotspotDecision,
+    ) {
         let mut score = 0_u64;
-        let mut reasons = Vec::new();
+        decision.station_id = sample.station_id;
+        decision.reasons.clear();
 
         if sample.total_entities() > thresholds.max_station_entities {
             score = score.saturating_add(1);
-            reasons.push("station_entities");
+            decision.reasons.push("station_entities");
         }
         if sample.subscribers > thresholds.max_station_subscribers {
             score = score.saturating_add(1);
-            reasons.push("station_subscribers");
+            decision.reasons.push("station_subscribers");
         }
         if sample.queued_events > thresholds.max_queued_events {
             score = score.saturating_add(1);
-            reasons.push("queued_events");
+            decision.reasons.push("queued_events");
         }
         if sample.estimated_bytes > thresholds.max_estimated_bytes {
             score = score.saturating_add(1);
-            reasons.push("estimated_bytes");
+            decision.reasons.push("estimated_bytes");
         }
         if sample.tick_cost_units > thresholds.max_tick_cost_units {
             score = score.saturating_add(1);
-            reasons.push("tick_cost");
+            decision.reasons.push("tick_cost");
         }
         if sample.max_cell_pressure() > thresholds.max_cell_pressure {
             score = score.saturating_add(1);
-            reasons.push("cell_pressure");
+            decision.reasons.push("cell_pressure");
         }
 
-        let severity = match score {
+        decision.severity = match score {
             0 => HotspotSeverity::Normal,
             1 => HotspotSeverity::Warm,
             _ => HotspotSeverity::Hot,
         };
-
-        HotspotDecision {
-            station_id: sample.station_id,
-            severity,
-            score,
-            reasons,
-        }
+        decision.score = score;
     }
 
     /// Proposes cells to move by selecting the highest-pressure cells first.
@@ -310,6 +327,23 @@ mod tests {
 
         let decision = HotspotPlanner::evaluate(&sample, thresholds);
         assert_eq!(decision.severity, HotspotSeverity::Hot);
+
+        let mut reused_decision = HotspotDecision::default();
+        HotspotPlanner::evaluate_into(&sample, thresholds, &mut reused_decision);
+        assert_eq!(reused_decision, decision);
+        let reason_capacity = reused_decision.reasons.capacity();
+        HotspotPlanner::evaluate_into(
+            &StationLoadSample {
+                station_id: StationId::new(4),
+                ..StationLoadSample::default()
+            },
+            thresholds,
+            &mut reused_decision,
+        );
+        assert_eq!(reused_decision.station_id, StationId::new(4));
+        assert_eq!(reused_decision.severity, HotspotSeverity::Normal);
+        assert!(reused_decision.reasons.is_empty());
+        assert_eq!(reused_decision.reasons.capacity(), reason_capacity);
 
         let proposal = HotspotPlanner::propose_cell_split(&sample, 1);
         assert_eq!(proposal.cells_to_move, vec![CellCoord3::new(1, 0, 0)]);

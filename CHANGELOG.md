@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Split scheduling now supports fully reusable nested output slots for hotspot
+  decisions and actions, plus borrowed execution/cooldown APIs, avoiding fresh
+  reason and proposal buffers in steady-state passes.
 - Hotspot cell split planning now offers reusable candidate/proposal storage and
   deterministic budgeted top-k selection; SplitScheduler exposes explicit
   scratch entry points without weakening conservative migration guards.
