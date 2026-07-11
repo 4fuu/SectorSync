@@ -848,6 +848,17 @@ impl ComponentStore {
             .and_then(|column| column.values.get(&entity))
     }
 
+    /// Returns whether any selected component on `entity` is dirty.
+    ///
+    /// This is a low-level convenience for caller-owned replication eligibility
+    /// rules; the store does not clear dirty state or track per-client delivery.
+    pub fn has_dirty_selected(&self, entity: EntityHandle, component_ids: &[ComponentId]) -> bool {
+        component_ids.iter().any(|component_id| {
+            self.get_blob(*component_id, entity)
+                .is_some_and(|blob| blob.dirty)
+        })
+    }
+
     /// Decodes a typed component value using `codec`.
     pub fn get_typed<T, C: ComponentCodec<T>>(
         &self,
@@ -1262,6 +1273,41 @@ mod tests {
                 .expect("typed value decodes"),
             20
         );
+    }
+
+    #[test]
+    fn selected_dirty_query_only_considers_requested_components() {
+        let selected = ComponentDescriptor::sparse_blob(
+            ComponentId::new(1),
+            "selected",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let ignored = ComponentDescriptor::sparse_blob(
+            ComponentId::new(2),
+            "ignored",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let entity = EntityHandle::new(1, 0);
+        let mut store = ComponentStore::default();
+        store
+            .set_blob(&selected, entity, 1, vec![1])
+            .expect("selected blob should fit");
+        store
+            .set_blob(&ignored, entity, 1, vec![2])
+            .expect("ignored blob should fit");
+
+        assert!(store.has_dirty_selected(entity, &[selected.id]));
+        store
+            .get_blob_mut(selected.id, entity)
+            .expect("selected blob exists")
+            .dirty = false;
+        assert!(!store.has_dirty_selected(entity, &[selected.id]));
+        assert!(store.has_dirty_selected(entity, &[ignored.id]));
+        assert!(!store.has_dirty_selected(entity, &[]));
     }
 
     #[test]

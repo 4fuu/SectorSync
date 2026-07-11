@@ -10,9 +10,9 @@ use sectorsync_core::prelude::{
     CommandQueueLimits, CommandQueues, ComponentDescriptor, ComponentId, ComponentMigrationMode,
     ComponentStore, ComponentSyncMode, EntityHandle, EntityId, EventId, EventKind, EventPriority,
     EventQueueLimits, GatewayConfig, GatewaySessionTable, GridSpec, InstanceId, NodeId, PolicyId,
-    PolicyTable, Position3, ReplicationBatchScratch, ReplicationBudget, ReplicationPlanner,
-    ReplicationScratch, ReplicationTracker, ReplicationTrackerConfig, Station, StationConfig,
-    StationEvent, StationId, Tick, ViewerQuery,
+    PolicyTable, Position3, RangeOnlyVisibility, ReplicationBatchScratch, ReplicationBudget,
+    ReplicationPlanner, ReplicationScratch, ReplicationTracker, ReplicationTrackerConfig, Station,
+    StationConfig, StationEvent, StationId, Tick, ViewerQuery,
 };
 use sectorsync_runtime::EventRouter;
 use sectorsync_transport::{
@@ -698,16 +698,8 @@ fn drain_gameplay_events(
     stats.events_drained = stats.events_drained.saturating_add(drained);
 }
 
-fn replicate_room(
-    room: &mut Room,
-    policies: &PolicyTable,
-    selection: &ComponentSelection,
-    builder: ReplicationFrameBuilder,
-    budget: ReplicationBudget,
-    stats: &mut Stats,
-) {
-    let viewers = room
-        .players
+fn room_viewers(room: &Room) -> Vec<ViewerQuery> {
+    room.players
         .iter()
         .map(|player| ViewerQuery {
             client_id: player.client_id,
@@ -719,13 +711,27 @@ fn replicate_room(
             radius: 256.0,
             max_entities: 256,
         })
-        .collect::<Vec<_>>();
-    let plans = ReplicationPlanner::plan_for_viewers_range_into(
+        .collect()
+}
+
+fn replicate_room(
+    room: &mut Room,
+    policies: &PolicyTable,
+    selection: &ComponentSelection,
+    builder: ReplicationFrameBuilder,
+    budget: ReplicationBudget,
+    stats: &mut Stats,
+) {
+    let viewers = room_viewers(room);
+    let components = &room.components;
+    let plans = ReplicationPlanner::plan_for_viewers_eligible_into(
         &room.station,
         &room.index,
         policies,
         &viewers,
+        &RangeOnlyVisibility,
         budget,
+        |_, handle, _| components.has_dirty_selected(handle, &selection.component_ids),
         &mut room.planning,
         &mut room.plans,
     );

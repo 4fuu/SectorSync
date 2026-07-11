@@ -369,10 +369,15 @@ budget.
 Two initial release runs completed all 30 ticks with 1,392 admitted and
 applied commands, 60 routed and drained events, 4,110 viewer plans and packets,
 3,035,294 encoded and decoded bytes, zero oversized packets, and 6.595-6.875 ms
-tick p99 on the development host. Each selected 537,076 entities but encoded
-41,409, or about 13 selected entities per encoded entity. This is the baseline
-signal for dirty-aware planning rather than a claim that the current ratio is
-ideal.
+tick p99 on the development host. They selected 537,076 entities but encoded
+41,409, exposing about 13x redundant planner and tracker work.
+
+After moving the benchmark's caller-owned dirty rule into planner eligibility,
+the same deterministic workload selected and encoded 41,409 entities, reducing
+the ratio to 1.000 and tracker ACK work from 527,157 to 40,234. Encoded bytes
+remained 3,035,294 and tick p99 was 6.759 ms, confirming that this change removes
+selection/tracking overhead without altering wire output. Host timings are
+diagnostic rather than portable acceptance thresholds.
 
 Machine-readable output retains phase percentiles, command/event/transport
 conservation, spawn/despawn and lifecycle counts, selected/encoded/component

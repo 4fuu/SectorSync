@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
+use crate::entity::EntityRecord;
 use crate::ids::{ClientId, EntityHandle, Tick};
 #[cfg(not(feature = "simd"))]
 use crate::interest::RangeOnlyVisibility;
@@ -767,6 +768,38 @@ impl ReplicationPlanner {
         scratch: &mut ReplicationScratch,
         plan: &mut ReplicationPlan,
     ) {
+        Self::plan_for_viewer_eligible_with_scratch_into(
+            station,
+            index,
+            policies,
+            viewer,
+            filter,
+            budget,
+            |_, _, _| true,
+            scratch,
+            plan,
+        );
+    }
+
+    /// Plans one viewer while applying caller-owned eligibility before budget use.
+    ///
+    /// The predicate can implement dirty, per-client delivery, or gameplay-owned
+    /// selection rules without transferring that state into `SectorSync`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_eligible_with_scratch_into<F, E>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        eligible: E,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
+    {
         let candidates =
             index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
         Self::plan_for_candidates_inner_into(
@@ -777,6 +810,7 @@ impl ReplicationPlanner {
             filter,
             budget,
             |_, _, _| true,
+            eligible,
             plan,
         );
     }
@@ -817,10 +851,40 @@ impl ReplicationPlanner {
         scratch: &mut ReplicationScratch,
         batch: &'a mut ReplicationBatchScratch,
     ) -> ReplicationBatchView<'a> {
+        Self::plan_for_viewers_eligible_into(
+            station,
+            index,
+            policies,
+            viewers,
+            filter,
+            budget,
+            |_, _, _| true,
+            scratch,
+            batch,
+        )
+    }
+
+    /// Plans viewers with caller-owned eligibility and reusable output storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewers_eligible_into<'a, F, E>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        filter: &F,
+        budget: ReplicationBudget,
+        eligible: E,
+        scratch: &mut ReplicationScratch,
+        batch: &'a mut ReplicationBatchScratch,
+    ) -> ReplicationBatchView<'a>
+    where
+        F: VisibilityFilter,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
+    {
         batch.prepare(viewers.len());
         for (plan, viewer) in batch.plans[..viewers.len()].iter_mut().zip(viewers) {
-            Self::plan_for_viewer_with_scratch_into(
-                station, index, policies, viewer, filter, budget, scratch, plan,
+            Self::plan_for_viewer_eligible_with_scratch_into(
+                station, index, policies, viewer, filter, budget, &eligible, scratch, plan,
             );
             batch.stats.record(plan, scratch);
         }
@@ -1001,6 +1065,7 @@ impl ReplicationPlanner {
                     last_sent(handle),
                 )
             },
+            |_, _, _| true,
             plan,
         );
     }
@@ -1196,13 +1261,14 @@ impl ReplicationPlanner {
             filter,
             budget,
             cadence_allows,
+            |_, _, _| true,
             &mut plan,
         );
         plan
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn plan_for_candidates_inner_into<F, C>(
+    fn plan_for_candidates_inner_into<F, C, E>(
         station: &Station,
         candidates: &[EntityHandle],
         policies: &PolicyTable,
@@ -1210,10 +1276,12 @@ impl ReplicationPlanner {
         filter: &F,
         budget: ReplicationBudget,
         cadence_allows: C,
+        eligible: E,
         plan: &mut ReplicationPlan,
     ) where
         F: VisibilityFilter,
         C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
     {
         let max_entities = viewer.max_entities.min(budget.max_entities);
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
@@ -1244,6 +1312,9 @@ impl ReplicationPlanner {
             }
             if !cadence_allows(*handle, policy, distance_squared) {
                 plan.stats.skipped_by_cadence += 1;
+                continue;
+            }
+            if !eligible(viewer, *handle, entity) {
                 continue;
             }
 
@@ -1290,6 +1361,7 @@ impl ReplicationPlanner {
             viewer,
             &RangeOnlyVisibility,
             budget,
+            |_, _, _| true,
             |_, _, _| true,
             plan,
         );
@@ -1636,6 +1708,61 @@ mod tests {
         assert_eq!(plan.entities, vec![static_visible]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.considered, 2);
+    }
+
+    #[test]
+    fn caller_eligibility_filters_before_replication_budget() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let mut index = CellIndex::new(GridSpec::new(16.0).expect("grid is valid"));
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 128.0));
+        let handles = (1_u16..=3)
+            .map(|id| {
+                let position = Position3::new(f32::from(id), 0.0, 0.0);
+                let handle = station
+                    .spawn_owned(
+                        EntityId::new(u64::from(id)),
+                        position,
+                        Bounds::Point,
+                        PolicyId::new(1),
+                    )
+                    .expect("entity id is unique");
+                index.upsert(handle, position, Bounds::Point);
+                handle
+            })
+            .collect::<Vec<_>>();
+        let viewer = ViewerQuery {
+            client_id: ClientId::new(1),
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: 128.0,
+            max_entities: 1,
+        };
+        let mut scratch = ReplicationScratch::default();
+        let mut plan = ReplicationPlan::default();
+
+        ReplicationPlanner::plan_for_viewer_eligible_with_scratch_into(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &RangeOnlyVisibility,
+            ReplicationBudget {
+                max_entities: 1,
+                ..ReplicationBudget::default()
+            },
+            |_, handle, _| handle == handles[2],
+            &mut scratch,
+            &mut plan,
+        );
+
+        assert_eq!(plan.entities, vec![handles[2]]);
+        assert_eq!(plan.stats.selected, 1);
+        assert_eq!(plan.stats.skipped_by_budget, 0);
     }
 
     #[test]

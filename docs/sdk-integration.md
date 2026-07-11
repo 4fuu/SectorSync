@@ -229,6 +229,14 @@ scratch lane per configured worker. Steady-state multi-room loops should use
 plan/entity capacity. Consume or encode that view before the next planning call.
 Cadence, priority, per-client tracking, and send state must remain explicit.
 
+Sparse-update integrations can use
+`plan_for_viewer_eligible_with_scratch_into` or
+`plan_for_viewers_eligible_into` to reject entities before they consume the
+replication budget. `ComponentStore::has_dirty_selected` is suitable for a
+global-dirty policy; per-client delivery state can instead live in the
+predicate's caller-owned state. The predicate does not clear dirty flags or
+invent ACK semantics.
+
 The bridge retains one `ReplicationPlan` output slot across its normal, cadence,
 priority, and priority/cadence send paths. Transport or encoding failures return
 the slot to the bridge before the error is surfaced. Direct single-viewer loops

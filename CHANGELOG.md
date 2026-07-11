@@ -14,6 +14,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
   active/idle/hot rooms through commands, movement, component changes,
   projectile churn, events, replication, in-memory transport, client decode,
   ACK tracking, and bounded room recreation.
+- Replication planners now accept caller-owned eligibility predicates before
+  budget consumption, with a component-store helper for checking whether any
+  explicitly selected component is dirty.
 
 ### Changed
 
