@@ -37,6 +37,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   views without materializing nested owned frame or payload buffers.
 - Replication receive bridges can visit borrowed frames immediately with
   separate propagation of transport/validation and caller application errors.
+- Client bridges can visit mixed ACK, borrowed replication, and barrier frames
+  in one validated allocation-light receive loop.
 - Bounded command, event, client packet, and station packet queues.
 - Gateway session expiry uses one allocation-free ordered-map retain scan.
 - Gateway client ingress can move ACK buffers directly into transport and

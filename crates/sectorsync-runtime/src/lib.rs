@@ -1009,6 +1009,69 @@ impl ClientTransportPump {
     }
 }
 
+/// Client-bound frame visited without materializing replication delta storage.
+#[derive(Clone, Debug)]
+pub enum ClientInboundFrameRef<'a> {
+    /// Decoded command acknowledgement value.
+    CommandAck(CommandAckFrame),
+    /// Validated replication frame borrowing entity/component payload bytes.
+    Replication(ReplicationFrameRef<'a>),
+    /// Decoded runtime barrier notification value.
+    Barrier(BarrierFrame),
+}
+
+/// Fixed-size result of visiting client-bound transport frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientTransportVisitReport {
+    /// Packets consumed from transport.
+    pub packets_received: usize,
+    /// Bytes consumed from transport.
+    pub bytes_received: usize,
+    /// Command acknowledgements decoded and accepted.
+    pub command_acks_received: usize,
+    /// Replication frames decoded and accepted.
+    pub replication_frames_received: usize,
+    /// Barrier frames decoded and accepted.
+    pub barrier_frames_received: usize,
+    /// Entity deltas visited in replication frames.
+    pub entities_received: usize,
+    /// Component deltas visited in replication frames.
+    pub components_received: usize,
+}
+
+/// Error produced while visiting client-bound transport frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientTransportVisitError<T, V> {
+    /// Packet receive, validation, or frame decoding failed.
+    Receive(ClientTransportBridgeError<T>),
+    /// The caller-provided frame visitor failed.
+    Visitor(V),
+}
+
+impl<T: core::fmt::Display, V: core::fmt::Display> core::fmt::Display
+    for ClientTransportVisitError<T, V>
+{
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Receive(error) => error.fmt(formatter),
+            Self::Visitor(error) => write!(formatter, "client frame visitor failed: {error}"),
+        }
+    }
+}
+
+impl<T, V> std::error::Error for ClientTransportVisitError<T, V>
+where
+    T: std::error::Error + 'static,
+    V: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Receive(error) => Some(error),
+            Self::Visitor(error) => Some(error),
+        }
+    }
+}
+
 /// Error produced by the low-level client transport bridge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientTransportBridgeError<E> {
@@ -1270,6 +1333,136 @@ impl ClientTransportBridge {
             }
         }
         Ok(pump)
+    }
+
+    /// Receives mixed client-bound frames and visits them without materializing
+    /// nested replication frame storage.
+    ///
+    /// ACK and barrier values are copied into the visitor enum. Replication
+    /// component bytes borrow the current transport packet and must be consumed
+    /// before the visitor returns. Accepted statistics are recorded before
+    /// visitor invocation and are not rolled back if the visitor fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn pump_visit<T, F, V>(
+        &mut self,
+        transport: &mut T,
+        max_packets: usize,
+        mut visitor: F,
+    ) -> Result<ClientTransportVisitReport, ClientTransportVisitError<T::Error, V>>
+    where
+        T: TransportReceiver,
+        F: for<'frame> FnMut(ClientInboundFrameRef<'frame>) -> Result<(), V>,
+    {
+        let mut report = ClientTransportVisitReport::default();
+        for _ in 0..max_packets {
+            let Some(packet) = transport.try_recv().map_err(|error| {
+                ClientTransportVisitError::Receive(ClientTransportBridgeError::Transport(error))
+            })?
+            else {
+                break;
+            };
+            self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+            self.stats.bytes_received =
+                self.stats.bytes_received.saturating_add(packet.bytes.len());
+            report.packets_received = report.packets_received.saturating_add(1);
+            report.bytes_received = report.bytes_received.saturating_add(packet.bytes.len());
+
+            if let Some(expected) = self.config.expected_source
+                && packet.client_id != Some(expected)
+            {
+                self.stats.frames_rejected_source =
+                    self.stats.frames_rejected_source.saturating_add(1);
+                return Err(ClientTransportVisitError::Receive(
+                    ClientTransportBridgeError::SourceMismatch {
+                        expected,
+                        actual: packet.client_id,
+                    },
+                ));
+            }
+
+            match BinaryFrameDecoder.decode_replication_ref(&packet.bytes) {
+                Ok(frame) => {
+                    self.validate_client_target::<T::Error>(
+                        ClientInboundFrameKind::Replication,
+                        frame.client_id,
+                    )
+                    .map_err(ClientTransportVisitError::Receive)?;
+                    let entities = frame.encoded_entity_count();
+                    let components = frame
+                        .entities()
+                        .map(sectorsync_wire::EntityDeltaRef::encoded_component_count)
+                        .sum::<usize>();
+                    self.stats.replication_frames_received =
+                        self.stats.replication_frames_received.saturating_add(1);
+                    self.stats.entities_received =
+                        self.stats.entities_received.saturating_add(entities);
+                    self.stats.components_received =
+                        self.stats.components_received.saturating_add(components);
+                    report.replication_frames_received =
+                        report.replication_frames_received.saturating_add(1);
+                    report.entities_received = report.entities_received.saturating_add(entities);
+                    report.components_received =
+                        report.components_received.saturating_add(components);
+                    visitor(ClientInboundFrameRef::Replication(frame))
+                        .map_err(ClientTransportVisitError::Visitor)?;
+                }
+                Err(ReplicationFrameRefDecodeError::Binary(error)) => {
+                    self.stats.frames_rejected_decode =
+                        self.stats.frames_rejected_decode.saturating_add(1);
+                    return Err(ClientTransportVisitError::Receive(
+                        ClientTransportBridgeError::Decode(error),
+                    ));
+                }
+                Err(ReplicationFrameRefDecodeError::UnexpectedFrameKind(_)) => {
+                    let decoded = BinaryFrameDecoder.decode(&packet.bytes).map_err(|error| {
+                        self.stats.frames_rejected_decode =
+                            self.stats.frames_rejected_decode.saturating_add(1);
+                        ClientTransportVisitError::Receive(ClientTransportBridgeError::Decode(
+                            error,
+                        ))
+                    })?;
+                    match decoded {
+                        RuntimeFrame::CommandAck(frame) => {
+                            self.validate_client_target::<T::Error>(
+                                ClientInboundFrameKind::CommandAck,
+                                frame.client_id,
+                            )
+                            .map_err(ClientTransportVisitError::Receive)?;
+                            self.stats.command_acks_received =
+                                self.stats.command_acks_received.saturating_add(1);
+                            report.command_acks_received =
+                                report.command_acks_received.saturating_add(1);
+                            visitor(ClientInboundFrameRef::CommandAck(frame))
+                                .map_err(ClientTransportVisitError::Visitor)?;
+                        }
+                        RuntimeFrame::Barrier(frame) => {
+                            self.validate_client_target::<T::Error>(
+                                ClientInboundFrameKind::Barrier,
+                                frame.client_id,
+                            )
+                            .map_err(ClientTransportVisitError::Receive)?;
+                            self.stats.barrier_frames_received =
+                                self.stats.barrier_frames_received.saturating_add(1);
+                            report.barrier_frames_received =
+                                report.barrier_frames_received.saturating_add(1);
+                            visitor(ClientInboundFrameRef::Barrier(frame))
+                                .map_err(ClientTransportVisitError::Visitor)?;
+                        }
+                        RuntimeFrame::Replication(_)
+                        | RuntimeFrame::Command(_)
+                        | RuntimeFrame::CommandDispatch(_)
+                        | RuntimeFrame::StationEvent(_) => {
+                            self.stats.frames_rejected_unexpected =
+                                self.stats.frames_rejected_unexpected.saturating_add(1);
+                            return Err(ClientTransportVisitError::Receive(
+                                ClientTransportBridgeError::UnexpectedFrame,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     fn validate_client_target<E>(
@@ -6192,7 +6385,7 @@ mod tests {
         server_transport
             .send(OutboundPacket {
                 client_id,
-                bytes: ack_bytes,
+                bytes: ack_bytes.clone(),
             })
             .expect("ACK should send");
 
@@ -6219,7 +6412,7 @@ mod tests {
         server_transport
             .send(OutboundPacket {
                 client_id,
-                bytes: replication_bytes,
+                bytes: replication_bytes.clone(),
             })
             .expect("replication should send");
 
@@ -6236,7 +6429,7 @@ mod tests {
         server_transport
             .send(OutboundPacket {
                 client_id,
-                bytes: barrier_bytes,
+                bytes: barrier_bytes.clone(),
             })
             .expect("barrier should send");
 
@@ -6259,6 +6452,71 @@ mod tests {
         assert_eq!(bridge.stats().barrier_frames_received, 1);
         assert_eq!(bridge.stats().entities_received, 1);
         assert_eq!(bridge.stats().components_received, 1);
+
+        for bytes in [ack_bytes.clone(), replication_bytes, barrier_bytes] {
+            server_transport
+                .send(OutboundPacket { client_id, bytes })
+                .expect("visitor packet should send");
+        }
+        let mut visited_ack = 0_usize;
+        let mut visited_replication = 0_usize;
+        let mut visited_barrier = 0_usize;
+        let mut payload_checksum = 0_u64;
+        let visit = bridge
+            .pump_visit(&mut client_transport, 8, |frame| {
+                match frame {
+                    ClientInboundFrameRef::CommandAck(frame) => {
+                        assert_eq!(frame, ack);
+                        visited_ack = visited_ack.saturating_add(1);
+                    }
+                    ClientInboundFrameRef::Replication(frame) => {
+                        assert_eq!(frame.client_id, client_id);
+                        assert_eq!(frame.encoded_entity_count(), 1);
+                        for entity in frame.entities() {
+                            for component in entity.components() {
+                                payload_checksum = payload_checksum.saturating_add(
+                                    component.bytes.iter().map(|byte| u64::from(*byte)).sum(),
+                                );
+                            }
+                        }
+                        visited_replication = visited_replication.saturating_add(1);
+                    }
+                    ClientInboundFrameRef::Barrier(frame) => {
+                        assert_eq!(frame, barrier);
+                        visited_barrier = visited_barrier.saturating_add(1);
+                    }
+                }
+                Ok::<(), &'static str>(())
+            })
+            .expect("mixed visitor pump should work");
+        assert_eq!(visit.packets_received, 3);
+        assert_eq!(visit.command_acks_received, 1);
+        assert_eq!(visit.replication_frames_received, 1);
+        assert_eq!(visit.barrier_frames_received, 1);
+        assert_eq!(visit.entities_received, 1);
+        assert_eq!(visit.components_received, 1);
+        assert_eq!(
+            (visited_ack, visited_replication, visited_barrier),
+            (1, 1, 1)
+        );
+        assert_eq!(payload_checksum, 100);
+        assert_eq!(bridge.stats().packets_received, 6);
+
+        server_transport
+            .send(OutboundPacket {
+                client_id,
+                bytes: ack_bytes,
+            })
+            .expect("failing visitor packet should send");
+        let visitor_error = bridge
+            .pump_visit(&mut client_transport, 1, |_| Err("apply failed"))
+            .expect_err("visitor failure should propagate");
+        assert_eq!(
+            visitor_error,
+            ClientTransportVisitError::Visitor("apply failed")
+        );
+        assert_eq!(bridge.stats().packets_received, 7);
+        assert_eq!(bridge.stats().command_acks_received, 3);
     }
 
     #[test]

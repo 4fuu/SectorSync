@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Client transport bridges now offer one fallible mixed-frame visitor pump for
+  ACK, borrowed replication, and barrier frames without nested replication
+  materialization; owned mixed pumping remains compatible.
 - Reliable Client and Station receive endpoints now borrow-decode frames and
   reuse each inbound wire Vec as the delivered payload instead of allocating a
   second payload buffer; compatible owned decoders remain available.

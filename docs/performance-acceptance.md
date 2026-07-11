@@ -908,6 +908,39 @@ about a 64% reduction on this development host. Identical bridge counters,
 workload/checksum, zero visitor materializations, visitor-error propagation,
 and complete source/wire/target validation are the portable acceptance signals.
 
+## Mixed Client Receive Visitor Measurement
+
+`ClientTransportBridge::pump_visit` accepts command ACKs, borrowed replication
+frames, and barrier notifications in one fallible visitor loop. It shares
+expected-source, target, complete wire validation, and cumulative statistics
+with compatible owned mixed pumping while avoiding nested replication frame
+materialization.
+
+Compare visitor and owned mixed client receive using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example client_mixed_receive_visit
+cargo run --release -q -p sectorsync-bench --example client_mixed_receive_visit -- --owned
+```
+
+The default preloaded workload processes 100 replication frames, 20 ACKs, and
+one barrier per tick for ten ticks. Each replication frame has 64 entities,
+four components per entity, and 64-byte component payloads. Guards cap 500
+replication frames, 500 ACKs, 20 barriers per tick, 256 entities, eight
+components, 1 KiB component payloads, 20 ticks, and 64 MiB aggregate
+replication payload work without `--allow-heavy`; execution has a 10-second
+budget.
+
+Five alternating release A/B runs each consumed 1,210 packets: 1,000
+replication frames, 200 ACKs, and ten barriers. Both paths visited 64,000
+entities, 256,000 components, `16,384,000` payload bytes, and produced a
+`46,080,220` checksum with identical bridge statistics. Visitor pumping
+materialized zero owned replication frames; mixed owned pumping materialized
+1,000. Median tick p99 was 1.206 ms visitor versus 3.917 ms owned, about a
+69.2% reduction on this development host. Exact mixed counts, checksum,
+statistics, visitor-error propagation, zero materializations, guard metadata,
+and `benchmark_ok=true` are the portable acceptance signals.
+
 ## Gateway ACK Ownership Measurement
 
 `GatewayClientTransportBridge::pump_ingress_compact` shares packet decoding,

@@ -226,6 +226,13 @@ and validation failures. Accepted-frame statistics are recorded before visitor
 invocation and are not rolled back on an application error. Use the compatible
 owned `pump` when frames must be queued, replayed, or transferred.
 
+When one client receive loop must also handle command ACKs and barrier state,
+use `ClientTransportBridge::pump_visit`. Its `ClientInboundFrameRef` carries ACK
+and barrier values plus borrowed replication frames through one expected-source,
+target-validation, statistics, and visitor-error path. Consume replication
+payload slices before returning from the visitor. Use the compatible mixed
+`pump` when any decoded frame must be retained or transferred.
+
 For synchronous UDP receive loops, `UdpTransport::try_recv_ref` and
 `UdpStationTransport::try_recv_station_ref` expose bytes from each adapter's
 configured reusable datagram buffer. Consume and decode the view before the
