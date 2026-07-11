@@ -76,6 +76,8 @@ pub struct ReplicationTransportStats {
     pub entities_encoded: usize,
     /// Component deltas encoded into replication frames.
     pub components_encoded: usize,
+    /// Entities rolled back because the concrete frame byte budget filled.
+    pub entities_skipped_by_frame_bytes: usize,
 }
 
 /// Result of one viewer replication send attempt.
@@ -95,6 +97,8 @@ pub struct ReplicationTransportReport {
     pub skipped_by_budget: usize,
     /// Candidate entities skipped because cadence had not elapsed.
     pub skipped_by_cadence: usize,
+    /// Entities rolled back because the concrete frame byte budget filled.
+    pub skipped_by_frame_bytes: usize,
     /// Encoded wire bytes submitted to transport.
     pub bytes_sent: usize,
     /// Whether a frame was sent.
@@ -178,6 +182,7 @@ impl ReplicationTransportBridge {
                 entities_skipped_by_cadence: 0,
                 entities_encoded: 0,
                 components_encoded: 0,
+                entities_skipped_by_frame_bytes: 0,
             },
         }
     }
@@ -409,19 +414,21 @@ impl ReplicationTransportBridge {
 
         let capacity_hint = self
             .builder
-            .sampled_binary_capacity_hint(station, plan, components, selection);
+            .sampled_binary_capacity_hint(station, plan, components, selection)
+            .min(self.config.budget.max_bytes);
         let mut bytes = Vec::with_capacity(capacity_hint);
         self.stats.packet_capacity_hint_bytes = self
             .stats
             .packet_capacity_hint_bytes
             .saturating_add(capacity_hint);
-        let build_stats = self.builder.encode_binary_into(
+        let build_stats = self.builder.encode_binary_bounded_into(
             client_id,
             server_tick,
             station,
             plan,
             components,
             selection,
+            self.config.budget.max_bytes,
             &mut bytes,
         )?;
         self.stats.entities_encoded = self
@@ -432,6 +439,10 @@ impl ReplicationTransportBridge {
             .stats
             .components_encoded
             .saturating_add(build_stats.encoded_components);
+        self.stats.entities_skipped_by_frame_bytes = self
+            .stats
+            .entities_skipped_by_frame_bytes
+            .saturating_add(build_stats.skipped_entities_by_frame_bytes);
 
         if build_stats.encoded_entities == 0 && !self.config.send_empty_frames {
             self.stats.frames_skipped_empty = self.stats.frames_skipped_empty.saturating_add(1);
@@ -479,6 +490,7 @@ fn replication_report(
         estimated_plan_bytes: plan.stats.estimated_bytes,
         skipped_by_budget: plan.stats.skipped_by_budget,
         skipped_by_cadence: plan.stats.skipped_by_cadence,
+        skipped_by_frame_bytes: build_stats.skipped_entities_by_frame_bytes,
         bytes_sent,
         sent,
     }
@@ -4781,8 +4793,9 @@ impl CommandDispatchTransportBridge {
     where
         T: StationTransportSink,
     {
-        let frame = CommandDispatchFrame::from_envelope(target_station, command);
-        self.send_frame(transport, source_station, &frame)
+        let mut bytes = Vec::with_capacity(64_usize.saturating_add(command.payload.len()));
+        BinaryFrameEncoder.encode_command_dispatch_envelope(target_station, command, &mut bytes)?;
+        self.send_encoded(transport, source_station, target_station, bytes)
     }
 
     /// Encodes and sends a command dispatch frame to its target station.
@@ -4797,11 +4810,24 @@ impl CommandDispatchTransportBridge {
     {
         let mut bytes = Vec::with_capacity(64);
         BinaryFrameEncoder.encode_command_dispatch(frame, &mut bytes)?;
+        self.send_encoded(transport, source_station, frame.station_id, bytes)
+    }
+
+    fn send_encoded<T>(
+        &mut self,
+        transport: &mut T,
+        source_station: StationId,
+        target_station: StationId,
+        bytes: Vec<u8>,
+    ) -> Result<(), CommandDispatchTransportError<T::Error>>
+    where
+        T: StationTransportSink,
+    {
         let byte_len = bytes.len();
         transport
             .send_station(StationOutboundPacket {
                 source_station,
-                target_station: frame.station_id,
+                target_station,
                 bytes,
             })
             .map_err(CommandDispatchTransportError::Transport)?;
@@ -6188,7 +6214,7 @@ mod tests {
             ReplicationTransportConfig {
                 budget: ReplicationBudget {
                     max_entities: 1,
-                    max_bytes: 32,
+                    max_bytes: 128,
                     estimated_entity_bytes: 32,
                 },
                 send_empty_frames: false,

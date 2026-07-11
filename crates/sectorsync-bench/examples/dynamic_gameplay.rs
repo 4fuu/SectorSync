@@ -279,6 +279,7 @@ struct Stats {
     unexamined_after_budget: usize,
     encoded_entities: usize,
     encoded_components: usize,
+    skipped_entities_by_frame_bytes: usize,
     packets_sent: usize,
     packets_received: usize,
     encoded_bytes: usize,
@@ -798,13 +799,14 @@ fn replicate_room(
             builder.sampled_binary_capacity_hint(&room.station, plan, &room.components, selection);
         let mut bytes = Vec::with_capacity(capacity);
         let build = builder
-            .encode_binary_into(
+            .encode_binary_bounded_into(
                 viewer.client_id,
                 room.station.tick(),
                 &room.station,
                 plan,
                 &room.components,
                 selection,
+                MAX_PACKET_BYTES,
                 &mut bytes,
             )
             .expect("guarded replication frame should encode");
@@ -814,6 +816,9 @@ fn replicate_room(
         stats.encoded_components = stats
             .encoded_components
             .saturating_add(build.encoded_components);
+        stats.skipped_entities_by_frame_bytes = stats
+            .skipped_entities_by_frame_bytes
+            .saturating_add(build.skipped_entities_by_frame_bytes);
         if bytes.len() > MAX_PACKET_BYTES {
             stats.packet_oversize = stats.packet_oversize.saturating_add(1);
             continue;
@@ -999,6 +1004,10 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
         stats.selected_entities as f64 / stats.encoded_entities.max(1) as f64
     );
     println!("encoded_components={}", stats.encoded_components);
+    println!(
+        "skipped_entities_by_frame_bytes={}",
+        stats.skipped_entities_by_frame_bytes
+    );
     println!("packets_sent={}", stats.packets_sent);
     println!("packets_received={}", stats.packets_received);
     println!("encoded_bytes={}", stats.encoded_bytes);

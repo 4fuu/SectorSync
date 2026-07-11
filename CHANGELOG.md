@@ -29,6 +29,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Reliable Client/Station retry senders now index retry deadlines instead of
   scanning every in-flight packet on each poll, and split target selection uses
   the aligned decision array without repeated Station-id scans.
+- Command dispatch bridges encode borrowed envelopes without cloning opaque
+  payloads, and direct replication encoding can enforce a concrete frame-byte
+  budget by rolling back the first entity that would exceed it.
 
 ### Changed
 

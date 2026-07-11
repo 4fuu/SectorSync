@@ -139,6 +139,11 @@ bounded by the configured window, interval, and attempt limits.
 of scanning all packets. ACK and timeout removal update that index immediately;
 the final packet for a peer also removes its count entry.
 
+`CommandDispatchTransportBridge::send_envelope` encodes the borrowed stamped
+envelope directly. Use an owned `CommandDispatchFrame` only when dispatch data
+must be retained independently; immediate transmission does not clone its
+opaque payload.
+
 Reliable Client and Station endpoints borrow-decode inbound frames and reuse
 the received wire Vec as the unique delivered payload after removing the fixed
 reliable header in place. This is automatic in `handle_inbound`; use
@@ -239,6 +244,12 @@ replication budget. `ComponentStore::has_dirty_selected` is suitable for a
 global-dirty policy; per-client delivery state can instead live in the
 predicate's caller-owned state. The predicate does not clear dirty flags or
 invent ACK semantics.
+
+`ReplicationBudget::max_bytes` is also the concrete frame limit used by
+`ReplicationTransportBridge`. Direct wire integrations can call
+`encode_binary_bounded_into`; the first entity that would exceed the frame
+budget is rolled back and reported through `skipped_entities_by_frame_bytes`.
+This is a wire guarantee, unlike planner estimates and capacity hints.
 
 When deterministic first-fit selection is acceptable, the explicit
 `*_work_bounded_*` APIs stop scanning as soon as the entity or estimated-byte

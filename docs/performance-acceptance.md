@@ -406,6 +406,12 @@ and client checksums, retained capacity classes, threshold verdicts, and
 `benchmark_ok`. It does not implement combat, persistence, matchmaking, kernel
 networking, or production client prediction.
 
+The focused `replication_frame_budget` workload deliberately underestimates 32
+64-byte component updates as 256 planner bytes. With a concrete 512-byte frame
+budget, bounded encoding admitted four entities into 417 bytes and atomically
+rolled back the fifth. Its verdict requires the final frame to remain within
+budget despite the optimistic planner estimate.
+
 ## Hot-Path Measurements
 
 These focused A/B runs isolate one algorithm, lookup, ownership, or allocation

@@ -273,6 +273,8 @@ pub struct ReplicationFrameBuildStats {
     pub encoded_components: usize,
     /// Entity deltas skipped by builder limits.
     pub skipped_entities_by_limit: usize,
+    /// Entity deltas skipped because the concrete frame byte budget filled.
+    pub skipped_entities_by_frame_bytes: usize,
     /// Component deltas skipped by builder limits.
     pub skipped_components_by_limit: usize,
     /// Component payloads skipped because they exceed byte limits.
@@ -512,6 +514,41 @@ impl ReplicationFrameBuilder {
         selection: &ComponentSelection,
         out: &mut Vec<u8>,
     ) -> Result<ReplicationFrameBuildStats, BinaryEncodeError> {
+        self.encode_binary_bounded_into(
+            client_id,
+            server_tick,
+            station,
+            plan,
+            components,
+            selection,
+            usize::MAX,
+            out,
+        )
+    }
+
+    /// Builds and appends one replication frame under a concrete wire-byte budget.
+    ///
+    /// The budget applies only to bytes appended by this frame. If the next
+    /// entity would exceed it, that entity is rolled back and planning stops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_binary_bounded_into(
+        &self,
+        client_id: ClientId,
+        server_tick: Tick,
+        station: &Station,
+        plan: &ReplicationPlan,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        max_frame_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<ReplicationFrameBuildStats, BinaryEncodeError> {
+        if max_frame_bytes < Self::BINARY_HEADER_BYTES {
+            return Err(BinaryEncodeError::FrameBudgetTooSmall {
+                budget: max_frame_bytes,
+                required: Self::BINARY_HEADER_BYTES,
+            });
+        }
+        let frame_start = out.len();
         let mut stats = ReplicationFrameBuildStats {
             planned_entities: plan.entities.len(),
             ..ReplicationFrameBuildStats::default()
@@ -541,6 +578,7 @@ impl ReplicationFrameBuilder {
             };
 
             let entity_start = out.len();
+            let estimated_before_entity = estimated_payload_bytes;
             out.extend_from_slice(&entity.id.get().to_le_bytes());
             out.extend_from_slice(&entity.role.owner_epoch().get().to_le_bytes());
             let component_count_offset = out.len();
@@ -576,6 +614,14 @@ impl ReplicationFrameBuilder {
             if component_count == 0 {
                 out.truncate(entity_start);
                 continue;
+            }
+
+            if out.len().saturating_sub(frame_start) > max_frame_bytes {
+                out.truncate(entity_start);
+                estimated_payload_bytes = estimated_before_entity;
+                stats.skipped_entities_by_frame_bytes =
+                    stats.skipped_entities_by_frame_bytes.saturating_add(1);
+                break;
             }
 
             let component_count =
@@ -950,6 +996,13 @@ impl From<BinaryDecodeError> for ReplicationFrameRefDecodeError {
 /// Binary encode error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BinaryEncodeError {
+    /// A concrete frame budget could not fit the fixed wire header.
+    FrameBudgetTooSmall {
+        /// Configured frame budget.
+        budget: usize,
+        /// Minimum fixed header bytes required.
+        required: usize,
+    },
     /// A list length exceeded `u32::MAX`.
     TooManyItems {
         /// Field being encoded.
@@ -969,6 +1022,10 @@ pub enum BinaryEncodeError {
 impl core::fmt::Display for BinaryEncodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::FrameBudgetTooSmall { budget, required } => write!(
+                f,
+                "replication frame budget {budget} bytes is smaller than {required}-byte header"
+            ),
             Self::TooManyItems { field, actual } => {
                 write!(f, "{field} has too many items: {actual}")
             }
@@ -1075,6 +1132,30 @@ impl FrameDecoder for BinaryFrameDecoder {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinaryFrameEncoder;
 
+impl BinaryFrameEncoder {
+    /// Encodes a stamped command envelope directly as a dispatch frame.
+    ///
+    /// This avoids cloning the opaque payload into an intermediate owned
+    /// [`CommandDispatchFrame`] when the frame is immediately transmitted.
+    pub fn encode_command_dispatch_envelope(
+        &mut self,
+        station_id: StationId,
+        envelope: &CommandEnvelope,
+        out: &mut Vec<u8>,
+    ) -> Result<(), BinaryEncodeError> {
+        out.push(FrameKind::CommandDispatch as u8);
+        out.extend_from_slice(&station_id.get().to_le_bytes());
+        out.extend_from_slice(&envelope.client_id.get().to_le_bytes());
+        out.extend_from_slice(&envelope.id.get().to_le_bytes());
+        out.extend_from_slice(&envelope.entity_id.get().to_le_bytes());
+        out.extend_from_slice(&envelope.sequence.to_le_bytes());
+        out.extend_from_slice(&envelope.received_at.get().to_le_bytes());
+        out.extend_from_slice(&envelope.kind.to_le_bytes());
+        out.push(encode_command_priority(envelope.priority));
+        write_bytes("command_dispatch.payload", &envelope.payload, out)
+    }
+}
+
 impl FrameEncoder for BinaryFrameEncoder {
     type Error = BinaryEncodeError;
 
@@ -1151,8 +1232,7 @@ impl FrameEncoder for BinaryFrameEncoder {
         out.extend_from_slice(&frame.received_at.get().to_le_bytes());
         out.extend_from_slice(&frame.kind.to_le_bytes());
         out.push(encode_command_priority(frame.priority));
-        write_bytes("command_dispatch.payload", &frame.payload, out)?;
-        Ok(())
+        write_bytes("command_dispatch.payload", &frame.payload, out)
     }
 
     fn encode_station_event(
@@ -1645,6 +1725,21 @@ mod tests {
         encoder
             .encode_command_dispatch(&frame, &mut bytes)
             .expect("encoder is infallible");
+        let envelope = CommandEnvelope {
+            id: frame.command_id,
+            client_id: frame.client_id,
+            entity_id: frame.entity_id,
+            sequence: frame.sequence,
+            received_at: frame.received_at,
+            kind: frame.kind,
+            priority: frame.priority,
+            payload: frame.payload.clone(),
+        };
+        let mut direct = Vec::new();
+        encoder
+            .encode_command_dispatch_envelope(frame.station_id, &envelope, &mut direct)
+            .expect("direct encoder is infallible");
+        assert_eq!(direct, bytes);
 
         let decoded = BinaryFrameDecoder
             .decode(&bytes)
@@ -1868,6 +1963,67 @@ mod tests {
             builder.sampled_binary_capacity_hint(&station, &plan, &components, &selection),
             direct_bytes.len()
         );
+        assert_bounded_binary_encoding(
+            builder,
+            &station,
+            &plan,
+            &components,
+            &selection,
+            direct_bytes.len(),
+        );
+    }
+
+    fn assert_bounded_binary_encoding(
+        builder: ReplicationFrameBuilder,
+        station: &Station,
+        plan: &ReplicationPlan,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        unbounded_len: usize,
+    ) {
+        let mut bounded_bytes = Vec::new();
+        let bounded = builder
+            .encode_binary_bounded_into(
+                ClientId::new(5),
+                Tick::new(9),
+                station,
+                plan,
+                components,
+                selection,
+                unbounded_len - 1,
+                &mut bounded_bytes,
+            )
+            .expect("bounded frame should roll back the oversized entity");
+        assert_eq!(bounded.encoded_entities, 0);
+        assert_eq!(bounded.encoded_components, 0);
+        assert_eq!(bounded.skipped_entities_by_frame_bytes, 1);
+        assert!(bounded_bytes.len() < unbounded_len);
+        let RuntimeFrame::Replication(frame) = BinaryFrameDecoder
+            .decode(&bounded_bytes)
+            .expect("bounded empty frame should remain valid")
+        else {
+            panic!("expected replication frame");
+        };
+        assert!(frame.entities.is_empty());
+
+        let mut prefix = vec![9, 8, 7];
+        assert_eq!(
+            builder.encode_binary_bounded_into(
+                ClientId::new(5),
+                Tick::new(9),
+                station,
+                plan,
+                components,
+                selection,
+                ReplicationFrameBuilder::BINARY_HEADER_BYTES - 1,
+                &mut prefix,
+            ),
+            Err(BinaryEncodeError::FrameBudgetTooSmall {
+                budget: ReplicationFrameBuilder::BINARY_HEADER_BYTES - 1,
+                required: ReplicationFrameBuilder::BINARY_HEADER_BYTES,
+            })
+        );
+        assert_eq!(prefix, [9, 8, 7]);
     }
 
     #[test]
