@@ -20,6 +20,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Replication planners now offer explicit work-bounded first-fit entry points
   that stop scanning when the budget fills and report unexamined candidates
   separately from exact budget skips.
+- Runtime Station/index registries, event routing, and bounded in-memory client
+  and Station transports now expose explicit teardown APIs that preserve
+  deterministic registry order and report discarded queued work.
 
 ### Changed
 

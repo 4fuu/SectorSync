@@ -1739,6 +1739,17 @@ pub struct InMemoryTransportHub {
     inner: Arc<Mutex<InMemoryTransportInner>>,
 }
 
+/// Resources released when an in-memory client endpoint is unregistered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InMemoryClientUnregister {
+    /// Address previously associated with the client.
+    pub remote_addr: SocketAddr,
+    /// Packets discarded with the endpoint queue.
+    pub queued_packets: usize,
+    /// Queue slots released with the endpoint.
+    pub retained_queue_capacity: usize,
+}
+
 impl InMemoryTransportHub {
     /// Creates an empty in-memory transport hub.
     pub fn new(limits: ClientTransportLimits) -> Self {
@@ -1795,6 +1806,23 @@ impl InMemoryTransportHub {
             local_client_id: client_id,
             hub: self.clone(),
         }
+    }
+
+    /// Unregisters a client and releases its queued packet storage.
+    pub fn unregister_client(
+        &self,
+        client_id: ClientId,
+    ) -> Result<Option<InMemoryClientUnregister>, InMemoryTransportError> {
+        let mut inner = self.lock_inner()?;
+        let Some(client) = inner.clients.remove(&client_id) else {
+            return Ok(None);
+        };
+        inner.addr_to_client.remove(&client.remote_addr);
+        Ok(Some(InMemoryClientUnregister {
+            remote_addr: client.remote_addr,
+            queued_packets: client.queue.len(),
+            retained_queue_capacity: client.queue.capacity(),
+        }))
     }
 
     /// Returns queued packet count for a client.
@@ -3706,6 +3734,11 @@ impl InMemoryStationTransport {
         }
     }
 
+    /// Unregisters a station and releases its queued packet storage.
+    pub fn unregister_station(&mut self, station_id: StationId) -> Option<usize> {
+        self.queues.remove(&station_id).map(|queue| queue.len())
+    }
+
     /// Returns queued packet count for a station.
     pub fn queued_len(&self, station_id: StationId) -> Option<usize> {
         self.queues.get(&station_id).map(VecDeque::len)
@@ -5185,6 +5218,30 @@ mod tests {
                 .expect("capacity should read"),
             Some(peak)
         );
+
+        client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: vec![2],
+            })
+            .expect("packet should queue before teardown");
+        let released = hub
+            .unregister_client(server_id)
+            .expect("unregister should lock")
+            .expect("server should unregister");
+        assert_eq!(released.remote_addr, memory_addr(20000));
+        assert_eq!(released.queued_packets, 1);
+        assert_eq!(released.retained_queue_capacity, peak);
+        assert_eq!(hub.queued_len(server_id).expect("lookup should work"), None);
+        assert_eq!(
+            hub.retained_queue_capacity().expect("capacity should read"),
+            0
+        );
+        assert!(
+            hub.unregister_client(server_id)
+                .expect("second unregister should lock")
+                .is_none()
+        );
     }
 
     #[test]
@@ -5779,6 +5836,14 @@ mod tests {
             );
         }
         assert_eq!(transport.queued_capacity(target), Some(peak));
+
+        transport
+            .send_station(station_packet(1))
+            .expect("packet should queue before teardown");
+        assert_eq!(transport.unregister_station(target), Some(1));
+        assert_eq!(transport.queued_len(target), None);
+        assert_eq!(transport.retained_queue_capacity(), 0);
+        assert_eq!(transport.unregister_station(target), None);
     }
 
     #[test]

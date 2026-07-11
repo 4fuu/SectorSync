@@ -251,6 +251,7 @@ struct Room {
     tracker: ReplicationTracker,
     planning: ReplicationScratch,
     plans: ReplicationBatchScratch,
+    transport_hub: InMemoryTransportHub,
     server_transport: InMemoryTransportEndpoint,
     dirty_handles: Vec<EntityHandle>,
     ready_events: Vec<StationEvent>,
@@ -261,6 +262,10 @@ struct Stats {
     ticks_completed: usize,
     rooms_created: usize,
     rooms_destroyed: usize,
+    endpoints_unregistered: usize,
+    teardown_queued_packets: usize,
+    teardown_queued_events: usize,
+    teardown_released_queue_capacity: usize,
     commands_admitted: usize,
     commands_applied: usize,
     events_routed: usize,
@@ -350,7 +355,9 @@ fn run(
         }
         let tick_started = Instant::now();
         if let Some(room_id) = tick_trace.recreate_room {
+            teardown_room(&rooms[room_id], &mut router, &mut stats);
             rooms[room_id] = create_room(room_id, config.entities_per_room, descriptors);
+            router.register_station(rooms[room_id].station.config().station_id);
             stats.rooms_destroyed = stats.rooms_destroyed.saturating_add(1);
             stats.rooms_created = stats.rooms_created.saturating_add(1);
         }
@@ -509,9 +516,37 @@ fn create_room(room_id: usize, entities_per_room: usize, descriptors: &Descripto
         }),
         planning: ReplicationScratch::default(),
         plans: ReplicationBatchScratch::new(),
+        transport_hub: hub,
         server_transport,
         dirty_handles,
         ready_events: Vec::new(),
+    }
+}
+
+fn teardown_room(room: &Room, router: &mut EventRouter, stats: &mut Stats) {
+    stats.teardown_queued_events = stats.teardown_queued_events.saturating_add(
+        router
+            .unregister_station(room.station.config().station_id)
+            .expect("room router queue should be registered"),
+    );
+    for client_id in room
+        .players
+        .iter()
+        .map(|player| player.client_id)
+        .chain(std::iter::once(server_client_id(room.id)))
+    {
+        let released = room
+            .transport_hub
+            .unregister_client(client_id)
+            .expect("room transport lock should remain healthy")
+            .expect("room endpoint should be registered");
+        stats.endpoints_unregistered = stats.endpoints_unregistered.saturating_add(1);
+        stats.teardown_queued_packets = stats
+            .teardown_queued_packets
+            .saturating_add(released.queued_packets);
+        stats.teardown_released_queue_capacity = stats
+            .teardown_released_queue_capacity
+            .saturating_add(released.retained_queue_capacity);
     }
 }
 
@@ -877,6 +912,7 @@ fn room_checksum(room: &Room) -> u64 {
 
 fn benchmark_ok(config: Config, stats: &Stats) -> bool {
     let expected_recreates = config.ticks.saturating_sub(1) / 15;
+    let expected_endpoints = expected_endpoint_unregistrations(config);
     !config.heavy_profile_denied
         && stats.ticks_completed == config.ticks
         && !stats.time_budget_exhausted
@@ -891,6 +927,10 @@ fn benchmark_ok(config: Config, stats: &Stats) -> bool {
         && stats.tracker_acks >= stats.tracker_records
         && stats.rooms_destroyed == expected_recreates
         && stats.rooms_created == config.rooms.saturating_add(expected_recreates)
+        && stats.endpoints_unregistered == expected_endpoints
+        && stats.teardown_queued_packets == 0
+        && stats.teardown_queued_events == 0
+        && (expected_recreates == 0 || stats.teardown_released_queue_capacity > 0)
         && stats.world_checksum != 0
         && stats.client_checksum != 0
 }
@@ -898,6 +938,7 @@ fn benchmark_ok(config: Config, stats: &Stats) -> bool {
 #[allow(clippy::cast_precision_loss)]
 fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
     let expected_recreates = config.ticks.saturating_sub(1) / 15;
+    let expected_endpoints = expected_endpoint_unregistrations(config);
     println!("SectorSync dynamic gameplay benchmark");
     println!("requested_profile={:?}", config.requested_profile);
     println!("profile={:?}", config.profile);
@@ -913,6 +954,14 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
     println!("rooms_created={}", stats.rooms_created);
     println!("rooms_destroyed={}", stats.rooms_destroyed);
     println!("expected_rooms_destroyed={expected_recreates}");
+    println!("endpoints_unregistered={}", stats.endpoints_unregistered);
+    println!("expected_endpoints_unregistered={expected_endpoints}");
+    println!("teardown_queued_packets={}", stats.teardown_queued_packets);
+    println!("teardown_queued_events={}", stats.teardown_queued_events);
+    println!(
+        "teardown_released_queue_capacity={}",
+        stats.teardown_released_queue_capacity
+    );
     println!("commands_admitted={}", stats.commands_admitted);
     println!("commands_applied={}", stats.commands_applied);
     println!("events_routed={}", stats.events_routed);
@@ -972,9 +1021,22 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
         "threshold_lifecycle_ok={}",
         stats.rooms_destroyed == expected_recreates
             && stats.rooms_created == config.rooms.saturating_add(expected_recreates)
+            && stats.endpoints_unregistered == expected_endpoints
+            && stats.teardown_queued_packets == 0
+            && stats.teardown_queued_events == 0
+            && (expected_recreates == 0 || stats.teardown_released_queue_capacity > 0)
     );
     println!("benchmark_ok={}", benchmark_ok(config, stats));
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1_000.0);
+}
+
+fn expected_endpoint_unregistrations(config: Config) -> usize {
+    (1..=config.ticks.saturating_sub(1) / 15)
+        .map(|recreate| {
+            let room_id = recreate % config.rooms;
+            MIN_PLAYERS + room_id % (MAX_PLAYERS - MIN_PLAYERS + 1) + 1
+        })
+        .sum()
 }
 
 fn print_percentiles(name: &str, values: &[f64]) {

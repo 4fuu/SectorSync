@@ -302,6 +302,13 @@ Only clear dirty state after the integration's chosen delivery/ACK contract
 confirms it. `ReplicationTracker` provides bounded send/ACK bookkeeping but does
 not invent that protocol.
 
+When a room or Station is destroyed, explicitly remove it from `StationSet` and
+`StationIndexSet`, call `EventRouter::unregister_station`, and unregister its
+in-memory transport endpoints. Ordered runtime registries preserve the relative
+order of survivors. Router and transport teardown return discarded queue counts
+so integrations can require zero backlog or account for intentional loss before
+reusing an identifier.
+
 ### 5. Handle Barriers Explicitly
 
 Preserve this control sequence:

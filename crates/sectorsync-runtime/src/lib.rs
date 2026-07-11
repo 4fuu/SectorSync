@@ -2540,6 +2540,17 @@ impl StationSet {
         self.stations.push(station);
     }
 
+    /// Removes and returns the first Station with `station_id`.
+    ///
+    /// Remaining Stations retain their iteration order. Lookup storage remains
+    /// allocated for reuse when the indexed path is active.
+    pub fn remove(&mut self, station_id: StationId) -> Option<Station> {
+        let position = self.position(station_id)?;
+        let station = self.stations.remove(position);
+        self.rebuild_positions();
+        Some(station)
+    }
+
     /// Gets a station by id.
     pub fn get(&self, station_id: StationId) -> Option<&Station> {
         self.position(station_id)
@@ -2642,6 +2653,18 @@ impl StationSet {
                 .or_insert(index);
         }
     }
+
+    fn rebuild_positions(&mut self) {
+        if self.positions.is_empty() {
+            return;
+        }
+        self.positions.clear();
+        for (index, station) in self.stations.iter().enumerate() {
+            self.positions
+                .entry(station.config().station_id)
+                .or_insert(index);
+        }
+    }
 }
 
 /// Station-local spatial indexes keyed by station id.
@@ -2685,6 +2708,17 @@ impl StationIndexSet {
             }
             self.indexes.push((station_id, index));
         }
+    }
+
+    /// Removes and returns one Station-local spatial index.
+    ///
+    /// Remaining indexes retain their iteration order and indexed lookup
+    /// storage remains allocated for later registrations.
+    pub fn remove(&mut self, station_id: StationId) -> Option<CellIndex> {
+        let position = self.position(station_id)?;
+        let (_, index) = self.indexes.remove(position);
+        self.rebuild_positions();
+        Some(index)
     }
 
     /// Gets one station index.
@@ -2767,6 +2801,16 @@ impl StationIndexSet {
             return;
         }
         self.positions.reserve(new_len);
+        for (index, (station_id, _)) in self.indexes.iter().enumerate() {
+            self.positions.entry(*station_id).or_insert(index);
+        }
+    }
+
+    fn rebuild_positions(&mut self) {
+        if self.positions.is_empty() {
+            return;
+        }
+        self.positions.clear();
         for (index, (station_id, _)) in self.indexes.iter().enumerate() {
             self.positions.entry(*station_id).or_insert(index);
         }
@@ -4322,6 +4366,11 @@ impl EventRouter {
         }
     }
 
+    /// Unregisters a station queue and returns the number of queued events dropped.
+    pub fn unregister_station(&mut self, station_id: StationId) -> Option<usize> {
+        self.queues.remove(&station_id).map(|queue| queue.len())
+    }
+
     /// Routes an event to its target station queue.
     pub fn route(&mut self, event: StationEvent) -> Result<PushOutcome, EventRouterError> {
         let queue = self
@@ -5705,6 +5754,36 @@ mod tests {
             last
         );
         assert!(indexes.get(last).is_some());
+
+        let removed_id = StationId::new(2);
+        let removed_station = stations.remove(removed_id).expect("Station should remove");
+        let removed_index = indexes.remove(removed_id).expect("index should remove");
+        assert_eq!(removed_station.config().station_id, removed_id);
+        assert_eq!(removed_index.entity_count(), 0);
+        assert!(stations.get(removed_id).is_none());
+        assert!(indexes.get(removed_id).is_none());
+        assert_eq!(
+            stations
+                .get(last)
+                .expect("shifted Station resolves")
+                .config()
+                .station_id,
+            last
+        );
+        assert!(indexes.get(last).is_some());
+        assert_eq!(
+            stations
+                .iter()
+                .map(|station| station.config().station_id)
+                .nth(1),
+            Some(StationId::new(3))
+        );
+        assert_eq!(
+            indexes.iter().nth(1).map(|(id, _)| id),
+            Some(StationId::new(3))
+        );
+        assert!(stations.lookup_index_active());
+        assert!(indexes.lookup_index_active());
     }
 
     #[test]
@@ -7101,6 +7180,32 @@ mod tests {
         assert_eq!(drained.capacity(), retained_capacity);
         assert_eq!(router.stats().routed_events, 1);
         assert_eq!(router.stats().drained_events, 1);
+    }
+
+    #[test]
+    fn event_router_unregisters_station_and_discards_queued_events() {
+        let station_id = StationId::new(2);
+        let mut router = EventRouter::default();
+        router.register_station(station_id);
+        router
+            .route(StationEvent {
+                id: EventId::new(1),
+                source: StationId::new(1),
+                target: station_id,
+                source_tick: Tick::new(0),
+                target_tick: Tick::new(10),
+                priority: EventPriority::Important,
+                kind: EventKind::Custom(1),
+            })
+            .expect("event should queue");
+
+        assert_eq!(router.unregister_station(station_id), Some(1));
+        assert_eq!(router.unregister_station(station_id), None);
+        assert_eq!(router.queued_len(station_id), None);
+        assert_eq!(
+            router.drain_ready(station_id, Tick::new(10)),
+            Err(EventRouterError::MissingTarget(station_id))
+        );
     }
 
     #[test]

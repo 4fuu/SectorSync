@@ -385,6 +385,13 @@ default sparse-dirty trace because no viewer fills the 256-entity budget. Core
 tests separately verify that a saturated first-fit plan stops after selecting
 its budget and reports the untouched candidate suffix.
 
+Room recreation also exercises explicit teardown. The smoke trace unregisters
+the old router queue and all client/server endpoints before registering the
+replacement room. The measured run removed six endpoints, discarded zero
+queued packets and events, and released 20 retained packet slots. Lifecycle
+acceptance checks the expected endpoint count, zero backlog, and nonzero released
+capacity whenever recreation occurs.
+
 Machine-readable output retains phase percentiles, command/event/transport
 conservation, spawn/despawn and lifecycle counts, selected/encoded/component
 counts, actual bytes, packet-budget failures, tracker state/ACK counts, world
