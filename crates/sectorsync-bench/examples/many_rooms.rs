@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CompiledSyncPolicy, ComponentDescriptor, ComponentId,
     ComponentMigrationMode, ComponentStore, ComponentSyncMode, EntityId, GridSpec, InstanceId,
-    NodeId, PolicyId, PolicyTable, Position3, ReplicationBudget, ReplicationPlanner,
-    ReplicationScratch, Station, StationConfig, StationId, ViewerQuery,
+    NodeId, PolicyId, PolicyTable, Position3, ReplicationBatchScratch, ReplicationBudget,
+    ReplicationPlanner, ReplicationScratch, Station, StationConfig, StationId, ViewerQuery,
 };
 use sectorsync_wire::{ComponentSelection, ReplicationFrameBuilder, ReplicationFrameLimits};
 
@@ -179,6 +179,7 @@ struct StationWork {
     components: ComponentStore,
     viewers: Vec<ViewerQuery>,
     scratch: ReplicationScratch,
+    batch_scratch: ReplicationBatchScratch,
 }
 
 #[derive(Debug)]
@@ -201,6 +202,8 @@ struct Stats {
     encoded_components: usize,
     encoded_bytes: usize,
     frames_skipped_empty: usize,
+    batch_plan_slots_max: usize,
+    batch_entity_capacity_max: usize,
     ticks_completed: usize,
     time_budget_exhausted: bool,
 }
@@ -269,6 +272,11 @@ fn main() {
     println!("encoded_entities={}", stats.encoded_entities);
     println!("encoded_components={}", stats.encoded_components);
     println!("encoded_bytes={}", stats.encoded_bytes);
+    println!("batch_plan_slots_max={}", stats.batch_plan_slots_max);
+    println!(
+        "batch_entity_capacity_max={}",
+        stats.batch_entity_capacity_max
+    );
     println!("setup_ms={setup_ms:.3}");
     println!("sweep_ms_p50={:.3}", percentile_ms(&stats.sweep_ms, 0.50));
     println!("sweep_ms_p95={:.3}", percentile_ms(&stats.sweep_ms, 0.95));
@@ -357,6 +365,7 @@ fn create_rooms(config: Config) -> Vec<Room> {
                         components: ComponentStore::default(),
                         viewers: Vec::new(),
                         scratch: ReplicationScratch::default(),
+                        batch_scratch: ReplicationBatchScratch::new(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -468,20 +477,21 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
             for work in &mut room.stations {
                 work.station.advance_tick();
                 let planning_start = Instant::now();
-                let batch = ReplicationPlanner::plan_for_viewers_range_with_scratch(
+                let batch = ReplicationPlanner::plan_for_viewers_range_into(
                     &work.station,
                     &work.index,
                     &policies,
                     &work.viewers,
                     budget,
                     &mut work.scratch,
+                    &mut work.batch_scratch,
                 );
                 planning_elapsed = planning_elapsed.saturating_add(planning_start.elapsed());
                 stats.viewer_queries = stats.viewer_queries.saturating_add(batch.stats.viewers);
                 stats.selected_entities =
                     stats.selected_entities.saturating_add(batch.stats.selected);
                 let encoding_start = Instant::now();
-                for (viewer, plan) in work.viewers.iter().zip(&batch.plans) {
+                for (viewer, plan) in work.viewers.iter().zip(batch.plans) {
                     let mut bytes = Vec::new();
                     let build_stats = builder
                         .encode_binary_into(
@@ -508,6 +518,12 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
                     }
                 }
                 encoding_elapsed = encoding_elapsed.saturating_add(encoding_start.elapsed());
+                stats.batch_plan_slots_max = stats
+                    .batch_plan_slots_max
+                    .max(work.batch_scratch.retained_plan_slots());
+                stats.batch_entity_capacity_max = stats
+                    .batch_entity_capacity_max
+                    .max(work.batch_scratch.retained_entity_capacity());
             }
             stats.room_updates = stats.room_updates.saturating_add(1);
         }

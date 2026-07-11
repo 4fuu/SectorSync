@@ -96,8 +96,11 @@ Build viewer input from caller-owned client state, then use
 visibility, and budget input. The caller-owned bridge lazily retains its planning
 scratch and directly encodes selected dirty components into the outbound packet,
 avoiding intermediate entity/component delta allocations. Integrations that call
-`ReplicationPlanner` directly should retain their own `ReplicationScratch`;
-cadence and priority state must remain explicit.
+`ReplicationPlanner` directly should retain their own `ReplicationScratch` and
+use `ReplicationBatchScratch` with the `*_into` batch APIs when viewer groups are
+planned repeatedly. Explicit parallel integrations retain at most one planning
+scratch lane per configured worker. Cadence and priority state must remain
+explicit.
 
 On the receive side, `ReplicationReceiveBridge` validates expected packet
 source and frame target before returning decoded frames. Applying those frames

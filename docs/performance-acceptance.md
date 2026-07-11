@@ -196,7 +196,9 @@ The guarded room benchmark models one `InstanceId` per room and assigns
 `max_stations_per_room`. All room/Station work runs sequentially on the calling
 thread; every viewer performs a real Cell query and replication plan, and every
 dirty component selected for a viewer is encoded directly into a concrete binary
-delta. The runner reports planning and encoding p99 separately:
+delta. Viewer plan/entity output capacity is retained across sweeps. The runner
+reports planning and encoding p99 plus `batch_plan_slots_max` and
+`batch_entity_capacity_max` separately:
 
 ```powershell
 $env:CARGO_BUILD_JOBS=4
@@ -231,6 +233,10 @@ and 64,000 entities. It selected 1,695,816 entities but encoded only 128,368
 dirty entity/component deltas and 9,154,528 bytes. Three consecutive runs
 reported 23.58-31.25 ms sweep p99, 11.87-14.70 ms planning p99, and
 11.51-17.11 ms encoding p99.
+
+For the denser 4-10 player, 16-entities-per-player shape, reusable batch output
+retained at most ten plan slots and 1,280 selected-entity slots per Station.
+Three release runs reported 19.11-23.87 ms sweep p99.
 
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or

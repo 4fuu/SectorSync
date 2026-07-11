@@ -146,6 +146,79 @@ pub struct ReplicationBatchResult {
     pub stats: ReplicationBatchStats,
 }
 
+/// Borrowed ordered plans produced from reusable batch storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationBatchView<'a> {
+    /// One plan per input viewer, retaining input order.
+    pub plans: &'a [ReplicationPlan],
+    /// Aggregate work signals for the active plans.
+    pub stats: ReplicationBatchStats,
+}
+
+/// Caller-owned reusable output storage for viewer batch planning.
+///
+/// Plan slots and their entity buffers grow to the largest observed batch and
+/// are retained for later calls. This storage contains no cross-client send or
+/// acknowledgement state.
+#[derive(Clone, Debug, Default)]
+pub struct ReplicationBatchScratch {
+    plans: Vec<ReplicationPlan>,
+    active_plans: usize,
+    stats: ReplicationBatchStats,
+}
+
+impl ReplicationBatchScratch {
+    /// Creates empty batch output storage.
+    pub const fn new() -> Self {
+        Self {
+            plans: Vec::new(),
+            active_plans: 0,
+            stats: ReplicationBatchStats {
+                viewers: 0,
+                candidates: 0,
+                considered: 0,
+                selected: 0,
+                estimated_bytes: 0,
+                grid_queries: 0,
+                occupied_queries: 0,
+                grid_cells_probed: 0,
+                occupied_cells_scanned: 0,
+                matched_cells: 0,
+                candidate_capacity_max: 0,
+                dedup_capacity_max: 0,
+                matching_cell_capacity_max: 0,
+                priority_capacity_max: 0,
+            },
+        }
+    }
+
+    /// Number of plan slots retained for reuse.
+    pub fn retained_plan_slots(&self) -> usize {
+        self.plans.len()
+    }
+
+    /// Total selected-entity capacity retained across all plan slots.
+    pub fn retained_entity_capacity(&self) -> usize {
+        self.plans.iter().map(|plan| plan.entities.capacity()).sum()
+    }
+
+    /// Returns the active result from the most recent planning call.
+    pub fn view(&self) -> ReplicationBatchView<'_> {
+        ReplicationBatchView {
+            plans: &self.plans[..self.active_plans],
+            stats: self.stats,
+        }
+    }
+
+    fn prepare(&mut self, plans: usize) {
+        if self.plans.len() < plans {
+            self.plans.resize_with(plans, ReplicationPlan::default);
+        }
+        self.active_plans = plans;
+        self.stats = ReplicationBatchStats::default();
+    }
+}
+
 /// Bounded per-client replication tracking configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicationTrackerConfig {
@@ -583,9 +656,28 @@ impl ReplicationPlanner {
         budget: ReplicationBudget,
         scratch: &mut ReplicationScratch,
     ) -> ReplicationPlan {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_viewer_with_scratch_into(
+            station, index, policies, viewer, filter, budget, scratch, &mut plan,
+        );
+        plan
+    }
+
+    /// Plans one viewer into caller-owned output while retaining its entity capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_with_scratch_into<F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) {
         let candidates =
             index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
-        Self::plan_for_candidates_inner(
+        Self::plan_for_candidates_inner_into(
             station,
             candidates,
             policies,
@@ -593,7 +685,8 @@ impl ReplicationPlanner {
             filter,
             budget,
             |_, _, _| true,
-        )
+            plan,
+        );
     }
 
     /// Plans viewers in input order while reusing caller-provided scratch.
@@ -620,6 +713,28 @@ impl ReplicationPlanner {
         batch
     }
 
+    /// Plans viewers into caller-owned output slots while retaining all capacities.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewers_into<'a, F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+        batch: &'a mut ReplicationBatchScratch,
+    ) -> ReplicationBatchView<'a> {
+        batch.prepare(viewers.len());
+        for (plan, viewer) in batch.plans[..viewers.len()].iter_mut().zip(viewers) {
+            Self::plan_for_viewer_with_scratch_into(
+                station, index, policies, viewer, filter, budget, scratch, plan,
+            );
+            batch.stats.record(plan, scratch);
+        }
+        batch.view()
+    }
+
     /// Plans one range-only viewer using the optional SIMD candidate filter.
     ///
     /// With the `simd` feature this evaluates candidate distances in eight-lane
@@ -632,9 +747,27 @@ impl ReplicationPlanner {
         budget: ReplicationBudget,
         scratch: &mut ReplicationScratch,
     ) -> ReplicationPlan {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_viewer_range_with_scratch_into(
+            station, index, policies, viewer, budget, scratch, &mut plan,
+        );
+        plan
+    }
+
+    /// Plans one range-only viewer into caller-owned reusable output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_range_with_scratch_into(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) {
         let candidates =
             index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
-        Self::plan_for_range_candidates(station, candidates, policies, viewer, budget)
+        Self::plan_for_range_candidates_into(station, candidates, policies, viewer, budget, plan);
     }
 
     /// Plans a range-only viewer batch in input order with optional SIMD filtering.
@@ -658,6 +791,27 @@ impl ReplicationPlanner {
             batch.plans.push(plan);
         }
         batch
+    }
+
+    /// Plans a range-only viewer batch into caller-owned reusable output slots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewers_range_into<'a>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+        batch: &'a mut ReplicationBatchScratch,
+    ) -> ReplicationBatchView<'a> {
+        batch.prepare(viewers.len());
+        for (plan, viewer) in batch.plans[..viewers.len()].iter_mut().zip(viewers) {
+            Self::plan_for_viewer_range_with_scratch_into(
+                station, index, policies, viewer, budget, scratch, plan,
+            );
+            batch.stats.record(plan, scratch);
+        }
+        batch.view()
     }
 
     /// Plans a frame and skips entities whose distance-based cadence has not elapsed.
@@ -873,16 +1027,42 @@ impl ReplicationPlanner {
         F: VisibilityFilter,
         C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
     {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_candidates_inner_into(
+            station,
+            candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            cadence_allows,
+            &mut plan,
+        );
+        plan
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_for_candidates_inner_into<F, C>(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        cadence_allows: C,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
+    {
         let max_entities = viewer.max_entities.min(budget.max_entities);
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
-
-        let mut plan = ReplicationPlan {
-            entities: Vec::with_capacity(hard_limit),
-            stats: ReplicationStats {
-                candidates: candidates.len(),
-                ..ReplicationStats::default()
-            },
+        plan.entities.clear();
+        plan.entities.reserve(hard_limit);
+        plan.stats = ReplicationStats {
+            candidates: candidates.len(),
+            ..ReplicationStats::default()
         };
 
         for handle in candidates {
@@ -917,10 +1097,9 @@ impl ReplicationPlanner {
 
         plan.stats.selected = plan.entities.len();
         plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
-        plan
     }
 
-    #[cfg(not(feature = "simd"))]
+    #[cfg(all(not(feature = "simd"), test))]
     fn plan_for_range_candidates(
         station: &Station,
         candidates: &[EntityHandle],
@@ -928,7 +1107,23 @@ impl ReplicationPlanner {
         viewer: &ViewerQuery,
         budget: ReplicationBudget,
     ) -> ReplicationPlan {
-        Self::plan_for_candidates_inner(
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_range_candidates_into(
+            station, candidates, policies, viewer, budget, &mut plan,
+        );
+        plan
+    }
+
+    #[cfg(not(feature = "simd"))]
+    fn plan_for_range_candidates_into(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+        plan: &mut ReplicationPlan,
+    ) {
+        Self::plan_for_candidates_inner_into(
             station,
             candidates,
             policies,
@@ -936,10 +1131,11 @@ impl ReplicationPlanner {
             &RangeOnlyVisibility,
             budget,
             |_, _, _| true,
-        )
+            plan,
+        );
     }
 
-    #[cfg(feature = "simd")]
+    #[cfg(all(feature = "simd", test))]
     fn plan_for_range_candidates(
         station: &Station,
         candidates: &[EntityHandle],
@@ -947,18 +1143,33 @@ impl ReplicationPlanner {
         viewer: &ViewerQuery,
         budget: ReplicationBudget,
     ) -> ReplicationPlan {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_range_candidates_into(
+            station, candidates, policies, viewer, budget, &mut plan,
+        );
+        plan
+    }
+
+    #[cfg(feature = "simd")]
+    fn plan_for_range_candidates_into(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+        plan: &mut ReplicationPlan,
+    ) {
         use wide::{CmpLe, f32x8};
 
         const LANES: usize = 8;
         let max_entities = viewer.max_entities.min(budget.max_entities);
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
-        let mut plan = ReplicationPlan {
-            entities: Vec::with_capacity(hard_limit),
-            stats: ReplicationStats {
-                candidates: candidates.len(),
-                ..ReplicationStats::default()
-            },
+        plan.entities.clear();
+        plan.entities.reserve(hard_limit);
+        plan.stats = ReplicationStats {
+            candidates: candidates.len(),
+            ..ReplicationStats::default()
         };
         let viewer_radius_squared = viewer.radius_squared();
 
@@ -1002,7 +1213,6 @@ impl ReplicationPlanner {
 
         plan.stats.selected = plan.entities.len();
         plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
-        plan
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1222,6 +1432,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn range_batch_matches_ordered_scalar_plans() {
         let mut station = Station::new(StationConfig {
             station_id: StationId::new(1),
@@ -1294,6 +1505,55 @@ mod tests {
         assert_eq!(
             batch.stats.grid_queries + batch.stats.occupied_queries,
             viewers.len()
+        );
+
+        let mut reusable_planning = ReplicationScratch::default();
+        let mut reusable_output = ReplicationBatchScratch::new();
+        {
+            let reused = ReplicationPlanner::plan_for_viewers_range_into(
+                &station,
+                &index,
+                &policies,
+                &viewers,
+                ReplicationBudget::default(),
+                &mut reusable_planning,
+                &mut reusable_output,
+            );
+            assert_eq!(reused.plans, expected);
+            assert_eq!(reused.stats, batch.stats);
+        }
+        let retained_capacity = reusable_output.retained_entity_capacity();
+        assert_eq!(reusable_output.retained_plan_slots(), viewers.len());
+
+        {
+            let reused = ReplicationPlanner::plan_for_viewers_into(
+                &station,
+                &index,
+                &policies,
+                &viewers,
+                &RangeOnlyVisibility,
+                ReplicationBudget::default(),
+                &mut reusable_planning,
+                &mut reusable_output,
+            );
+            assert_eq!(reused.plans, expected);
+            assert_eq!(reused.stats, batch.stats);
+        }
+
+        let reused = ReplicationPlanner::plan_for_viewers_range_into(
+            &station,
+            &index,
+            &policies,
+            &viewers[..1],
+            ReplicationBudget::default(),
+            &mut reusable_planning,
+            &mut reusable_output,
+        );
+        assert_eq!(reused.plans, &expected[..1]);
+        assert_eq!(reusable_output.retained_plan_slots(), viewers.len());
+        assert_eq!(
+            reusable_output.retained_entity_capacity(),
+            retained_capacity
         );
     }
 

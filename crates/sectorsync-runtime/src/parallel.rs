@@ -1,6 +1,7 @@
 //! Explicit, bounded parallel replication planning.
 
 use core::fmt;
+use core::ops::Range;
 
 use rayon::prelude::*;
 use sectorsync_core::prelude::{
@@ -86,19 +87,22 @@ impl<'a> StationReplicationBatch<'a> {
     }
 }
 
-/// Caller-owned scratch lanes retained across parallel planning calls.
+/// Caller-owned worker scratch lanes retained across parallel planning calls.
+///
+/// Lane count is bounded by the pool thread count rather than the number of
+/// Station batches. Each lane processes a deterministic contiguous partition.
 #[derive(Clone, Debug, Default)]
 pub struct ParallelReplicationScratch {
     lanes: Vec<ReplicationScratch>,
 }
 
 impl ParallelReplicationScratch {
-    /// Creates empty scratch storage. Lanes are allocated on first use.
+    /// Creates empty scratch storage. Worker lanes are allocated on first use.
     pub const fn new() -> Self {
         Self { lanes: Vec::new() }
     }
 
-    /// Number of scratch lanes currently retained.
+    /// Number of worker scratch lanes currently retained.
     pub fn lanes(&self) -> usize {
         self.lanes.len()
     }
@@ -106,6 +110,14 @@ impl ParallelReplicationScratch {
     fn prepare(&mut self, lanes: usize) {
         self.lanes.resize_with(lanes, ReplicationScratch::default);
     }
+}
+
+fn partition_bounds(items: usize, partitions: usize, partition: usize) -> Range<usize> {
+    let base = items / partitions;
+    let remainder = items % partitions;
+    let start = partition * base + partition.min(remainder);
+    let len = base + usize::from(partition < remainder);
+    start..start + len
 }
 
 /// Ordered station results and merged aggregate statistics.
@@ -183,7 +195,7 @@ impl ReplicationThreadPool {
             .install(|| inputs.into_par_iter().map(operation).collect())
     }
 
-    /// Plans generic visibility batches in parallel by station.
+    /// Plans generic visibility batches in deterministic worker partitions.
     pub fn plan_station_batches<F>(
         &self,
         batches: &[StationReplicationBatch<'_>],
@@ -195,28 +207,38 @@ impl ReplicationThreadPool {
     where
         F: VisibilityFilter + Sync,
     {
-        scratch.prepare(batches.len());
-        let results = self.pool.install(|| {
-            batches
-                .par_iter()
-                .zip(scratch.lanes.par_iter_mut())
-                .map(|(batch, lane)| {
-                    ReplicationPlanner::plan_for_viewers_with_scratch(
-                        batch.station,
-                        batch.index,
-                        policies,
-                        batch.viewers,
-                        filter,
-                        budget,
-                        lane,
-                    )
+        let lanes = self.threads.min(batches.len());
+        scratch.prepare(lanes);
+        let partitioned = self.pool.install(|| {
+            scratch
+                .lanes
+                .par_iter_mut()
+                .enumerate()
+                .map(|(lane_index, lane)| {
+                    batches[partition_bounds(batches.len(), lanes, lane_index)]
+                        .iter()
+                        .map(|batch| {
+                            ReplicationPlanner::plan_for_viewers_with_scratch(
+                                batch.station,
+                                batch.index,
+                                policies,
+                                batch.viewers,
+                                filter,
+                                budget,
+                                lane,
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect()
+                .collect::<Vec<_>>()
         });
+        let results = partitioned.into_iter().flatten().collect();
         ParallelReplicationResult::from_batches(results)
     }
 
-    /// Plans range-only batches using SIMD when the core `simd` feature is enabled.
+    /// Plans range-only batches in deterministic worker partitions.
+    ///
+    /// SIMD candidate filtering is used when the core `simd` feature is enabled.
     pub fn plan_station_range_batches(
         &self,
         batches: &[StationReplicationBatch<'_>],
@@ -224,23 +246,31 @@ impl ReplicationThreadPool {
         budget: ReplicationBudget,
         scratch: &mut ParallelReplicationScratch,
     ) -> ParallelReplicationResult {
-        scratch.prepare(batches.len());
-        let results = self.pool.install(|| {
-            batches
-                .par_iter()
-                .zip(scratch.lanes.par_iter_mut())
-                .map(|(batch, lane)| {
-                    ReplicationPlanner::plan_for_viewers_range_with_scratch(
-                        batch.station,
-                        batch.index,
-                        policies,
-                        batch.viewers,
-                        budget,
-                        lane,
-                    )
+        let lanes = self.threads.min(batches.len());
+        scratch.prepare(lanes);
+        let partitioned = self.pool.install(|| {
+            scratch
+                .lanes
+                .par_iter_mut()
+                .enumerate()
+                .map(|(lane_index, lane)| {
+                    batches[partition_bounds(batches.len(), lanes, lane_index)]
+                        .iter()
+                        .map(|batch| {
+                            ReplicationPlanner::plan_for_viewers_range_with_scratch(
+                                batch.station,
+                                batch.index,
+                                policies,
+                                batch.viewers,
+                                budget,
+                                lane,
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect()
+                .collect::<Vec<_>>()
         });
+        let results = partitioned.into_iter().flatten().collect();
         ParallelReplicationResult::from_batches(results)
     }
 }
@@ -258,6 +288,9 @@ mod tests {
         assert_eq!(ReplicationThreadPoolConfig::default().resolve(12), 6);
         assert_eq!(ReplicationThreadPoolConfig::default().resolve(1), 1);
         assert_eq!(ReplicationThreadPoolConfig::new(64, 4).resolve(12), 4);
+        assert_eq!(partition_bounds(10, 3, 0), 0..4);
+        assert_eq!(partition_bounds(10, 3, 1), 4..7);
+        assert_eq!(partition_bounds(10, 3, 2), 7..10);
     }
 
     #[test]
@@ -268,7 +301,7 @@ mod tests {
         let mut policies = PolicyTable::default();
         policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 128, 128.0));
 
-        for station_index in 0_u32..2 {
+        for station_index in 0_u32..6 {
             let mut station = Station::new(StationConfig {
                 station_id: StationId::new(station_index),
                 node_id: NodeId::new(1),
@@ -329,7 +362,7 @@ mod tests {
             );
             assert_eq!(parallel.batches[batch_index].plans, serial.plans);
         }
-        assert_eq!(parallel.stats.viewers, 2);
+        assert_eq!(parallel.stats.viewers, 6);
         assert_eq!(parallel_scratch.lanes(), 2);
     }
 
@@ -341,5 +374,22 @@ mod tests {
         let output = pool.map_ordered(vec![3_u32, 1, 2], |value| value * value);
 
         assert_eq!(output, vec![9, 1, 4]);
+    }
+
+    #[test]
+    fn empty_station_batch_retains_no_scratch_lanes() {
+        let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
+            .expect("pool builds");
+        let mut scratch = ParallelReplicationScratch::new();
+        let result = pool.plan_station_range_batches(
+            &[],
+            &PolicyTable::default(),
+            ReplicationBudget::default(),
+            &mut scratch,
+        );
+
+        assert!(result.batches.is_empty());
+        assert_eq!(result.stats, ReplicationBatchStats::default());
+        assert_eq!(scratch.lanes(), 0);
     }
 }

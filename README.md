@@ -207,7 +207,8 @@ it is not stable at 128 Hz on the current development host.
 For the guarded many-room shape, each room receives its own `InstanceId`, and
 its Station count grows deterministically with player count. The runner advances
 all rooms sequentially on one thread, plans with reusable scratch, and directly
-encodes dirty component data without an intermediate frame object tree:
+encodes dirty component data without an intermediate frame object tree. Viewer
+plan slots and their selected-entity buffers are retained across sweeps:
 
 ```powershell
 $env:CARGO_BUILD_JOBS=4
@@ -221,6 +222,11 @@ players, eight entities per player, and eight measured sweeps. Use
 runner reports planning and encoding phase p99 values separately. This measures
 spatial planning and wire encoding, not gameplay, matchmaking, room lifecycle,
 persistence, or network capacity.
+
+For explicit parallel planning, `ParallelReplicationScratch` retains at most one
+planning scratch lane per configured worker, not per Station batch. The
+`ReplicationBatchScratch` `*_into` APIs provide the same allocation reuse for
+caller-managed serial or custom scheduling loops.
 
 ## Documentation
 

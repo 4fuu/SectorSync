@@ -18,6 +18,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - The guarded many-room benchmark now separates planning and encoding latency
   and can vary per-room entities, dirty ratio, and component payload size
   independently from player count.
+- Parallel replication scratch is bounded by configured worker count instead of
+  Station batch count, and reusable batch output APIs retain viewer plan/entity
+  capacity across planning calls.
 
 ## [2026.7.10] - 2026-07-10
 

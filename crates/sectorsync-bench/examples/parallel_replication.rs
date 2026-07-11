@@ -6,7 +6,8 @@ use sectorsync_core::prelude::{
     ViewerQuery,
 };
 use sectorsync_runtime::{
-    ParallelReplicationScratch, ReplicationThreadPool, StationReplicationBatch,
+    ParallelReplicationScratch, ReplicationThreadPool, ReplicationThreadPoolConfig,
+    StationReplicationBatch,
 };
 
 fn main() {
@@ -16,7 +17,7 @@ fn main() {
     let mut indexes = Vec::new();
     let mut viewer_groups = Vec::new();
 
-    for station_number in 0_u32..2 {
+    for station_number in 0_u32..12 {
         let mut station = Station::new(StationConfig {
             station_id: StationId::new(station_number),
             node_id: NodeId::new(1),
@@ -52,7 +53,8 @@ fn main() {
         .zip(&viewer_groups)
         .map(|((station, index), viewers)| StationReplicationBatch::new(station, index, viewers))
         .collect::<Vec<_>>();
-    let pool = ReplicationThreadPool::for_host().expect("explicit pool should build");
+    let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
+        .expect("explicit pool should build");
     let mut scratch = ParallelReplicationScratch::new();
     let result = pool.plan_station_range_batches(
         &batches,
@@ -61,8 +63,9 @@ fn main() {
         &mut scratch,
     );
 
-    assert_eq!(result.batches.len(), 2);
-    assert_eq!(result.stats.viewers, 2);
+    assert_eq!(result.batches.len(), 12);
+    assert_eq!(result.stats.viewers, 12);
+    assert_eq!(scratch.lanes(), 2);
     assert!(result.stats.selected > 0);
     println!("threads={}", pool.threads());
     println!("scratch_lanes={}", scratch.lanes());
