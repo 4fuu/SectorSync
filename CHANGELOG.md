@@ -10,6 +10,10 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Parallel multi-Station replication planning now offers borrowed `*_into`
+  results backed by caller-owned output slots, avoiding repeated per-room and
+  per-viewer result allocation in steady-state loops while preserving ordered
+  owned-result APIs.
 - Added an explicit revision field so multiple releases can be published on
   the same Asia/Hong_Kong calendar day.
 - Replication transport bridges now retain planning scratch and encode dirty

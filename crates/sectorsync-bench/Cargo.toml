@@ -17,6 +17,11 @@ name = "parallel_replication"
 path = "examples/parallel_replication.rs"
 required-features = ["parallel"]
 
+[[example]]
+name = "parallel_output_reuse"
+path = "examples/parallel_output_reuse.rs"
+required-features = ["parallel"]
+
 [features]
 default = []
 simd = ["sectorsync-core/simd"]

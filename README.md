@@ -26,6 +26,7 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   of sorting the full eligible set when the send budget is small.
 - Reusable caller-owned query and replication scratch buffers.
 - Reusable single-viewer plan output across normal, cadence, and priority paths.
+- Reusable parallel multi-Station output slots and selected-entity capacity.
 - Explicit Station, spatial-index, and component-column capacity reservation.
 - Reusable typed-component encoding scratch and in-place blob byte updates.
 - Dense replication frames use bounded dirty-data sampling to reduce output
@@ -154,6 +155,8 @@ cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
 cargo run -p sectorsync-bench --features parallel --example parallel_replication
+cargo run -p sectorsync-bench --release --features parallel --example parallel_output_reuse
+cargo run -p sectorsync-bench --release --features parallel --example parallel_output_reuse -- --fresh-output
 ```
 
 The focused example-to-feature map is maintained in
@@ -274,6 +277,12 @@ For explicit parallel planning, `ParallelReplicationScratch` retains at most one
 planning scratch lane per configured worker, not per Station batch. The
 `ReplicationBatchScratch` `*_into` APIs provide the same allocation reuse for
 caller-managed serial or custom scheduling loops.
+
+`plan_station_batches_into` and `plan_station_range_batches_into` also retain
+one output slot per observed Station batch. Their borrowed
+`ParallelReplicationView` exposes only the active rooms, so smaller later calls
+neither expose stale results nor discard previously grown entity capacity. The
+owned-result methods remain available when the integration needs ownership.
 
 ## Documentation
 

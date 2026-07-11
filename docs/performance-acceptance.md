@@ -388,6 +388,35 @@ compare top-k output against full sorting across zero, small, boundary, equal,
 and oversized limits. A `limit=1800` check reports `partition_applied=false`,
 confirming the high-budget fallback.
 
+## Parallel Multi-Station Output Measurement
+
+`ParallelReplicationScratch` can retain both one planning lane per bounded
+worker and one `ReplicationBatchScratch` output slot per observed Station batch.
+The borrowed `ParallelReplicationView` path avoids rebuilding per-room batch
+results and per-viewer selected-entity buffers on each planning call. Compare it
+with the owned-result compatibility path using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --features parallel --example parallel_output_reuse
+cargo run --release -q -p sectorsync-bench --features parallel --example parallel_output_reuse -- --fresh-output
+```
+
+The default workload is 12 rooms, six players and 128 entities per room, 20
+planning calls per tick, and 20 ticks. Without `--allow-heavy`, guards cap 64
+rooms, ten players, 512 entities per room, 100 calls per tick, and 30 ticks;
+execution also has a 10-second budget. Output retains room/player/entity guard
+metadata, selected checksum, fresh-output count, retained slot/entity capacity,
+latency percentiles, path/workload verdicts, and `benchmark_ok`.
+
+Five alternating release A/B runs produced the same `2,764,800` selected
+checksum. The reusable path created zero fresh results and retained 12 Station
+slots with total selected-entity capacity of 6,912; the owned path created 400
+fresh results per run. On this development host, median tick p99 was 1.986 ms
+with retained output versus 3.363 ms with fresh output, about a 41% reduction.
+Runtime tests also compare every active Station plan and aggregate statistic,
+verify capacity retention after a smaller subsequent batch, and cover empty
+input.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

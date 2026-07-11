@@ -111,8 +111,11 @@ avoiding intermediate entity/component delta allocations. Integrations that call
 `ReplicationPlanner` directly should retain their own `ReplicationScratch` and
 use `ReplicationBatchScratch` with the `*_into` batch APIs when viewer groups are
 planned repeatedly. Explicit parallel integrations retain at most one planning
-scratch lane per configured worker. Cadence and priority state must remain
-explicit.
+scratch lane per configured worker. Steady-state multi-room loops should use
+`plan_station_batches_into` or `plan_station_range_batches_into`; their borrowed
+`ParallelReplicationView` exposes active per-Station outputs backed by retained
+plan/entity capacity. Consume or encode that view before the next planning call.
+Cadence, priority, per-client tracking, and send state must remain explicit.
 
 The bridge retains one `ReplicationPlan` output slot across its normal, cadence,
 priority, and priority/cadence send paths. Transport or encoding failures return

@@ -5,8 +5,9 @@ use core::ops::Range;
 
 use rayon::prelude::*;
 use sectorsync_core::prelude::{
-    CellIndex, PolicyTable, ReplicationBatchResult, ReplicationBatchStats, ReplicationBudget,
-    ReplicationPlanner, ReplicationScratch, Station, ViewerQuery, VisibilityFilter,
+    CellIndex, PolicyTable, ReplicationBatchResult, ReplicationBatchScratch, ReplicationBatchStats,
+    ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station, ViewerQuery,
+    VisibilityFilter,
 };
 
 /// Configuration for an explicitly created replication planning thread pool.
@@ -94,12 +95,18 @@ impl<'a> StationReplicationBatch<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct ParallelReplicationScratch {
     lanes: Vec<ReplicationScratch>,
+    batches: Vec<ReplicationBatchScratch>,
+    active_batches: usize,
 }
 
 impl ParallelReplicationScratch {
     /// Creates empty scratch storage. Worker lanes are allocated on first use.
     pub const fn new() -> Self {
-        Self { lanes: Vec::new() }
+        Self {
+            lanes: Vec::new(),
+            batches: Vec::new(),
+            active_batches: 0,
+        }
     }
 
     /// Number of worker scratch lanes currently retained.
@@ -107,8 +114,29 @@ impl ParallelReplicationScratch {
         self.lanes.len()
     }
 
-    fn prepare(&mut self, lanes: usize) {
+    /// Number of Station batch output slots retained for later calls.
+    pub fn retained_batch_slots(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// Total selected-entity capacity retained by all Station batch outputs.
+    pub fn retained_entity_capacity(&self) -> usize {
+        self.batches
+            .iter()
+            .map(ReplicationBatchScratch::retained_entity_capacity)
+            .sum()
+    }
+
+    fn prepare_lanes(&mut self, lanes: usize) {
         self.lanes.resize_with(lanes, ReplicationScratch::default);
+    }
+
+    fn prepare_output(&mut self, batches: usize) {
+        if self.batches.len() < batches {
+            self.batches
+                .resize_with(batches, ReplicationBatchScratch::default);
+        }
+        self.active_batches = batches;
     }
 }
 
@@ -126,6 +154,15 @@ pub struct ParallelReplicationResult {
     /// One result per input station batch, retaining input order.
     pub batches: Vec<ReplicationBatchResult>,
     /// Aggregate statistics merged in station input order.
+    pub stats: ReplicationBatchStats,
+}
+
+/// Borrowed ordered Station results produced from reusable parallel storage.
+#[derive(Clone, Copy, Debug)]
+pub struct ParallelReplicationView<'a> {
+    /// One reusable batch slot per input Station batch, retaining input order.
+    pub batches: &'a [ReplicationBatchScratch],
+    /// Aggregate statistics merged in Station input order.
     pub stats: ReplicationBatchStats,
 }
 
@@ -208,7 +245,7 @@ impl ReplicationThreadPool {
         F: VisibilityFilter + Sync,
     {
         let lanes = self.threads.min(batches.len());
-        scratch.prepare(lanes);
+        scratch.prepare_lanes(lanes);
         let partitioned = self.pool.install(|| {
             scratch
                 .lanes
@@ -247,7 +284,7 @@ impl ReplicationThreadPool {
         scratch: &mut ParallelReplicationScratch,
     ) -> ParallelReplicationResult {
         let lanes = self.threads.min(batches.len());
-        scratch.prepare(lanes);
+        scratch.prepare_lanes(lanes);
         let partitioned = self.pool.install(|| {
             scratch
                 .lanes
@@ -273,6 +310,93 @@ impl ReplicationThreadPool {
         let results = partitioned.into_iter().flatten().collect();
         ParallelReplicationResult::from_batches(results)
     }
+
+    /// Plans generic visibility batches into caller-owned reusable Station outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_station_batches_into<'a, F>(
+        &self,
+        batches: &[StationReplicationBatch<'_>],
+        policies: &PolicyTable,
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &'a mut ParallelReplicationScratch,
+    ) -> ParallelReplicationView<'a>
+    where
+        F: VisibilityFilter + Sync,
+    {
+        let lanes = self.threads.min(batches.len());
+        scratch.prepare_lanes(lanes);
+        scratch.prepare_output(batches.len());
+        if lanes != 0 {
+            let chunk_size = batches.len().div_ceil(lanes);
+            self.pool.install(|| {
+                batches
+                    .par_chunks(chunk_size)
+                    .zip(scratch.batches[..batches.len()].par_chunks_mut(chunk_size))
+                    .zip(scratch.lanes[..lanes].par_iter_mut())
+                    .for_each(|((input, output), lane)| {
+                        for (batch, batch_output) in input.iter().zip(output) {
+                            ReplicationPlanner::plan_for_viewers_into(
+                                batch.station,
+                                batch.index,
+                                policies,
+                                batch.viewers,
+                                filter,
+                                budget,
+                                lane,
+                                batch_output,
+                            );
+                        }
+                    });
+            });
+        }
+        reusable_view(scratch)
+    }
+
+    /// Plans range-only batches into caller-owned reusable Station outputs.
+    pub fn plan_station_range_batches_into<'a>(
+        &self,
+        batches: &[StationReplicationBatch<'_>],
+        policies: &PolicyTable,
+        budget: ReplicationBudget,
+        scratch: &'a mut ParallelReplicationScratch,
+    ) -> ParallelReplicationView<'a> {
+        let lanes = self.threads.min(batches.len());
+        scratch.prepare_lanes(lanes);
+        scratch.prepare_output(batches.len());
+        if lanes != 0 {
+            let chunk_size = batches.len().div_ceil(lanes);
+            self.pool.install(|| {
+                batches
+                    .par_chunks(chunk_size)
+                    .zip(scratch.batches[..batches.len()].par_chunks_mut(chunk_size))
+                    .zip(scratch.lanes[..lanes].par_iter_mut())
+                    .for_each(|((input, output), lane)| {
+                        for (batch, batch_output) in input.iter().zip(output) {
+                            ReplicationPlanner::plan_for_viewers_range_into(
+                                batch.station,
+                                batch.index,
+                                policies,
+                                batch.viewers,
+                                budget,
+                                lane,
+                                batch_output,
+                            );
+                        }
+                    });
+            });
+        }
+        reusable_view(scratch)
+    }
+}
+
+fn reusable_view(scratch: &ParallelReplicationScratch) -> ParallelReplicationView<'_> {
+    let batches = &scratch.batches[..scratch.active_batches];
+    let mut stats = ReplicationBatchStats::default();
+    for batch in batches {
+        stats.merge(batch.view().stats);
+    }
+    ParallelReplicationView { batches, stats }
 }
 
 #[cfg(test)]
@@ -367,6 +491,105 @@ mod tests {
     }
 
     #[test]
+    fn reusable_parallel_output_matches_owned_results_and_retains_capacity() {
+        let mut stations = Vec::new();
+        let mut indexes = Vec::new();
+        let mut viewers = Vec::new();
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 128, 128.0));
+
+        for station_index in 0_u32..6 {
+            let mut station = Station::new(StationConfig {
+                station_id: StationId::new(station_index),
+                node_id: NodeId::new(1),
+                instance_id: InstanceId::new(1),
+                tick_rate_hz: 128,
+            });
+            let mut index = CellIndex::new(GridSpec::new(16.0).expect("valid grid"));
+            for entity_index in 0_u16..24 {
+                let position = Position3::new(f32::from(entity_index) * 3.0, 0.0, 0.0);
+                let handle = station
+                    .spawn_owned(
+                        EntityId::new(u64::from(station_index) * 100 + u64::from(entity_index)),
+                        position,
+                        Bounds::Point,
+                        PolicyId::new(1),
+                    )
+                    .expect("unique entity");
+                index.upsert(handle, position, Bounds::Point);
+            }
+            stations.push(station);
+            indexes.push(index);
+            viewers.push(vec![
+                ViewerQuery {
+                    client_id: ClientId::new(u64::from(station_index) * 2),
+                    position: Position3::new(16.0, 0.0, 0.0),
+                    radius: 64.0,
+                    max_entities: 32,
+                },
+                ViewerQuery {
+                    client_id: ClientId::new(u64::from(station_index) * 2 + 1),
+                    position: Position3::new(40.0, 0.0, 0.0),
+                    radius: 32.0,
+                    max_entities: 8,
+                },
+            ]);
+        }
+
+        let batches = stations
+            .iter()
+            .zip(&indexes)
+            .zip(&viewers)
+            .map(|((station, index), viewers)| {
+                StationReplicationBatch::new(station, index, viewers)
+            })
+            .collect::<Vec<_>>();
+        let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
+            .expect("pool builds");
+        let mut owned_scratch = ParallelReplicationScratch::new();
+        let owned = pool.plan_station_range_batches(
+            &batches,
+            &policies,
+            ReplicationBudget::default(),
+            &mut owned_scratch,
+        );
+        let mut reusable_scratch = ParallelReplicationScratch::new();
+
+        {
+            let reusable = pool.plan_station_range_batches_into(
+                &batches,
+                &policies,
+                ReplicationBudget::default(),
+                &mut reusable_scratch,
+            );
+            assert_eq!(reusable.stats, owned.stats);
+            for (actual, expected) in reusable.batches.iter().zip(&owned.batches) {
+                let actual = actual.view();
+                assert_eq!(actual.plans, expected.plans);
+                assert_eq!(actual.stats, expected.stats);
+            }
+        }
+        let retained_capacity = reusable_scratch.retained_entity_capacity();
+        assert_eq!(reusable_scratch.retained_batch_slots(), batches.len());
+        assert!(retained_capacity > 0);
+
+        let reduced = pool.plan_station_batches_into(
+            &batches[..2],
+            &policies,
+            &RangeOnlyVisibility,
+            ReplicationBudget::default(),
+            &mut reusable_scratch,
+        );
+        assert_eq!(reduced.batches.len(), 2);
+        assert_eq!(reduced.stats.viewers, 4);
+        assert_eq!(reusable_scratch.retained_batch_slots(), batches.len());
+        assert_eq!(
+            reusable_scratch.retained_entity_capacity(),
+            retained_capacity
+        );
+    }
+
+    #[test]
     fn ordered_map_retains_input_order() {
         let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
             .expect("pool builds");
@@ -390,6 +613,16 @@ mod tests {
 
         assert!(result.batches.is_empty());
         assert_eq!(result.stats, ReplicationBatchStats::default());
+        assert_eq!(scratch.lanes(), 0);
+
+        let reusable = pool.plan_station_range_batches_into(
+            &[],
+            &PolicyTable::default(),
+            ReplicationBudget::default(),
+            &mut scratch,
+        );
+        assert!(reusable.batches.is_empty());
+        assert_eq!(reusable.stats, ReplicationBatchStats::default());
         assert_eq!(scratch.lanes(), 0);
     }
 }

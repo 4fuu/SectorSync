@@ -56,19 +56,29 @@ fn main() {
     let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
         .expect("explicit pool should build");
     let mut scratch = ParallelReplicationScratch::new();
-    let result = pool.plan_station_range_batches(
-        &batches,
-        &policies,
-        ReplicationBudget::default(),
-        &mut scratch,
-    );
+    let stats = {
+        let result = pool.plan_station_range_batches_into(
+            &batches,
+            &policies,
+            ReplicationBudget::default(),
+            &mut scratch,
+        );
+        assert_eq!(result.batches.len(), 12);
+        assert_eq!(result.stats.viewers, 12);
+        assert!(result.stats.selected > 0);
+        result.stats
+    };
 
-    assert_eq!(result.batches.len(), 12);
-    assert_eq!(result.stats.viewers, 12);
     assert_eq!(scratch.lanes(), 2);
-    assert!(result.stats.selected > 0);
+    assert_eq!(scratch.retained_batch_slots(), 12);
+    assert!(scratch.retained_entity_capacity() > 0);
     println!("threads={}", pool.threads());
     println!("scratch_lanes={}", scratch.lanes());
-    println!("viewers={}", result.stats.viewers);
-    println!("selected={}", result.stats.selected);
+    println!("retained_batch_slots={}", scratch.retained_batch_slots());
+    println!(
+        "retained_entity_capacity={}",
+        scratch.retained_entity_capacity()
+    );
+    println!("viewers={}", stats.viewers);
+    println!("selected={}", stats.selected);
 }

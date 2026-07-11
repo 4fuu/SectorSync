@@ -36,8 +36,9 @@ pub use deployment::{
 };
 #[cfg(feature = "parallel")]
 pub use parallel::{
-    ParallelReplicationResult, ParallelReplicationScratch, ReplicationThreadPool,
-    ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig, StationReplicationBatch,
+    ParallelReplicationResult, ParallelReplicationScratch, ParallelReplicationView,
+    ReplicationThreadPool, ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig,
+    StationReplicationBatch,
 };
 
 /// Client replication transport bridge configuration.
