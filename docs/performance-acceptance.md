@@ -392,6 +392,13 @@ queued packets and events, and released 20 retained packet slots. Lifecycle
 acceptance checks the expected endpoint count, zero backlog, and nonzero released
 capacity whenever recreation occurs.
 
+The trace assigns inventory to sparse `ComponentId` 65,535. Compact sorted
+column storage retains 80 slots for 60 registered room-local columns across 20
+rooms; capacity no longer scales to the maximum numeric ID. All 2,620 indexed
+entities at measurement time use inline single-cell membership, eliminating
+their former one-element membership allocations. Both conditions have explicit
+machine-readable threshold verdicts.
+
 Machine-readable output retains phase percentiles, command/event/transport
 conservation, spawn/despawn and lifecycle counts, selected/encoded/component
 counts, actual bytes, packet-budget failures, tracker state/ACK counts, world

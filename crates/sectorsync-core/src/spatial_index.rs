@@ -153,12 +153,32 @@ impl CellQueryScratch {
     }
 }
 
+/// Internal compact membership representation for point and bounded entities.
+#[derive(Clone, Debug)]
+enum CellMembership {
+    Point(CellCoord3),
+    Multiple(Vec<CellCoord3>),
+}
+
+impl CellMembership {
+    fn as_slice(&self) -> &[CellCoord3] {
+        match self {
+            Self::Point(cell) => std::slice::from_ref(cell),
+            Self::Multiple(cells) => cells,
+        }
+    }
+
+    fn matches_range(&self, min: CellCoord3, max: CellCoord3) -> bool {
+        cells_match_range(self.as_slice(), min, max)
+    }
+}
+
 /// Station-local 3D cell index.
 #[derive(Clone, Debug)]
 pub struct CellIndex {
     grid: GridSpec,
     cells: HashMap<CellCoord3, Vec<EntityHandle>>,
-    entity_cells: HashMap<EntityHandle, Vec<CellCoord3>>,
+    entity_cells: HashMap<EntityHandle, CellMembership>,
 }
 
 impl CellIndex {
@@ -218,19 +238,24 @@ impl CellIndex {
             if let Some(old_cell) = self
                 .entity_cells
                 .get(&handle)
-                .and_then(|current| (current.len() == 1).then(|| current[0]))
+                .and_then(|current| match current {
+                    CellMembership::Point(cell) => Some(*cell),
+                    CellMembership::Multiple(_) => None,
+                })
             {
                 if old_cell == cell {
                     return CellIndexUpdate::Unchanged;
                 }
                 self.remove_handle_from_cell(old_cell, handle);
                 self.cells.entry(cell).or_default().push(handle);
-                self.entity_cells
+                *self
+                    .entity_cells
                     .get_mut(&handle)
-                    .expect("indexed point entity retains its cell list")[0] = cell;
+                    .expect("indexed point entity retains its cell membership") =
+                    CellMembership::Point(cell);
                 return CellIndexUpdate::Relocated;
             }
-            vec![cell]
+            CellMembership::Point(cell)
         } else {
             let aabb = bounds.to_aabb(position);
             let min = self.grid.cell_at(aabb.min);
@@ -238,14 +263,14 @@ impl CellIndex {
             if self
                 .entity_cells
                 .get(&handle)
-                .is_some_and(|current| cells_match_range(current, min, max))
+                .is_some_and(|current| current.matches_range(min, max))
             {
                 return CellIndexUpdate::Unchanged;
             }
-            collect_cell_range(min, max)
+            CellMembership::Multiple(collect_cell_range(min, max))
         };
         let existed = self.remove(handle);
-        for cell in &cells {
+        for cell in cells.as_slice() {
             self.cells.entry(*cell).or_default().push(handle);
         }
         self.entity_cells.insert(handle, cells);
@@ -262,8 +287,8 @@ impl CellIndex {
             return false;
         };
 
-        for cell in cells {
-            self.remove_handle_from_cell(cell, handle);
+        for cell in cells.as_slice() {
+            self.remove_handle_from_cell(*cell, handle);
         }
 
         true
@@ -369,12 +394,20 @@ impl CellIndex {
 
     /// Returns cells currently occupied by one entity handle.
     pub fn cells_for_handle(&self, handle: EntityHandle) -> Option<&[CellCoord3]> {
-        self.entity_cells.get(&handle).map(Vec::as_slice)
+        self.entity_cells.get(&handle).map(CellMembership::as_slice)
     }
 
     /// Number of indexed entities.
     pub fn entity_count(&self) -> usize {
         self.entity_cells.len()
+    }
+
+    /// Number of entities using allocation-free single-cell membership.
+    pub fn point_membership_count(&self) -> usize {
+        self.entity_cells
+            .values()
+            .filter(|membership| matches!(membership, CellMembership::Point(_)))
+            .count()
     }
 
     /// Number of non-empty cells.
@@ -496,23 +529,19 @@ mod tests {
         assert_eq!(index.entity_capacity(), entity_capacity);
         assert_eq!(index.occupied_cell_capacity(), cell_capacity);
 
-        let retained_cell_list = index
-            .entity_cells
-            .get(&handle)
-            .expect("point entity has one cell list")
-            .as_ptr();
+        assert!(matches!(
+            index.entity_cells.get(&handle),
+            Some(CellMembership::Point(cell)) if *cell == first_cell
+        ));
         assert_eq!(
             index.upsert_tracked(handle, Position3::new(11.0, 2.0, 3.0), Bounds::Point),
             CellIndexUpdate::Relocated
         );
-        assert_eq!(
-            index
-                .entity_cells
-                .get(&handle)
-                .expect("relocated point entity retains its cell list")
-                .as_ptr(),
-            retained_cell_list
-        );
+        assert!(matches!(
+            index.entity_cells.get(&handle),
+            Some(CellMembership::Point(cell)) if *cell == second_cell
+        ));
+        assert_eq!(index.point_membership_count(), 1);
         assert!(index.handles_in_cell_slice(first_cell).is_empty());
         assert_eq!(index.handles_in_cell_slice(second_cell), &[handle]);
     }
@@ -532,6 +561,7 @@ mod tests {
             .entity_cells
             .get(&handle)
             .expect("bounded entity has cells")
+            .as_slice()
             .as_ptr();
         assert_eq!(
             index.upsert_tracked(handle, Position3::new(9.5, 0.0, 0.0), bounds),
@@ -542,6 +572,7 @@ mod tests {
                 .entity_cells
                 .get(&handle)
                 .expect("unchanged bounds retain cells")
+                .as_slice()
                 .as_ptr(),
             retained_cells
         );

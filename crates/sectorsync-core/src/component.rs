@@ -722,7 +722,7 @@ struct ComponentColumn {
 /// Station-local sparse component blob store.
 #[derive(Clone, Debug, Default)]
 pub struct ComponentStore {
-    columns: Vec<Option<ComponentColumn>>,
+    columns: Vec<(ComponentId, ComponentColumn)>,
 }
 
 impl ComponentStore {
@@ -740,9 +740,7 @@ impl ComponentStore {
 
     /// Sparse entity entries retained for one component without another rehash.
     pub fn component_capacity(&self, component_id: ComponentId) -> usize {
-        self.columns
-            .get(usize::from(component_id.get()))
-            .and_then(Option::as_ref)
+        self.column(component_id)
             .map_or(0, |column| column.values.capacity())
     }
 
@@ -842,9 +840,7 @@ impl ComponentStore {
         component_id: ComponentId,
         entity: EntityHandle,
     ) -> Option<&ComponentBlob> {
-        self.columns
-            .get(usize::from(component_id.get()))
-            .and_then(Option::as_ref)
+        self.column(component_id)
             .and_then(|column| column.values.get(&entity))
     }
 
@@ -880,16 +876,14 @@ impl ComponentStore {
         component_id: ComponentId,
         entity: EntityHandle,
     ) -> Option<&mut ComponentBlob> {
-        self.columns
-            .get_mut(usize::from(component_id.get()))
-            .and_then(Option::as_mut)
-            .and_then(|column| column.values.get_mut(&entity))
+        let index = self.column_index(component_id).ok()?;
+        self.columns[index].1.values.get_mut(&entity)
     }
 
     /// Clears dirty flags for all components on one entity.
     pub fn clear_dirty_for_entity(&mut self, entity: EntityHandle) -> usize {
         let mut cleared = 0;
-        for column in self.columns.iter_mut().filter_map(Option::as_mut) {
+        for (_, column) in &mut self.columns {
             if let Some(blob) = column.values.get_mut(&entity)
                 && blob.dirty
             {
@@ -914,14 +908,9 @@ impl ComponentStore {
         removed: &mut Vec<(ComponentId, ComponentBlob)>,
     ) -> usize {
         removed.clear();
-        for (index, column) in self.columns.iter_mut().enumerate() {
-            let Some(column) = column else {
-                continue;
-            };
+        for (component_id, column) in &mut self.columns {
             if let Some(blob) = column.values.remove(&entity) {
-                let component_id = u16::try_from(index)
-                    .expect("component columns are indexed by u16 component ids");
-                removed.push((ComponentId::new(component_id), blob));
+                removed.push((*component_id, blob));
             }
         }
         removed.len()
@@ -930,7 +919,7 @@ impl ComponentStore {
     /// Removes and drops all component blobs for an entity without output storage.
     pub fn clear_entity(&mut self, entity: EntityHandle) -> usize {
         let mut removed = 0_usize;
-        for column in self.columns.iter_mut().filter_map(Option::as_mut) {
+        for (_, column) in &mut self.columns {
             removed = removed.saturating_add(usize::from(column.values.remove(&entity).is_some()));
         }
         removed
@@ -961,17 +950,36 @@ impl ComponentStore {
     pub fn blob_count(&self) -> usize {
         self.columns
             .iter()
-            .filter_map(Option::as_ref)
-            .map(|column| column.values.len())
+            .map(|(_, column)| column.values.len())
             .sum()
     }
 
     fn column_mut(&mut self, component_id: ComponentId) -> &mut ComponentColumn {
-        let index = usize::from(component_id.get());
-        if self.columns.len() <= index {
-            self.columns.resize_with(index + 1, || None);
-        }
-        self.columns[index].get_or_insert_with(ComponentColumn::default)
+        let index = match self.column_index(component_id) {
+            Ok(index) => index,
+            Err(index) => {
+                self.columns
+                    .insert(index, (component_id, ComponentColumn::default()));
+                index
+            }
+        };
+        &mut self.columns[index].1
+    }
+
+    fn column(&self, component_id: ComponentId) -> Option<&ComponentColumn> {
+        self.column_index(component_id)
+            .ok()
+            .map(|index| &self.columns[index].1)
+    }
+
+    fn column_index(&self, component_id: ComponentId) -> Result<usize, usize> {
+        self.columns
+            .binary_search_by_key(&component_id, |(id, _)| *id)
+    }
+
+    /// Number of component columns currently registered in the store.
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
     }
 }
 
@@ -1002,7 +1010,8 @@ mod tests {
         let mut store = ComponentStore::default();
         store.reserve_component(component_id, 16);
 
-        assert!(store.column_slots_capacity() >= 4);
+        assert!(store.column_slots_capacity() >= 1);
+        assert_eq!(store.column_count(), 1);
         assert!(store.component_capacity(component_id) >= 16);
 
         let descriptor = ComponentDescriptor::sparse_blob(
@@ -1022,6 +1031,22 @@ mod tests {
                 .map(|blob| blob.bytes.as_slice()),
             Some(&[1, 2, 3, 4][..])
         );
+    }
+
+    #[test]
+    fn sparse_component_ids_only_allocate_registered_columns() {
+        let low = ComponentId::new(1);
+        let high = ComponentId::new(u16::MAX);
+        let mut store = ComponentStore::default();
+        store.reserve_component(high, 4);
+        let capacity_after_high = store.column_slots_capacity();
+        store.reserve_component(low, 4);
+
+        assert_eq!(store.column_count(), 2);
+        assert!(capacity_after_high < 16);
+        assert!(store.column_slots_capacity() < 16);
+        assert!(store.component_capacity(low) >= 4);
+        assert!(store.component_capacity(high) >= 4);
     }
 
     #[test]

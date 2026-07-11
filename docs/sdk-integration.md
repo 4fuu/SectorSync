@@ -46,6 +46,8 @@ Create capacities and ownership explicitly before accepting traffic:
    spawn, movement, removal, handoff, and cell migration.
 3. Compile `PolicyTable` entries, register custom component descriptors, and
    call `ComponentStore::reserve_component` for known sparse-column sizes.
+   Component IDs may be sparse; column storage scales with registered IDs, not
+   the highest numeric ID.
 4. Configure bounded command queues, event queues, transport packet limits,
    replication budgets, trackers, gateway sessions, and deployment routes.
 5. Register station/client transport endpoints and expected packet sources.
@@ -198,8 +200,8 @@ result back through controlled APIs such as:
   application-owned.
 - `CellIndex::upsert` after transform/bounds changes. Point updates that remain
   in the same cell avoid index mutation and allocation automatically; point
-  updates that cross cells retain their entity-cell list and update the mapping
-  in place. Sphere/AABB updates compare existing multi-cell membership before
+  entities store their single cell inline without a per-entity heap allocation.
+  Sphere/AABB updates compare existing multi-cell membership before
   allocating a replacement list. Use `upsert_tracked` only when the application
   needs the outcome.
 - `EventRouter` or station event transport for ordered cross-station effects.

@@ -38,7 +38,7 @@ const MAX_PACKET_BYTES: usize = 16 * 1024;
 const TIME_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFORM_COMPONENT: ComponentId = ComponentId::new(1);
 const STATE_COMPONENT: ComponentId = ComponentId::new(2);
-const INVENTORY_COMPONENT: ComponentId = ComponentId::new(3);
+const INVENTORY_COMPONENT: ComponentId = ComponentId::new(u16::MAX);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
@@ -293,6 +293,9 @@ struct Stats {
     retained_query_candidates: usize,
     retained_command_slots: usize,
     retained_component_slots: usize,
+    registered_component_columns: usize,
+    indexed_entities: usize,
+    point_memberships: usize,
     time_budget_exhausted: bool,
     tick_ms: Vec<f64>,
     command_ms: Vec<f64>,
@@ -399,7 +402,12 @@ fn run(
         stats.ticks_completed = stats.ticks_completed.saturating_add(1);
     }
 
-    for room in &rooms {
+    collect_room_stats(&rooms, &mut stats);
+    stats
+}
+
+fn collect_room_stats(rooms: &[Room], stats: &mut Stats) {
+    for room in rooms {
         stats.world_checksum = stats.world_checksum.wrapping_add(room_checksum(room));
         stats.tracker_records = stats.tracker_records.saturating_add(room.tracker.len());
         stats.tracker_acks = stats
@@ -420,8 +428,16 @@ fn run(
         stats.retained_component_slots = stats
             .retained_component_slots
             .saturating_add(room.components.column_slots_capacity());
+        stats.registered_component_columns = stats
+            .registered_component_columns
+            .saturating_add(room.components.column_count());
+        stats.indexed_entities = stats
+            .indexed_entities
+            .saturating_add(room.index.entity_count());
+        stats.point_memberships = stats
+            .point_memberships
+            .saturating_add(room.index.point_membership_count());
     }
-    stats
 }
 
 fn create_room(room_id: usize, entities_per_room: usize, descriptors: &Descriptors) -> Room {
@@ -931,6 +947,9 @@ fn benchmark_ok(config: Config, stats: &Stats) -> bool {
         && stats.teardown_queued_packets == 0
         && stats.teardown_queued_events == 0
         && (expected_recreates == 0 || stats.teardown_released_queue_capacity > 0)
+        && stats.registered_component_columns == config.rooms.saturating_mul(3)
+        && stats.retained_component_slots < config.rooms.saturating_mul(16)
+        && stats.point_memberships == stats.indexed_entities
         && stats.world_checksum != 0
         && stats.client_checksum != 0
 }
@@ -949,6 +968,7 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
     println!("players_min={MIN_PLAYERS}");
     println!("players_max={MAX_PLAYERS}");
     println!("entities_per_room={}", config.entities_per_room);
+    println!("sparse_component_id={}", INVENTORY_COMPONENT.get());
     println!("ticks={}", config.ticks);
     println!("ticks_completed={}", stats.ticks_completed);
     println!("rooms_created={}", stats.rooms_created);
@@ -988,6 +1008,18 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
     println!("packet_oversize={}", stats.packet_oversize);
     println!("world_checksum={}", stats.world_checksum);
     println!("client_checksum={}", stats.client_checksum);
+    print_retained_resources(stats);
+    println!("time_budget_exhausted={}", stats.time_budget_exhausted);
+    print_percentiles("tick_ms", &stats.tick_ms);
+    print_percentiles("command_ms", &stats.command_ms);
+    print_percentiles("simulation_ms", &stats.simulation_ms);
+    print_percentiles("replication_ms", &stats.replication_ms);
+    print_thresholds(config, stats, expected_recreates, expected_endpoints);
+    println!("benchmark_ok={}", benchmark_ok(config, stats));
+    println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1_000.0);
+}
+
+fn print_retained_resources(stats: &Stats) {
     println!("retained_plan_slots={}", stats.retained_plan_slots);
     println!("retained_plan_entities={}", stats.retained_plan_entities);
     println!(
@@ -999,11 +1031,20 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
         "retained_component_slots={}",
         stats.retained_component_slots
     );
-    println!("time_budget_exhausted={}", stats.time_budget_exhausted);
-    print_percentiles("tick_ms", &stats.tick_ms);
-    print_percentiles("command_ms", &stats.command_ms);
-    print_percentiles("simulation_ms", &stats.simulation_ms);
-    print_percentiles("replication_ms", &stats.replication_ms);
+    println!(
+        "registered_component_columns={}",
+        stats.registered_component_columns
+    );
+    println!("indexed_entities={}", stats.indexed_entities);
+    println!("point_memberships={}", stats.point_memberships);
+}
+
+fn print_thresholds(
+    config: Config,
+    stats: &Stats,
+    expected_recreates: usize,
+    expected_endpoints: usize,
+) {
     println!(
         "threshold_command_conservation_ok={}",
         stats.commands_admitted == stats.commands_applied
@@ -1018,6 +1059,15 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
     );
     println!("threshold_packet_budget_ok={}", stats.packet_oversize == 0);
     println!(
+        "threshold_compact_components_ok={}",
+        stats.registered_component_columns == config.rooms.saturating_mul(3)
+            && stats.retained_component_slots < config.rooms.saturating_mul(16)
+    );
+    println!(
+        "threshold_inline_point_membership_ok={}",
+        stats.point_memberships == stats.indexed_entities
+    );
+    println!(
         "threshold_lifecycle_ok={}",
         stats.rooms_destroyed == expected_recreates
             && stats.rooms_created == config.rooms.saturating_add(expected_recreates)
@@ -1026,8 +1076,6 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
             && stats.teardown_queued_events == 0
             && (expected_recreates == 0 || stats.teardown_released_queue_capacity > 0)
     );
-    println!("benchmark_ok={}", benchmark_ok(config, stats));
-    println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1_000.0);
 }
 
 fn expected_endpoint_unregistrations(config: Config) -> usize {
