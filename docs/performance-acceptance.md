@@ -726,6 +726,37 @@ scan comparison, avoiding the earlier small-set hash overhead. Runtime tests
 cover threshold activation, first-duplicate semantics, replacement order,
 paired mutable lookup, and both capacity classes.
 
+## Packet Security Seal Scratch Measurement
+
+`PacketSecurityEnvelope::encode_parts` writes borrowed ciphertext/tag slices
+with the same limits and wire format as the owned envelope. `PacketSecurityBox`
+`seal_into`, `seal_with_nonce_into`, and `seal_with_key_ring_into` reuse a
+caller-owned `PacketSecurityScratch` for ciphertext and authentication tags.
+The final wire Vec remains caller-owned for transport handoff. Validation,
+cipher, or authenticator failure appends no partial envelope bytes.
+
+Compare reusable scratch with the compatible fresh-scratch path using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example security_seal_reuse
+cargo run --release -q -p sectorsync-bench --example security_seal_reuse -- --fresh-scratch
+```
+
+The default workload seals 2,000 packets per tick with 1 KiB payloads for ten
+ticks. Guards cap 4,000 packets per tick, 4 KiB payloads, and 20 ticks without
+`--allow-heavy`; execution has a 10-second budget. Both paths allocate the final
+owned wire packet. The benchmark authenticator emits a fixed 16-byte illustrative
+tag and `PlaintextPacketCipher` isolates framework buffer cost; these are not
+production cryptography or algorithm-throughput measurements.
+
+Five alternating release A/B runs produced identical 20,000 packets,
+`21,240,000` wire bytes, and a `22,900,000` checksum. Reusable sealing created
+zero fresh scratch sets and retained 1,024 payload plus 16 tag bytes; the
+comparison created 20,000 scratch sets. Median tick p99 was 0.420 ms reusable
+versus 0.640 ms fresh, about a 34% reduction on this development host. Transport
+tests cover owned/borrowed byte equality, repeated pointer/capacity retention,
+automatic nonce reporting, payload/tag limits, and failure atomicity.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

@@ -552,44 +552,63 @@ pub struct PacketSecurityEnvelope {
 }
 
 impl PacketSecurityEnvelope {
+    /// Appends an envelope from borrowed payload and tag slices.
+    pub fn encode_parts(
+        config: PacketSecurityConfig,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        tag: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), PacketSecurityEncodeError> {
+        if payload.len() > config.max_payload_bytes {
+            return Err(PacketSecurityEncodeError::PayloadTooLarge {
+                budget: config.max_payload_bytes,
+                actual: payload.len(),
+            });
+        }
+        if tag.len() > config.max_tag_bytes {
+            return Err(PacketSecurityEncodeError::TagTooLarge {
+                budget: config.max_tag_bytes,
+                actual: tag.len(),
+            });
+        }
+
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            PacketSecurityEncodeError::PayloadTooLarge {
+                budget: config.max_payload_bytes,
+                actual: payload.len(),
+            }
+        })?;
+        let tag_len =
+            u16::try_from(tag.len()).map_err(|_| PacketSecurityEncodeError::TagTooLarge {
+                budget: config.max_tag_bytes,
+                actual: tag.len(),
+            })?;
+        out.extend_from_slice(&PACKET_SECURITY_MAGIC);
+        out.extend_from_slice(&key_id.to_le_bytes());
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&tag_len.to_le_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(tag);
+        Ok(())
+    }
+
     /// Encodes a packet security envelope.
     pub fn encode(
         &self,
         config: PacketSecurityConfig,
         out: &mut Vec<u8>,
     ) -> Result<(), PacketSecurityEncodeError> {
-        if self.payload.len() > config.max_payload_bytes {
-            return Err(PacketSecurityEncodeError::PayloadTooLarge {
-                budget: config.max_payload_bytes,
-                actual: self.payload.len(),
-            });
-        }
-        if self.tag.len() > config.max_tag_bytes {
-            return Err(PacketSecurityEncodeError::TagTooLarge {
-                budget: config.max_tag_bytes,
-                actual: self.tag.len(),
-            });
-        }
-
-        out.extend_from_slice(&PACKET_SECURITY_MAGIC);
-        out.extend_from_slice(&self.key_id.to_le_bytes());
-        out.extend_from_slice(&self.nonce.to_le_bytes());
-        let payload_len = u32::try_from(self.payload.len()).map_err(|_| {
-            PacketSecurityEncodeError::PayloadTooLarge {
-                budget: config.max_payload_bytes,
-                actual: self.payload.len(),
-            }
-        })?;
-        let tag_len =
-            u16::try_from(self.tag.len()).map_err(|_| PacketSecurityEncodeError::TagTooLarge {
-                budget: config.max_tag_bytes,
-                actual: self.tag.len(),
-            })?;
-        out.extend_from_slice(&payload_len.to_le_bytes());
-        out.extend_from_slice(&tag_len.to_le_bytes());
-        out.extend_from_slice(&self.payload);
-        out.extend_from_slice(&self.tag);
-        Ok(())
+        Self::encode_parts(
+            config,
+            self.key_id,
+            self.nonce,
+            &self.payload,
+            &self.tag,
+            out,
+        )
     }
 
     /// Decodes a packet security envelope.
@@ -863,6 +882,38 @@ pub struct PacketSecurityStats {
     pub replay_rejected: usize,
 }
 
+/// Caller-owned reusable payload and tag storage for packet sealing.
+#[derive(Clone, Debug, Default)]
+pub struct PacketSecurityScratch {
+    sealed_payload: Vec<u8>,
+    tag: Vec<u8>,
+}
+
+impl PacketSecurityScratch {
+    /// Creates empty sealing storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates sealing storage with explicit payload and tag capacities.
+    pub fn with_capacity(payload_bytes: usize, tag_bytes: usize) -> Self {
+        Self {
+            sealed_payload: Vec::with_capacity(payload_bytes),
+            tag: Vec::with_capacity(tag_bytes),
+        }
+    }
+
+    /// Encrypted-payload bytes retained without growing the scratch buffer.
+    pub fn retained_payload_capacity(&self) -> usize {
+        self.sealed_payload.capacity()
+    }
+
+    /// Authentication-tag bytes retained without growing the scratch buffer.
+    pub fn retained_tag_capacity(&self) -> usize {
+        self.tag.capacity()
+    }
+}
+
 /// Error produced by packet security helpers.
 #[derive(Debug)]
 pub enum PacketSecurityError<A, C> {
@@ -1011,6 +1062,88 @@ where
         nonce: u64,
         payload: &[u8],
     ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        let mut scratch = PacketSecurityScratch::with_capacity(
+            payload.len().min(self.config.max_payload_bytes),
+            0,
+        );
+        self.prepare_seal(key_id, nonce, payload, &mut scratch)?;
+        let mut out = Vec::with_capacity(
+            PACKET_SECURITY_HEADER_BYTES
+                .saturating_add(scratch.sealed_payload.len())
+                .saturating_add(scratch.tag.len()),
+        );
+        PacketSecurityEnvelope::encode_parts(
+            self.config,
+            key_id,
+            nonce,
+            &scratch.sealed_payload,
+            &scratch.tag,
+            &mut out,
+        )
+        .map_err(PacketSecurityError::Encode)?;
+        self.stats.sealed = self.stats.sealed.saturating_add(1);
+        Ok(out)
+    }
+
+    /// Seals and appends one payload using an allocated nonce and reusable storage.
+    pub fn seal_into(
+        &mut self,
+        key_id: u32,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+        scratch: &mut PacketSecurityScratch,
+    ) -> Result<u64, PacketSecurityError<A::Error, C::Error>> {
+        let nonce = self.allocate_nonce(key_id);
+        self.seal_with_nonce_into(key_id, nonce, payload, out, scratch)?;
+        Ok(nonce)
+    }
+
+    /// Selects a key and appends one sealed payload using reusable storage.
+    pub fn seal_with_key_ring_into(
+        &mut self,
+        key_ring: &PacketKeyRing,
+        payload: &[u8],
+        now: Tick,
+        out: &mut Vec<u8>,
+        scratch: &mut PacketSecurityScratch,
+    ) -> Result<(u32, u64), PacketSecurityError<A::Error, C::Error>> {
+        let descriptor = key_ring
+            .select_send_key(now)
+            .map_err(PacketSecurityError::Key)?;
+        let nonce = self.seal_into(descriptor.key_id, payload, out, scratch)?;
+        Ok((descriptor.key_id, nonce))
+    }
+
+    /// Seals and appends one payload with an explicit nonce and reusable storage.
+    pub fn seal_with_nonce_into(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+        scratch: &mut PacketSecurityScratch,
+    ) -> Result<(), PacketSecurityError<A::Error, C::Error>> {
+        self.prepare_seal(key_id, nonce, payload, scratch)?;
+        PacketSecurityEnvelope::encode_parts(
+            self.config,
+            key_id,
+            nonce,
+            &scratch.sealed_payload,
+            &scratch.tag,
+            out,
+        )
+        .map_err(PacketSecurityError::Encode)?;
+        self.stats.sealed = self.stats.sealed.saturating_add(1);
+        Ok(())
+    }
+
+    fn prepare_seal(
+        &mut self,
+        key_id: u32,
+        nonce: u64,
+        payload: &[u8],
+        scratch: &mut PacketSecurityScratch,
+    ) -> Result<(), PacketSecurityError<A::Error, C::Error>> {
         if payload.len() > self.config.max_payload_bytes {
             return Err(PacketSecurityError::Encode(
                 PacketSecurityEncodeError::PayloadTooLarge {
@@ -1019,30 +1152,16 @@ where
                 },
             ));
         }
-        let mut sealed_payload = payload.to_vec();
+        scratch.sealed_payload.clear();
+        scratch.sealed_payload.extend_from_slice(payload);
         self.cipher
-            .seal(key_id, nonce, &mut sealed_payload)
+            .seal(key_id, nonce, &mut scratch.sealed_payload)
             .map_err(PacketSecurityError::Cipher)?;
-        let mut tag = Vec::new();
+        scratch.tag.clear();
         self.authenticator
-            .sign(key_id, nonce, &sealed_payload, &mut tag)
+            .sign(key_id, nonce, &scratch.sealed_payload, &mut scratch.tag)
             .map_err(PacketSecurityError::Authenticator)?;
-        let envelope = PacketSecurityEnvelope {
-            key_id,
-            nonce,
-            payload: sealed_payload,
-            tag,
-        };
-        let mut out = Vec::with_capacity(
-            PACKET_SECURITY_HEADER_BYTES
-                .saturating_add(envelope.payload.len())
-                .saturating_add(envelope.tag.len()),
-        );
-        envelope
-            .encode(self.config, &mut out)
-            .map_err(PacketSecurityError::Encode)?;
-        self.stats.sealed = self.stats.sealed.saturating_add(1);
-        Ok(out)
+        Ok(())
     }
 
     /// Decodes, authenticates, replay-checks, and opens one payload.
@@ -3876,6 +3995,17 @@ mod tests {
         envelope
             .encode(config, &mut bytes)
             .expect("envelope should encode");
+        let mut borrowed = Vec::new();
+        PacketSecurityEnvelope::encode_parts(
+            config,
+            envelope.key_id,
+            envelope.nonce,
+            &envelope.payload,
+            &envelope.tag,
+            &mut borrowed,
+        )
+        .expect("borrowed envelope should encode");
+        assert_eq!(borrowed, bytes);
         assert_eq!(
             PacketSecurityEnvelope::decode(config, &bytes).expect("envelope should decode"),
             envelope
@@ -4016,6 +4146,65 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(receiver.stats().replay_rejected, 1);
+    }
+
+    #[test]
+    fn packet_security_seal_into_matches_owned_and_reuses_scratch_atomically() {
+        let config = PacketSecurityConfig::default();
+        let mut owned = PacketSecurityBox::new(config, TestAuthenticator, PlaintextPacketCipher);
+        let mut reused = PacketSecurityBox::new(config, TestAuthenticator, PlaintextPacketCipher);
+        let mut scratch = PacketSecurityScratch::with_capacity(32, 8);
+        let mut out = Vec::with_capacity(64);
+
+        let expected = owned
+            .seal_with_nonce(7, 10, b"command")
+            .expect("owned packet should seal");
+        reused
+            .seal_with_nonce_into(7, 10, b"command", &mut out, &mut scratch)
+            .expect("reused packet should seal");
+        assert_eq!(out, expected);
+        let payload_ptr = scratch.sealed_payload.as_ptr();
+        let tag_ptr = scratch.tag.as_ptr();
+        let payload_capacity = scratch.retained_payload_capacity();
+        let tag_capacity = scratch.retained_tag_capacity();
+
+        out.clear();
+        let nonce = reused
+            .seal_into(7, b"ack", &mut out, &mut scratch)
+            .expect("allocated nonce packet should seal");
+        assert_eq!(nonce, 1);
+        let envelope =
+            PacketSecurityEnvelope::decode(config, &out).expect("reused packet should decode");
+        assert_eq!(envelope.nonce, nonce);
+        assert_eq!(scratch.sealed_payload.as_ptr(), payload_ptr);
+        assert_eq!(scratch.tag.as_ptr(), tag_ptr);
+        assert_eq!(scratch.retained_payload_capacity(), payload_capacity);
+        assert_eq!(scratch.retained_tag_capacity(), tag_capacity);
+        assert_eq!(reused.stats().sealed, 2);
+
+        let before_error = out.clone();
+        let too_large = vec![0_u8; config.max_payload_bytes + 1];
+        assert!(matches!(
+            reused.seal_with_nonce_into(7, 11, &too_large, &mut out, &mut scratch),
+            Err(PacketSecurityError::Encode(
+                PacketSecurityEncodeError::PayloadTooLarge { .. }
+            ))
+        ));
+        assert_eq!(out, before_error);
+
+        let small_tag_config = PacketSecurityConfig {
+            max_tag_bytes: 4,
+            ..config
+        };
+        let mut small_tag =
+            PacketSecurityBox::new(small_tag_config, TestAuthenticator, PlaintextPacketCipher);
+        assert!(matches!(
+            small_tag.seal_with_nonce_into(7, 12, b"tag", &mut out, &mut scratch),
+            Err(PacketSecurityError::Encode(
+                PacketSecurityEncodeError::TagTooLarge { .. }
+            ))
+        ));
+        assert_eq!(out, before_error);
     }
 
     #[test]

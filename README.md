@@ -44,6 +44,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   support caller-owned retry scan scratch without cloning in-flight payloads.
 - Reliable sender window admission uses per-peer counters instead of scanning
   all in-flight packets as concurrent reliable windows grow.
+- Packet security sealing supports caller-owned payload/tag scratch and borrowed
+  envelope encoding while production algorithms and keys remain external.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
@@ -184,6 +186,8 @@ cargo run -p sectorsync-bench --release --example split_schedule_reuse
 cargo run -p sectorsync-bench --release --example split_schedule_reuse -- --fresh-output
 cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
+cargo run -p sectorsync-bench --release --example security_seal_reuse
+cargo run -p sectorsync-bench --release --example security_seal_reuse -- --fresh-scratch
 cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan -- --collect-remove

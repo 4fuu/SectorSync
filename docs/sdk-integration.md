@@ -103,6 +103,14 @@ bounded by the configured window, interval, and attempt limits.
 of scanning all packets. ACK and timeout removal update that index immediately;
 the final packet for a peer also removes its count entry.
 
+For repeated security sealing, retain `PacketSecurityScratch` and call
+`seal_into`, `seal_with_nonce_into`, or `seal_with_key_ring_into`. The scratch
+retains encrypted-payload and authentication-tag storage; the final wire Vec
+remains caller-owned and can be moved into a transport packet. Failed payload,
+cipher, authenticator, or tag validation does not append partial wire bytes.
+Authenticators, ciphers, keys, and certificates remain external integration
+responsibilities.
+
 ### 3. Apply Station-Local Business Work
 
 At the station tick boundary, pop a bounded number of commands from

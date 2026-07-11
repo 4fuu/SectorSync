@@ -6,7 +6,8 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_transport::{
     ClientTransportLimits, InMemoryTransportHub, OutboundPacket, PacketAuthenticator, PacketCipher,
-    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, TransportReceiver, TransportSink,
+    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, PacketSecurityScratch,
+    TransportReceiver, TransportSink,
 };
 use sectorsync_wire::{
     BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame, CommandFrame, FrameDecoder,
@@ -40,6 +41,10 @@ fn main() {
         PacketSecurityBox::new(security_config, ExampleAuthenticator, ExampleCipher);
     let mut server_security =
         PacketSecurityBox::new(security_config, ExampleAuthenticator, ExampleCipher);
+    let mut seal_scratch = PacketSecurityScratch::with_capacity(
+        security_config.max_payload_bytes,
+        security_config.max_tag_bytes,
+    );
 
     let command = CommandFrame {
         client_id,
@@ -55,8 +60,14 @@ fn main() {
     encoder
         .encode_command(&command, &mut command_bytes)
         .expect("command should encode");
-    let secure_command = client_security
-        .seal(client_to_server_key, &command_bytes)
+    let mut secure_command = Vec::with_capacity(256);
+    client_security
+        .seal_into(
+            client_to_server_key,
+            &command_bytes,
+            &mut secure_command,
+            &mut seal_scratch,
+        )
         .expect("command should seal");
     client_transport
         .send(OutboundPacket {
@@ -116,8 +127,14 @@ fn main() {
     encoder
         .encode_command_ack(&ack, &mut ack_bytes)
         .expect("ack should encode");
-    let secure_ack = server_security
-        .seal(server_to_client_key, &ack_bytes)
+    let mut secure_ack = Vec::with_capacity(256);
+    server_security
+        .seal_into(
+            server_to_client_key,
+            &ack_bytes,
+            &mut secure_ack,
+            &mut seal_scratch,
+        )
         .expect("ack should seal");
     server_transport
         .send(OutboundPacket {

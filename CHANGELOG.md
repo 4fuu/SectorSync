@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Packet security sealing now supports caller-owned encrypted-payload and tag
+  scratch plus borrowed envelope encoding, avoiding per-packet internal buffer
+  allocation while keeping authenticator/cipher providers external.
 - `StationSet` and `StationIndexSet` now preserve ordered iteration while using
   an adaptive Station-id index for larger registries; explicit capacity APIs
   reserve ordered slots and lookup storage for multi-room runtimes.

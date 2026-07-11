@@ -3,7 +3,8 @@
 use sectorsync_core::prelude::Tick;
 use sectorsync_transport::{
     PacketAuthenticator, PacketKeyRing, PacketKeyRingConfig, PacketKeyRingError, PacketSecurityBox,
-    PacketSecurityConfig, PacketSecurityEnvelope, PacketSecurityError, PlaintextPacketCipher,
+    PacketSecurityConfig, PacketSecurityEnvelope, PacketSecurityError, PacketSecurityScratch,
+    PlaintextPacketCipher,
 };
 
 fn main() {
@@ -23,9 +24,18 @@ fn main() {
 
     let mut sender = PacketSecurityBox::new(config, ExampleAuthenticator, PlaintextPacketCipher);
     let mut receiver = PacketSecurityBox::new(config, ExampleAuthenticator, PlaintextPacketCipher);
+    let mut seal_scratch =
+        PacketSecurityScratch::with_capacity(config.max_payload_bytes, config.max_tag_bytes);
 
-    let first_packet = sender
-        .seal_with_key_ring(&sender_ring, b"client-command", Tick::new(10))
+    let mut first_packet = Vec::with_capacity(256);
+    sender
+        .seal_with_key_ring_into(
+            &sender_ring,
+            b"client-command",
+            Tick::new(10),
+            &mut first_packet,
+            &mut seal_scratch,
+        )
         .expect("first packet should seal");
     let first_key = PacketSecurityEnvelope::decode(config, &first_packet)
         .expect("first packet should decode")
@@ -48,8 +58,15 @@ fn main() {
         .retire(100, Tick::new(20))
         .expect("old receiver key should retire");
 
-    let rotated_packet = sender
-        .seal_with_key_ring(&sender_ring, b"server-ack", Tick::new(20))
+    let mut rotated_packet = Vec::with_capacity(256);
+    sender
+        .seal_with_key_ring_into(
+            &sender_ring,
+            b"server-ack",
+            Tick::new(20),
+            &mut rotated_packet,
+            &mut seal_scratch,
+        )
         .expect("rotated packet should seal");
     let rotated_key = PacketSecurityEnvelope::decode(config, &rotated_packet)
         .expect("rotated packet should decode")

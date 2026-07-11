@@ -43,6 +43,12 @@ history. The embedding stack supplies both `PacketAuthenticator` and
 `PacketCipher` implementations. Those implementations may call a vetted crypto
 library, HSM, KMS-backed key cache, or another integration-owned provider.
 
+High-rate send paths should retain `PacketSecurityScratch` and use the `*_into`
+sealing APIs. SectorSync then reuses ciphertext and tag buffers while leaving
+the final transport packet caller-owned. Scratch contains transient packet
+material and must follow the embedding application's memory-clearing policy;
+SectorSync does not claim secure erasure or own secret-memory management.
+
 `PacketKeyRing` contains key ids and lifecycle metadata only. It never contains
 secret bytes. Keep these operations external:
 
