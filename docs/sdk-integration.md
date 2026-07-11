@@ -111,6 +111,14 @@ cipher, authenticator, or tag validation does not append partial wire bytes.
 Authenticators, ciphers, keys, and certificates remain external integration
 responsibilities.
 
+For repeated security opening, retain `PacketSecurityOpenScratch` and call
+`open_with_scratch` or `open_with_key_ring_and_scratch`. The returned
+`PacketSecurityOpenView` borrows plaintext from that scratch and must be
+consumed before the next call that mutates it. Use the compatible owned `open`
+methods when plaintext must outlive the scratch or move into caller-owned
+storage. Authentication and replay checks still run before decryption, and a
+failed authentication leaves the previous scratch plaintext unchanged.
+
 ### 3. Apply Station-Local Business Work
 
 At the station tick boundary, pop a bounded number of commands from

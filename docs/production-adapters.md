@@ -48,6 +48,11 @@ sealing APIs. SectorSync then reuses ciphertext and tag buffers while leaving
 the final transport packet caller-owned. Scratch contains transient packet
 material and must follow the embedding application's memory-clearing policy;
 SectorSync does not claim secure erasure or own secret-memory management.
+High-rate receive paths may similarly retain `PacketSecurityOpenScratch` and
+use the scratch opening APIs. Its plaintext remains allocated after the
+borrowed view expires, so the same application-owned clearing and retention
+policy applies. Use owned opening when the payload must cross the scratch
+lifetime or ownership boundary.
 
 `PacketKeyRing` contains key ids and lifecycle metadata only. It never contains
 secret bytes. Keep these operations external:

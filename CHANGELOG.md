@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Packet security opening now supports borrowed envelope decoding and
+  caller-owned plaintext scratch, removing per-packet payload/tag parsing
+  allocations and allowing high-rate receive paths to retain plaintext output.
 - Packet security sealing now supports caller-owned encrypted-payload and tag
   scratch plus borrowed envelope encoding, avoiding per-packet internal buffer
   allocation while keeping authenticator/cipher providers external.

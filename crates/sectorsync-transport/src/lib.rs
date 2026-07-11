@@ -538,7 +538,59 @@ impl Default for PacketKeyRing {
     }
 }
 
-/// Encoded packet security envelope.
+/// Borrowed packet security envelope decoded directly from wire bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketSecurityEnvelopeRef<'a> {
+    /// External key identifier chosen by the embedder.
+    pub key_id: u32,
+    /// Nonce scoped to `key_id`.
+    pub nonce: u64,
+    /// Borrowed ciphertext or plaintext payload.
+    pub payload: &'a [u8],
+    /// Borrowed authentication tag.
+    pub tag: &'a [u8],
+}
+
+impl<'a> PacketSecurityEnvelopeRef<'a> {
+    /// Decodes and validates an envelope without copying payload or tag bytes.
+    pub fn decode(
+        config: PacketSecurityConfig,
+        input: &'a [u8],
+    ) -> Result<Self, PacketSecurityDecodeError> {
+        let mut cursor = SecurityCursor::new(input);
+        let magic = cursor.read_array::<4>()?;
+        if magic != PACKET_SECURITY_MAGIC {
+            return Err(PacketSecurityDecodeError::BadMagic);
+        }
+        let key_id = cursor.read_u32()?;
+        let nonce = cursor.read_u64()?;
+        let payload_len = cursor.read_u32()? as usize;
+        let tag_len = cursor.read_u16()? as usize;
+        if payload_len > config.max_payload_bytes {
+            return Err(PacketSecurityDecodeError::PayloadTooLarge {
+                budget: config.max_payload_bytes,
+                actual: payload_len,
+            });
+        }
+        if tag_len > config.max_tag_bytes {
+            return Err(PacketSecurityDecodeError::TagTooLarge {
+                budget: config.max_tag_bytes,
+                actual: tag_len,
+            });
+        }
+        let payload = cursor.read_slice(payload_len)?;
+        let tag = cursor.read_slice(tag_len)?;
+        cursor.finish()?;
+        Ok(Self {
+            key_id,
+            nonce,
+            payload,
+            tag,
+        })
+    }
+}
+
+/// Owned packet security envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketSecurityEnvelope {
     /// External key identifier chosen by the embedder.
@@ -616,35 +668,12 @@ impl PacketSecurityEnvelope {
         config: PacketSecurityConfig,
         input: &[u8],
     ) -> Result<Self, PacketSecurityDecodeError> {
-        let mut cursor = SecurityCursor::new(input);
-        let magic = cursor.read_array::<4>()?;
-        if magic != PACKET_SECURITY_MAGIC {
-            return Err(PacketSecurityDecodeError::BadMagic);
-        }
-        let key_id = cursor.read_u32()?;
-        let nonce = cursor.read_u64()?;
-        let payload_len = cursor.read_u32()? as usize;
-        let tag_len = cursor.read_u16()? as usize;
-        if payload_len > config.max_payload_bytes {
-            return Err(PacketSecurityDecodeError::PayloadTooLarge {
-                budget: config.max_payload_bytes,
-                actual: payload_len,
-            });
-        }
-        if tag_len > config.max_tag_bytes {
-            return Err(PacketSecurityDecodeError::TagTooLarge {
-                budget: config.max_tag_bytes,
-                actual: tag_len,
-            });
-        }
-        let payload = cursor.read_bytes(payload_len)?;
-        let tag = cursor.read_bytes(tag_len)?;
-        cursor.finish()?;
+        let envelope = PacketSecurityEnvelopeRef::decode(config, input)?;
         Ok(Self {
-            key_id,
-            nonce,
-            payload,
-            tag,
+            key_id: envelope.key_id,
+            nonce: envelope.nonce,
+            payload: envelope.payload.to_vec(),
+            tag: envelope.tag.to_vec(),
         })
     }
 }
@@ -914,6 +943,42 @@ impl PacketSecurityScratch {
     }
 }
 
+/// Caller-owned reusable payload storage for packet opening.
+#[derive(Clone, Debug, Default)]
+pub struct PacketSecurityOpenScratch {
+    payload: Vec<u8>,
+}
+
+impl PacketSecurityOpenScratch {
+    /// Creates empty opening storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates opening storage with explicit payload capacity.
+    pub fn with_capacity(payload_bytes: usize) -> Self {
+        Self {
+            payload: Vec::with_capacity(payload_bytes),
+        }
+    }
+
+    /// Opened-payload bytes retained without growing the scratch buffer.
+    pub fn retained_payload_capacity(&self) -> usize {
+        self.payload.capacity()
+    }
+}
+
+/// Borrowed result of opening one packet into caller-owned scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketSecurityOpenView<'a> {
+    /// External key identifier carried by the envelope.
+    pub key_id: u32,
+    /// Accepted nonce carried by the envelope.
+    pub nonce: u64,
+    /// Opened payload, valid until the scratch is mutably reused.
+    pub payload: &'a [u8],
+}
+
 /// Error produced by packet security helpers.
 #[derive(Debug)]
 pub enum PacketSecurityError<A, C> {
@@ -1169,9 +1234,9 @@ where
         &mut self,
         input: &[u8],
     ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
-        let envelope = PacketSecurityEnvelope::decode(self.config, input)
+        let envelope = PacketSecurityEnvelopeRef::decode(self.config, input)
             .map_err(PacketSecurityError::Decode)?;
-        self.open_decoded(envelope)
+        self.open_borrowed_owned(envelope)
     }
 
     /// Decodes an envelope, validates its key against `key_ring`, then opens it.
@@ -1181,26 +1246,86 @@ where
         input: &[u8],
         now: Tick,
     ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
-        let envelope = PacketSecurityEnvelope::decode(self.config, input)
+        let envelope = PacketSecurityEnvelopeRef::decode(self.config, input)
             .map_err(PacketSecurityError::Decode)?;
         if let Err(error) = key_ring.accept_key(envelope.key_id, now) {
             self.stats.key_rejected = self.stats.key_rejected.saturating_add(1);
             return Err(PacketSecurityError::Key(error));
         }
-        self.open_decoded(envelope)
+        self.open_borrowed_owned(envelope)
     }
 
-    fn open_decoded(
+    /// Opens one envelope into caller-owned reusable payload storage.
+    pub fn open_with_scratch<'a>(
         &mut self,
-        envelope: PacketSecurityEnvelope,
+        input: &[u8],
+        scratch: &'a mut PacketSecurityOpenScratch,
+    ) -> Result<PacketSecurityOpenView<'a>, PacketSecurityError<A::Error, C::Error>> {
+        let envelope = PacketSecurityEnvelopeRef::decode(self.config, input)
+            .map_err(PacketSecurityError::Decode)?;
+        self.open_borrowed_with_scratch(envelope, scratch)
+    }
+
+    /// Validates a key-ring entry and opens into caller-owned reusable storage.
+    pub fn open_with_key_ring_and_scratch<'a>(
+        &mut self,
+        key_ring: &PacketKeyRing,
+        input: &[u8],
+        now: Tick,
+        scratch: &'a mut PacketSecurityOpenScratch,
+    ) -> Result<PacketSecurityOpenView<'a>, PacketSecurityError<A::Error, C::Error>> {
+        let envelope = PacketSecurityEnvelopeRef::decode(self.config, input)
+            .map_err(PacketSecurityError::Decode)?;
+        if let Err(error) = key_ring.accept_key(envelope.key_id, now) {
+            self.stats.key_rejected = self.stats.key_rejected.saturating_add(1);
+            return Err(PacketSecurityError::Key(error));
+        }
+        self.open_borrowed_with_scratch(envelope, scratch)
+    }
+
+    fn open_borrowed_owned(
+        &mut self,
+        envelope: PacketSecurityEnvelopeRef<'_>,
     ) -> Result<Vec<u8>, PacketSecurityError<A::Error, C::Error>> {
+        self.verify_and_accept(envelope)?;
+        let mut payload = envelope.payload.to_vec();
+        self.cipher
+            .open(envelope.key_id, envelope.nonce, &mut payload)
+            .map_err(PacketSecurityError::Cipher)?;
+        self.stats.opened = self.stats.opened.saturating_add(1);
+        Ok(payload)
+    }
+
+    fn open_borrowed_with_scratch<'a>(
+        &mut self,
+        envelope: PacketSecurityEnvelopeRef<'_>,
+        scratch: &'a mut PacketSecurityOpenScratch,
+    ) -> Result<PacketSecurityOpenView<'a>, PacketSecurityError<A::Error, C::Error>> {
+        self.verify_and_accept(envelope)?;
+        scratch.payload.clear();
+        scratch.payload.extend_from_slice(envelope.payload);
+        self.cipher
+            .open(envelope.key_id, envelope.nonce, &mut scratch.payload)
+            .map_err(PacketSecurityError::Cipher)?;
+        self.stats.opened = self.stats.opened.saturating_add(1);
+        Ok(PacketSecurityOpenView {
+            key_id: envelope.key_id,
+            nonce: envelope.nonce,
+            payload: &scratch.payload,
+        })
+    }
+
+    fn verify_and_accept(
+        &mut self,
+        envelope: PacketSecurityEnvelopeRef<'_>,
+    ) -> Result<(), PacketSecurityError<A::Error, C::Error>> {
         let verified = self
             .authenticator
             .verify(
                 envelope.key_id,
                 envelope.nonce,
-                &envelope.payload,
-                &envelope.tag,
+                envelope.payload,
+                envelope.tag,
             )
             .map_err(PacketSecurityError::Authenticator)?;
         if !verified {
@@ -1217,12 +1342,7 @@ where
                 nonce: envelope.nonce,
             });
         }
-        let mut payload = envelope.payload;
-        self.cipher
-            .open(envelope.key_id, envelope.nonce, &mut payload)
-            .map_err(PacketSecurityError::Cipher)?;
-        self.stats.opened = self.stats.opened.saturating_add(1);
-        Ok(payload)
+        Ok(())
     }
 
     fn allocate_nonce(&mut self, key_id: u32) -> u64 {
@@ -1266,9 +1386,9 @@ impl<'a> SecurityCursor<'a> {
         Ok(out)
     }
 
-    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, PacketSecurityDecodeError> {
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], PacketSecurityDecodeError> {
         self.require(len)?;
-        let bytes = self.input[self.offset..self.offset + len].to_vec();
+        let bytes = &self.input[self.offset..self.offset + len];
         self.offset += len;
         Ok(bytes)
     }
@@ -3995,17 +4115,25 @@ mod tests {
         envelope
             .encode(config, &mut bytes)
             .expect("envelope should encode");
-        let mut borrowed = Vec::new();
+        let mut borrowed_bytes = Vec::new();
         PacketSecurityEnvelope::encode_parts(
             config,
             envelope.key_id,
             envelope.nonce,
             &envelope.payload,
             &envelope.tag,
-            &mut borrowed,
+            &mut borrowed_bytes,
         )
         .expect("borrowed envelope should encode");
-        assert_eq!(borrowed, bytes);
+        assert_eq!(borrowed_bytes, bytes);
+        let borrowed = PacketSecurityEnvelopeRef::decode(config, &bytes)
+            .expect("borrowed envelope should decode");
+        assert_eq!(borrowed.key_id, envelope.key_id);
+        assert_eq!(borrowed.nonce, envelope.nonce);
+        assert_eq!(borrowed.payload, envelope.payload);
+        assert_eq!(borrowed.tag, envelope.tag);
+        assert!(borrowed.payload.as_ptr() >= bytes.as_ptr());
+        assert!(borrowed.tag.as_ptr() >= borrowed.payload.as_ptr());
         assert_eq!(
             PacketSecurityEnvelope::decode(config, &bytes).expect("envelope should decode"),
             envelope
@@ -4130,7 +4258,6 @@ mod tests {
             TestAuthenticator,
             PlaintextPacketCipher,
         );
-
         let sealed = sender.seal(7, b"command").expect("packet should seal");
         assert_eq!(sender.stats().sealed, 1);
         let opened = receiver.open(&sealed).expect("packet should open");
@@ -4208,6 +4335,57 @@ mod tests {
     }
 
     #[test]
+    fn packet_security_open_scratch_matches_owned_reuses_and_preserves_failed_input() {
+        let config = PacketSecurityConfig::default();
+        let mut sender = PacketSecurityBox::new(config, TestAuthenticator, PlaintextPacketCipher);
+        let first = sender
+            .seal_with_nonce(7, 10, b"first-command")
+            .expect("first packet should seal");
+        let second = sender
+            .seal_with_nonce(7, 11, b"second-command")
+            .expect("second packet should seal");
+        let mut owned_receiver =
+            PacketSecurityBox::new(config, TestAuthenticator, PlaintextPacketCipher);
+        let expected = owned_receiver
+            .open(&first)
+            .expect("owned packet should open");
+
+        let mut receiver = PacketSecurityBox::new(config, TestAuthenticator, PlaintextPacketCipher);
+        let mut scratch = PacketSecurityOpenScratch::with_capacity(32);
+        let first_ptr = {
+            let opened = receiver
+                .open_with_scratch(&first, &mut scratch)
+                .expect("scratch packet should open");
+            assert_eq!(opened.key_id, 7);
+            assert_eq!(opened.nonce, 10);
+            assert_eq!(opened.payload, expected);
+            opened.payload.as_ptr()
+        };
+        let retained = scratch.retained_payload_capacity();
+        let second_payload = {
+            let opened = receiver
+                .open_with_scratch(&second, &mut scratch)
+                .expect("second scratch packet should open");
+            assert_eq!(opened.payload.as_ptr(), first_ptr);
+            opened.payload.to_vec()
+        };
+        assert_eq!(second_payload, b"second-command");
+        assert_eq!(scratch.retained_payload_capacity(), retained);
+        assert_eq!(receiver.stats().opened, 2);
+
+        let before_failure = scratch.payload.clone();
+        let mut tampered = sender
+            .seal_with_nonce(7, 12, b"tampered")
+            .expect("tampered source should seal");
+        tampered[PACKET_SECURITY_HEADER_BYTES] ^= 0x55;
+        assert!(matches!(
+            receiver.open_with_scratch(&tampered, &mut scratch),
+            Err(PacketSecurityError::AuthenticationFailed { .. })
+        ));
+        assert_eq!(scratch.payload, before_failure);
+    }
+
+    #[test]
     fn packet_security_box_uses_key_ring_for_rotation_policy() {
         let mut sender_ring = PacketKeyRing::default();
         let mut receiver_ring = PacketKeyRing::default();
@@ -4228,6 +4406,7 @@ mod tests {
             TestAuthenticator,
             PlaintextPacketCipher,
         );
+        let mut open_scratch = PacketSecurityOpenScratch::with_capacity(16);
 
         let sealed = sender
             .seal_with_key_ring(&sender_ring, b"command", Tick::new(10))
@@ -4237,8 +4416,14 @@ mod tests {
         assert_eq!(envelope.key_id, 7);
         assert_eq!(
             receiver
-                .open_with_key_ring(&receiver_ring, &sealed, Tick::new(10))
-                .expect("packet should open through accepted key"),
+                .open_with_key_ring_and_scratch(
+                    &receiver_ring,
+                    &sealed,
+                    Tick::new(10),
+                    &mut open_scratch,
+                )
+                .expect("packet should open through accepted key")
+                .payload,
             b"command"
         );
 
@@ -4260,8 +4445,14 @@ mod tests {
         assert_eq!(rotated_envelope.key_id, 8);
         assert_eq!(
             receiver
-                .open_with_key_ring(&receiver_ring, &rotated, Tick::new(11))
-                .expect("rotated packet should open"),
+                .open_with_key_ring_and_scratch(
+                    &receiver_ring,
+                    &rotated,
+                    Tick::new(11),
+                    &mut open_scratch,
+                )
+                .expect("rotated packet should open")
+                .payload,
             b"ack"
         );
 

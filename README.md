@@ -46,6 +46,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   all in-flight packets as concurrent reliable windows grow.
 - Packet security sealing supports caller-owned payload/tag scratch and borrowed
   envelope encoding while production algorithms and keys remain external.
+- Packet security opening supports borrowed envelope decoding and caller-owned
+  plaintext scratch for allocation-free steady-state receive output.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
@@ -188,6 +190,8 @@ cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
 cargo run -p sectorsync-bench --release --example security_seal_reuse
 cargo run -p sectorsync-bench --release --example security_seal_reuse -- --fresh-scratch
+cargo run -p sectorsync-bench --release --example security_open_reuse
+cargo run -p sectorsync-bench --release --example security_open_reuse -- --fresh-output
 cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan -- --collect-remove

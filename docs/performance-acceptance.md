@@ -757,6 +757,38 @@ versus 0.640 ms fresh, about a 34% reduction on this development host. Transport
 tests cover owned/borrowed byte equality, repeated pointer/capacity retention,
 automatic nonce reporting, payload/tag limits, and failure atomicity.
 
+## Packet Security Open Scratch Measurement
+
+`PacketSecurityEnvelopeRef::decode` validates the bounded wire envelope while
+borrowing its payload and tag. `PacketSecurityBox::open_with_scratch` and
+`open_with_key_ring_and_scratch` authenticate those borrowed slices and reuse a
+caller-owned `PacketSecurityOpenScratch` for decrypted plaintext. Compatible
+owned opening remains available when the result must move or outlive scratch.
+
+Compare reusable output with the compatible owned path using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example security_open_reuse
+cargo run --release -q -p sectorsync-bench --example security_open_reuse -- --fresh-output
+```
+
+The default workload opens 2,000 packets per tick with 1 KiB payloads for ten
+ticks. Guards cap 4,000 packets per tick, 4 KiB payloads, and 20 ticks without
+`--allow-heavy`; execution has a 10-second budget. The illustrative fixed tag
+and `PlaintextPacketCipher` isolate framework buffer cost and are not production
+cryptography or algorithm-throughput measurements.
+
+Five alternating release A/B runs each produced 20,000 packets, `20,480,000`
+opened payload bytes, and a `3,600,000` checksum. Reusable opening created zero
+fresh outputs and retained 1,024 plaintext bytes; the owned comparison created
+20,000 fresh output Vecs. Median tick p99 was 0.083 ms reusable versus 0.331 ms
+owned, about a 75% reduction on this development host. Individual runs showed
+host scheduling variance, so allocation count and workload equality are the
+portable acceptance signals; timings are local evidence only. Transport tests
+cover borrowed offsets and limits, owned/scratch output equality, repeated
+pointer/capacity retention, key-ring opening, replay order, and authenticated
+failure behavior.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

@@ -6,8 +6,8 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_transport::{
     ClientTransportLimits, InMemoryTransportHub, OutboundPacket, PacketAuthenticator, PacketCipher,
-    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, PacketSecurityScratch,
-    TransportReceiver, TransportSink,
+    PacketSecurityBox, PacketSecurityConfig, PacketSecurityError, PacketSecurityOpenScratch,
+    PacketSecurityScratch, TransportReceiver, TransportSink,
 };
 use sectorsync_wire::{
     BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame, CommandFrame, FrameDecoder,
@@ -45,6 +45,8 @@ fn main() {
         security_config.max_payload_bytes,
         security_config.max_tag_bytes,
     );
+    let mut open_scratch =
+        PacketSecurityOpenScratch::with_capacity(security_config.max_payload_bytes);
 
     let command = CommandFrame {
         client_id,
@@ -83,10 +85,10 @@ fn main() {
     assert_eq!(inbound.client_id, Some(client_id));
     let sealed_command = inbound.bytes.clone();
     let opened_command = server_security
-        .open(&inbound.bytes)
+        .open_with_scratch(&inbound.bytes, &mut open_scratch)
         .expect("server should open secure command");
     let RuntimeFrame::Command(command) = BinaryFrameDecoder
-        .decode(&opened_command)
+        .decode(opened_command.payload)
         .expect("server should decode command")
     else {
         panic!("expected command frame");
@@ -149,10 +151,10 @@ fn main() {
         .expect("secure ACK should exist");
     assert_eq!(inbound_ack.client_id, Some(server_id));
     let opened_ack = client_security
-        .open(&inbound_ack.bytes)
+        .open_with_scratch(&inbound_ack.bytes, &mut open_scratch)
         .expect("client should open secure ACK");
     let decoded_ack = BinaryFrameDecoder
-        .decode(&opened_ack)
+        .decode(opened_ack.payload)
         .expect("client should decode ACK");
     assert_eq!(decoded_ack, RuntimeFrame::CommandAck(ack));
 

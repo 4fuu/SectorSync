@@ -3,10 +3,11 @@
 use sectorsync_core::prelude::Tick;
 use sectorsync_transport::{
     PacketAuthenticator, PacketKeyRing, PacketKeyRingConfig, PacketKeyRingError, PacketSecurityBox,
-    PacketSecurityConfig, PacketSecurityEnvelope, PacketSecurityError, PacketSecurityScratch,
-    PlaintextPacketCipher,
+    PacketSecurityConfig, PacketSecurityEnvelope, PacketSecurityError, PacketSecurityOpenScratch,
+    PacketSecurityScratch, PlaintextPacketCipher,
 };
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let config = PacketSecurityConfig {
         max_payload_bytes: 256,
@@ -26,6 +27,7 @@ fn main() {
     let mut receiver = PacketSecurityBox::new(config, ExampleAuthenticator, PlaintextPacketCipher);
     let mut seal_scratch =
         PacketSecurityScratch::with_capacity(config.max_payload_bytes, config.max_tag_bytes);
+    let mut open_scratch = PacketSecurityOpenScratch::with_capacity(config.max_payload_bytes);
 
     let mut first_packet = Vec::with_capacity(256);
     sender
@@ -41,9 +43,14 @@ fn main() {
         .expect("first packet should decode")
         .key_id;
     let opened_first = receiver
-        .open_with_key_ring(&receiver_ring, &first_packet, Tick::new(10))
+        .open_with_key_ring_and_scratch(
+            &receiver_ring,
+            &first_packet,
+            Tick::new(10),
+            &mut open_scratch,
+        )
         .expect("first packet should open");
-    assert_eq!(opened_first, b"client-command");
+    assert_eq!(opened_first.payload, b"client-command");
 
     sender_ring
         .insert_active(200, Tick::new(20), 10)
@@ -72,17 +79,27 @@ fn main() {
         .expect("rotated packet should decode")
         .key_id;
     let opened_rotated = receiver
-        .open_with_key_ring(&receiver_ring, &rotated_packet, Tick::new(20))
+        .open_with_key_ring_and_scratch(
+            &receiver_ring,
+            &rotated_packet,
+            Tick::new(20),
+            &mut open_scratch,
+        )
         .expect("rotated packet should open");
-    assert_eq!(opened_rotated, b"server-ack");
+    assert_eq!(opened_rotated.payload, b"server-ack");
 
     let old_but_retiring = sender
         .seal_with_nonce(100, 99, b"late-old-key-packet")
         .expect("explicit old-key packet should seal");
     let opened_old = receiver
-        .open_with_key_ring(&receiver_ring, &old_but_retiring, Tick::new(21))
+        .open_with_key_ring_and_scratch(
+            &receiver_ring,
+            &old_but_retiring,
+            Tick::new(21),
+            &mut open_scratch,
+        )
         .expect("retiring key should still receive");
-    assert_eq!(opened_old, b"late-old-key-packet");
+    assert_eq!(opened_old.payload, b"late-old-key-packet");
 
     receiver_ring
         .revoke(100)
