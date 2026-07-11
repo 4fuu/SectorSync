@@ -86,14 +86,24 @@ fn main() {
     let mut receive_bridge = ReplicationReceiveBridge::new(
         ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
     );
-    let pump = receive_bridge
-        .pump(&mut client_transport, 4)
-        .expect("replication should receive");
-    assert_eq!(pump.frames_received(), 1);
-    let frame = &pump.frames[0];
-    assert_eq!(frame.client_id, client_id);
-    assert_eq!(frame.entities.len(), 1);
-    assert_eq!(frame.entities[0].components.len(), 1);
+    let mut entities = 0_usize;
+    let mut received_components = 0_usize;
+    let visit = receive_bridge
+        .pump_visit(&mut client_transport, 4, |frame| {
+            assert_eq!(frame.client_id, client_id);
+            for entity in frame.entities() {
+                entities = entities.saturating_add(1);
+                for component in entity.components() {
+                    assert_eq!(component.bytes, 100_u32.to_le_bytes());
+                    received_components = received_components.saturating_add(1);
+                }
+            }
+            Ok::<_, core::convert::Infallible>(())
+        })
+        .expect("replication should receive and visit");
+    assert_eq!(visit.frames_received, 1);
+    assert_eq!(entities, 1);
+    assert_eq!(received_components, 1);
 
     println!(
         "replication_bridge sent={} recv={} bytes={} selected={} entities={} components={}",
@@ -101,7 +111,7 @@ fn main() {
         receive_bridge.stats().frames_received,
         bridge.stats().bytes_sent,
         report.selected_entities,
-        pump.entities_received(),
-        pump.components_received()
+        visit.entities_received,
+        visit.components_received
     );
 }

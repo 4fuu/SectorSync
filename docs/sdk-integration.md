@@ -196,6 +196,14 @@ mutated independently of that packet. Use `FrameDecoder::decode` or
 across that lifetime boundary. Source/target validation and application of
 component semantics remain caller responsibilities on this low-level path.
 
+`ReplicationReceiveBridge::pump_visit` combines that borrowed decoding with the
+bridge's expected-source, frame-target, and accumulated-statistics checks. The
+fallible visitor can apply components directly to caller-owned client state;
+`ReplicationReceiveVisitError` keeps visitor failures distinct from transport
+and validation failures. Accepted-frame statistics are recorded before visitor
+invocation and are not rolled back on an application error. Use the compatible
+owned `pump` when frames must be queued, replayed, or transferred.
+
 For synchronous UDP receive loops, `UdpTransport::try_recv_ref` and
 `UdpStationTransport::try_recv_station_ref` expose bytes from each adapter's
 configured reusable datagram buffer. Consume and decode the view before the

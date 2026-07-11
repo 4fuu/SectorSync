@@ -33,6 +33,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   buffer growth, while sparse frames conservatively retain normal allocation.
 - Replication receivers can iterate fully validated borrowed entity/component
   views without materializing nested owned frame or payload buffers.
+- Replication receive bridges can visit borrowed frames immediately with
+  separate propagation of transport/validation and caller application errors.
 - Bounded command, event, client packet, and station packet queues.
 - Gateway session expiry uses one allocation-free ordered-map retain scan.
 - Deployment stale-node marking updates state and route epochs in one
@@ -178,6 +180,8 @@ cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --release --example replication_decode_borrowed
 cargo run -p sectorsync-bench --release --example replication_decode_borrowed -- --owned
+cargo run -p sectorsync-bench --release --example replication_receive_visit
+cargo run -p sectorsync-bench --release --example replication_receive_visit -- --owned
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example load_sampling
 cargo run -p sectorsync-bench --release --example load_sampling_reuse

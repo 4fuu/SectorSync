@@ -27,7 +27,7 @@ use sectorsync_wire::{
     BarrierFrame, BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder,
     CommandAckFrame, CommandDispatchFrame, CommandFrame, ComponentSelection, FrameDecoder,
     FrameEncoder, ReplicationFrame, ReplicationFrameBuildStats, ReplicationFrameBuilder,
-    RuntimeFrame, StationEventFrame,
+    ReplicationFrameRef, ReplicationFrameRefDecodeError, RuntimeFrame, StationEventFrame,
 };
 
 pub use deployment::{
@@ -564,6 +564,21 @@ impl ReplicationReceivePump {
     }
 }
 
+/// Allocation-free summary from visiting replication packets immediately.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationReceiveVisitReport {
+    /// Packets consumed from client transport.
+    pub packets_received: usize,
+    /// Bytes consumed from client transport.
+    pub bytes_received: usize,
+    /// Replication frames accepted and passed to the visitor.
+    pub frames_received: usize,
+    /// Entity deltas observed across accepted frames.
+    pub entities_received: usize,
+    /// Component deltas observed across accepted frames.
+    pub components_received: usize,
+}
+
 /// Error produced while receiving replication frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicationReceiveError<E> {
@@ -629,6 +644,39 @@ where
 impl<E> From<BinaryDecodeError> for ReplicationReceiveError<E> {
     fn from(value: BinaryDecodeError) -> Self {
         Self::Decode(value)
+    }
+}
+
+/// Error produced while visiting borrowed replication frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicationReceiveVisitError<T, V> {
+    /// Packet receive, validation, or frame decoding failed.
+    Receive(ReplicationReceiveError<T>),
+    /// The caller-provided frame visitor failed.
+    Visitor(V),
+}
+
+impl<T: core::fmt::Display, V: core::fmt::Display> core::fmt::Display
+    for ReplicationReceiveVisitError<T, V>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Receive(error) => error.fmt(f),
+            Self::Visitor(error) => write!(f, "replication frame visitor failed: {error}"),
+        }
+    }
+}
+
+impl<T, V> std::error::Error for ReplicationReceiveVisitError<T, V>
+where
+    T: std::error::Error + 'static,
+    V: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Receive(error) => Some(error),
+            Self::Visitor(error) => Some(error),
+        }
     }
 }
 
@@ -739,6 +787,96 @@ impl ReplicationReceiveBridge {
             pump.frames.push(frame);
         }
         Ok(pump)
+    }
+
+    /// Receives validated replication frames and visits borrowed deltas without
+    /// materializing nested owned frame storage.
+    ///
+    /// The visitor must consume borrowed component bytes before returning. Its
+    /// error is surfaced separately from transport and frame-validation errors.
+    /// A frame is counted as accepted after source/wire/target validation and
+    /// before visitor invocation; accumulated bridge statistics are not rolled
+    /// back when the visitor returns an error.
+    pub fn pump_visit<T, F, V>(
+        &mut self,
+        transport: &mut T,
+        max_packets: usize,
+        mut visitor: F,
+    ) -> Result<ReplicationReceiveVisitReport, ReplicationReceiveVisitError<T::Error, V>>
+    where
+        T: TransportReceiver,
+        F: for<'frame> FnMut(ReplicationFrameRef<'frame>) -> Result<(), V>,
+    {
+        let mut report = ReplicationReceiveVisitReport::default();
+        for _ in 0..max_packets {
+            let Some(packet) = transport.try_recv().map_err(|error| {
+                ReplicationReceiveVisitError::Receive(ReplicationReceiveError::Transport(error))
+            })?
+            else {
+                break;
+            };
+            self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+            self.stats.bytes_received =
+                self.stats.bytes_received.saturating_add(packet.bytes.len());
+            report.packets_received = report.packets_received.saturating_add(1);
+            report.bytes_received = report.bytes_received.saturating_add(packet.bytes.len());
+
+            if let Some(expected) = self.config.expected_source
+                && packet.client_id != Some(expected)
+            {
+                self.stats.frames_rejected_source =
+                    self.stats.frames_rejected_source.saturating_add(1);
+                return Err(ReplicationReceiveVisitError::Receive(
+                    ReplicationReceiveError::SourceMismatch {
+                        expected,
+                        actual: packet.client_id,
+                    },
+                ));
+            }
+
+            let frame = match BinaryFrameDecoder.decode_replication_ref(&packet.bytes) {
+                Ok(frame) => frame,
+                Err(ReplicationFrameRefDecodeError::Binary(error)) => {
+                    self.stats.frames_rejected_decode =
+                        self.stats.frames_rejected_decode.saturating_add(1);
+                    return Err(ReplicationReceiveVisitError::Receive(
+                        ReplicationReceiveError::Decode(error),
+                    ));
+                }
+                Err(ReplicationFrameRefDecodeError::UnexpectedFrameKind(_)) => {
+                    self.stats.frames_rejected_unexpected =
+                        self.stats.frames_rejected_unexpected.saturating_add(1);
+                    return Err(ReplicationReceiveVisitError::Receive(
+                        ReplicationReceiveError::UnexpectedFrame,
+                    ));
+                }
+            };
+            if frame.client_id != self.config.client_id {
+                self.stats.frames_rejected_target =
+                    self.stats.frames_rejected_target.saturating_add(1);
+                return Err(ReplicationReceiveVisitError::Receive(
+                    ReplicationReceiveError::TargetMismatch {
+                        expected: self.config.client_id,
+                        actual: frame.client_id,
+                    },
+                ));
+            }
+
+            let entities = frame.encoded_entity_count();
+            let components = frame
+                .entities()
+                .map(sectorsync_wire::EntityDeltaRef::encoded_component_count)
+                .sum::<usize>();
+            self.stats.frames_received = self.stats.frames_received.saturating_add(1);
+            self.stats.entities_received = self.stats.entities_received.saturating_add(entities);
+            self.stats.components_received =
+                self.stats.components_received.saturating_add(components);
+            report.frames_received = report.frames_received.saturating_add(1);
+            report.entities_received = report.entities_received.saturating_add(entities);
+            report.components_received = report.components_received.saturating_add(components);
+            visitor(frame).map_err(ReplicationReceiveVisitError::Visitor)?;
+        }
+        Ok(report)
     }
 }
 
@@ -5419,7 +5557,10 @@ mod tests {
             .encode_replication(&frame, &mut bytes)
             .expect("replication should encode");
         server_transport
-            .send(OutboundPacket { client_id, bytes })
+            .send(OutboundPacket {
+                client_id,
+                bytes: bytes.clone(),
+            })
             .expect("replication packet should send");
 
         let mut receive = ReplicationReceiveBridge::new(
@@ -5438,6 +5579,51 @@ mod tests {
         assert_eq!(receive.stats().entities_received, 1);
         assert_eq!(receive.stats().components_received, 1);
         assert!(receive.stats().bytes_received > 0);
+
+        server_transport
+            .send(OutboundPacket {
+                client_id,
+                bytes: bytes.clone(),
+            })
+            .expect("visitor packet should send");
+        let mut visited_payload = 0_u32;
+        let visit = receive
+            .pump_visit(&mut client_transport, 4, |borrowed| {
+                assert_eq!(borrowed.client_id, client_id);
+                for entity in borrowed.entities() {
+                    assert_eq!(entity.entity_id, EntityId::new(100));
+                    for component in entity.components() {
+                        visited_payload = u32::from_le_bytes(
+                            component
+                                .bytes
+                                .try_into()
+                                .expect("health payload should be four bytes"),
+                        );
+                    }
+                }
+                Ok::<_, core::convert::Infallible>(())
+            })
+            .expect("borrowed replication packet should visit");
+        assert_eq!(visited_payload, 100);
+        assert_eq!(visit.packets_received, 1);
+        assert_eq!(visit.frames_received, 1);
+        assert_eq!(visit.entities_received, 1);
+        assert_eq!(visit.components_received, 1);
+
+        server_transport
+            .send(OutboundPacket { client_id, bytes })
+            .expect("visitor failure packet should send");
+        let error = receive
+            .pump_visit(&mut client_transport, 4, |_| Err("apply failed"))
+            .expect_err("visitor failure should surface separately");
+        assert!(matches!(
+            error,
+            ReplicationReceiveVisitError::Visitor("apply failed")
+        ));
+        assert_eq!(receive.stats().packets_received, 3);
+        assert_eq!(receive.stats().frames_received, 3);
+        assert_eq!(receive.stats().entities_received, 3);
+        assert_eq!(receive.stats().components_received, 3);
     }
 
     #[test]

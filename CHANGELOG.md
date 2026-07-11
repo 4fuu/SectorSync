@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Replication receive bridges now offer fallible borrowed-frame visitors that
+  preserve source/target validation and cumulative statistics while avoiding
+  nested owned frame materialization for immediate client-world application.
 - Replication wire decoding now offers fully validated borrowed frame, entity,
   component, and payload views for immediate allocation-free consumption while
   retaining a compatible single-pass owned `RuntimeFrame` decoder.

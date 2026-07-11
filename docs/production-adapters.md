@@ -76,6 +76,13 @@ requires an owned frame or application-owned copy. The specialized decoder
 validates the complete frame before exposing iterators but does not interpret
 game component schemas or update the client world.
 
+`ReplicationReceiveBridge::pump_visit` is the higher-level immediate-apply
+path when adapters still use `TransportReceiver`. It preserves bridge
+source/target checks and reports caller application failures separately.
+Visitor code must finish consuming borrowed bytes before returning and must not
+retain references in client state. Use owned pumping at queues, replay buffers,
+cross-thread handoff, and deferred-application boundaries.
+
 The explicit `PlaintextPacketCipher` is only appropriate when another trusted
 layer already provides confidentiality or for tests that need authentication
 framing alone.

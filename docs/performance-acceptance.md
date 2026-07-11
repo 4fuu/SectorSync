@@ -848,6 +848,35 @@ does not show a latency improvement. The portable benefit is removal of
 per-datagram owned payload allocation for immediate consumers, not a claim that
 UDP syscall latency decreases.
 
+## Replication Receive Visitor Measurement
+
+`ReplicationReceiveBridge::pump_visit` consumes transport packets, validates
+expected source and frame target, performs complete borrowed wire validation,
+updates bridge statistics, and invokes a fallible caller visitor without
+materializing nested owned replication frames. The compatible `pump` path
+returns owned frames for retention and transfer.
+
+Compare immediate visitor application with owned pumping using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example replication_receive_visit
+cargo run --release -q -p sectorsync-bench --example replication_receive_visit -- --owned
+```
+
+The default preloaded in-memory workload receives 100 frames per tick for ten
+ticks. Each frame has 64 entities, four components per entity, and 64 payload
+bytes per component. Guards cap 500 frames per tick, 256 entities, eight
+components, 1 KiB payloads, 20 ticks, and 64 MiB aggregate payload work without
+`--allow-heavy`; execution has a 10-second budget.
+
+Five alternating release A/B runs each accepted 1,000 packets/frames, 64,000
+entities, 256,000 components, and `16,384,000` payload bytes with a `46,080,000`
+checksum. Visitor receive materialized zero owned frames; owned pumping
+materialized 1,000. Median tick p99 was 1.539 ms visitor versus 4.220 ms owned,
+about a 64% reduction on this development host. Identical bridge counters,
+workload/checksum, zero visitor materializations, visitor-error propagation,
+and complete source/wire/target validation are the portable acceptance signals.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
