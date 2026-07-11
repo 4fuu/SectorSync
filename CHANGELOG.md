@@ -24,6 +24,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Station, spatial index, and sparse component columns support explicit capacity
   reservation, with retained-capacity signals and A/B coverage in the many-room
   benchmark.
+- Cell-index updates now skip allocation and index mutation when point entities
+  remain in the same cell, with an observable update result and guarded
+  many-room movement A/B coverage.
 
 ## [2026.7.10] - 2026-07-10
 

@@ -16,6 +16,7 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 ## Features
 
 - Uniform 3D cell indexing with deterministic AOI candidate queries.
+- Allocation-free point updates when an entity remains in its current cell.
 - Exactly one authoritative owner per entity and read-only ghost semantics.
 - Range, frustum, tag, cadence, priority, and byte-budget replication filters.
 - Reusable caller-owned query and replication scratch buffers.
@@ -220,9 +221,11 @@ The default run covers 500 rooms with 4-24 players each, one Station per 12
 players, eight entities per player, and eight measured sweeps. Use
 `--entities-per-room` to model entity counts independently from players, plus
 `--dirty-percent` and `--component-bytes` to vary actual delta pressure. The
-runner reports planning and encoding phase p99 values separately. This measures
-spatial planning and wire encoding, not gameplay, matchmaking, room lifecycle,
-persistence, or network capacity.
+runner reports planning, movement, and encoding phase p99 values separately.
+Use `--moving-percent` to exercise indexed entity movement;
+`--force-index-reinsert` exists only for an old-path A/B comparison. This
+measures spatial planning and wire encoding, not gameplay, matchmaking, room
+lifecycle, persistence, or network capacity.
 
 For explicit parallel planning, `ParallelReplicationScratch` retains at most one
 planning scratch lane per configured worker, not per Station batch. The

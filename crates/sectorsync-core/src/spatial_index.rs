@@ -16,6 +16,17 @@ pub struct CellOccupancy {
     pub entities: usize,
 }
 
+/// Result of inserting or updating one entity in a [`CellIndex`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellIndexUpdate {
+    /// The handle was not indexed and has been inserted.
+    Inserted,
+    /// The handle already occupied the same cells; index storage was untouched.
+    Unchanged,
+    /// The handle moved to a different set of cells.
+    Relocated,
+}
+
 /// Strategy used by the last scratch-backed cell query.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CellQueryStrategy {
@@ -192,12 +203,47 @@ impl CellIndex {
 
     /// Inserts or updates an entity in all cells touched by its bounds.
     pub fn upsert(&mut self, handle: EntityHandle, position: Position3, bounds: Bounds) {
-        self.remove(handle);
-        let cells = self.grid.cells_for_bounds(position, bounds);
+        self.upsert_tracked(handle, position, bounds);
+    }
+
+    /// Inserts or updates an entity and reports whether index membership changed.
+    pub fn upsert_tracked(
+        &mut self,
+        handle: EntityHandle,
+        position: Position3,
+        bounds: Bounds,
+    ) -> CellIndexUpdate {
+        let cells = if bounds == Bounds::Point {
+            let cell = self.grid.cell_at(position);
+            if self
+                .entity_cells
+                .get(&handle)
+                .is_some_and(|current| current.as_slice() == [cell])
+            {
+                return CellIndexUpdate::Unchanged;
+            }
+            vec![cell]
+        } else {
+            let cells = self.grid.cells_for_bounds(position, bounds);
+            if self
+                .entity_cells
+                .get(&handle)
+                .is_some_and(|current| current == &cells)
+            {
+                return CellIndexUpdate::Unchanged;
+            }
+            cells
+        };
+        let existed = self.remove(handle);
         for cell in &cells {
             self.cells.entry(*cell).or_default().push(handle);
         }
         self.entity_cells.insert(handle, cells);
+        if existed {
+            CellIndexUpdate::Relocated
+        } else {
+            CellIndexUpdate::Inserted
+        }
     }
 
     /// Removes an entity from the index.
@@ -377,6 +423,53 @@ mod tests {
         assert_eq!(
             index.query_sphere(Position3::new(1.0, 2.0, 3.0), 1.0),
             vec![handle]
+        );
+    }
+
+    #[test]
+    fn tracked_upsert_skips_same_cell_point_updates() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::with_capacity(grid, 1, 2);
+        let handle = EntityHandle::new(1, 0);
+        let first_cell = grid.cell_at(Position3::new(1.0, 2.0, 3.0));
+        let second_cell = grid.cell_at(Position3::new(11.0, 2.0, 3.0));
+
+        assert_eq!(
+            index.upsert_tracked(handle, Position3::new(1.0, 2.0, 3.0), Bounds::Point),
+            CellIndexUpdate::Inserted
+        );
+        let entity_capacity = index.entity_capacity();
+        let cell_capacity = index.occupied_cell_capacity();
+        assert_eq!(
+            index.upsert_tracked(handle, Position3::new(9.0, 2.0, 3.0), Bounds::Point),
+            CellIndexUpdate::Unchanged
+        );
+        assert_eq!(index.handles_in_cell_slice(first_cell), &[handle]);
+        assert_eq!(index.entity_capacity(), entity_capacity);
+        assert_eq!(index.occupied_cell_capacity(), cell_capacity);
+
+        assert_eq!(
+            index.upsert_tracked(handle, Position3::new(11.0, 2.0, 3.0), Bounds::Point),
+            CellIndexUpdate::Relocated
+        );
+        assert!(index.handles_in_cell_slice(first_cell).is_empty());
+        assert_eq!(index.handles_in_cell_slice(second_cell), &[handle]);
+    }
+
+    #[test]
+    fn tracked_upsert_skips_unchanged_multi_cell_bounds() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::new(grid);
+        let handle = EntityHandle::new(1, 0);
+        let bounds = Bounds::Sphere { radius: 2.0 };
+
+        assert_eq!(
+            index.upsert_tracked(handle, Position3::new(9.0, 0.0, 0.0), bounds),
+            CellIndexUpdate::Inserted
+        );
+        assert_eq!(
+            index.upsert_tracked(handle, Position3::new(9.5, 0.0, 0.0), bounds),
+            CellIndexUpdate::Unchanged
         );
     }
 

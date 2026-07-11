@@ -247,6 +247,21 @@ record slots versus 77,568 growth-based slots. Three alternating runs reported
 23.12-25.13 ms setup with preallocation and 24.24-28.01 ms without it; median
 setup fell from 25.85 ms to 24.15 ms.
 
+Use `--moving-percent` to move a deterministic share of indexed entities by a
+sub-cell offset on every sweep. The default SDK path detects unchanged cell
+membership before allocating or mutating index storage. The benchmark reports
+`index_updates_inserted`, `index_updates_unchanged`,
+`index_updates_relocated`, `movement_ms_p99`, and
+`threshold_same_cell_movement_ok`. `--force-index-reinsert` is a benchmark-only
+A/B mode that removes and reinserts each moving handle.
+
+For the 500-room, 4-10 player, 16-entities-per-player shape with 100% movement,
+447,232 same-cell index updates completed without reinsertion. Three alternating
+release A/B runs reported median movement p99 of 4.481 ms versus 17.534 ms with
+forced reinsertion, median sweep p99 of 21.697 ms versus 40.503 ms, and median
+total time of 160.631 ms versus 270.190 ms. These figures are local regression
+evidence; the counters and verdict establish which path actually ran.
+
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or
 matchmaking. Treat it as evidence for active-room spatial planning and encoding,
