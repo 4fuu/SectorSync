@@ -178,6 +178,12 @@ when current entries plus the entire plan length already fit under
 limit it retains the exact existing/new scan and fails before mutating any
 record. Applications should keep the tracker bound sized for their real
 client/entity horizon rather than relying on the fast path to weaken limits.
+Tracker record lookup also adapts automatically. It starts ordered for small
+client/entity sets and promotes once to hash storage when adding the 2,048th
+distinct key. Last-sent/ACK state, explicit client cleanup, tick pruning,
+capacity errors, and statistics survive migration. Promoted trackers remain
+hashed after pruning to avoid allocation churn around the threshold; tracker
+APIs expose keyed records rather than storage iteration order.
 
 For repeated security sealing, retain `PacketSecurityScratch` and call
 `seal_into`, `seal_with_nonce_into`, or `seal_with_key_ring_into`. The scratch

@@ -1,7 +1,8 @@
 //! Replication planning helpers.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 
 use crate::ids::{ClientId, EntityHandle, Tick};
 #[cfg(not(feature = "simd"))]
@@ -10,6 +11,93 @@ use crate::interest::{ViewerQuery, VisibilityFilter};
 use crate::policy::{CompiledSyncPolicy, PolicyTable};
 use crate::spatial_index::{CellIndex, CellQueryScratch, CellQueryStats, CellQueryStrategy};
 use crate::station::Station;
+
+const HASHED_REPLICATION_TRACKER_MIN_ENTRIES: usize = 2_048;
+
+#[derive(Clone, Debug)]
+enum AdaptiveTrackMap<K, V> {
+    Ordered(BTreeMap<K, V>),
+    Hashed(HashMap<K, V>),
+}
+
+impl<K: Copy + Eq + Hash + Ord, V> AdaptiveTrackMap<K, V> {
+    fn new() -> Self {
+        Self::Ordered(BTreeMap::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordered(entries) => entries.len(),
+            Self::Hashed(entries) => entries.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Ordered(entries) => entries.is_empty(),
+            Self::Hashed(entries) => entries.is_empty(),
+        }
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        match self {
+            Self::Ordered(entries) => entries.contains_key(key),
+            Self::Hashed(entries) => entries.contains_key(key),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self {
+            Self::Ordered(entries) => entries.get(key),
+            Self::Hashed(entries) => entries.get(key),
+        }
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        match self {
+            Self::Ordered(entries) => entries.get_mut(key),
+            Self::Hashed(entries) => entries.get_mut(key),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let promote = match self {
+            Self::Ordered(entries) => {
+                entries.len() >= HASHED_REPLICATION_TRACKER_MIN_ENTRIES.saturating_sub(1)
+                    && !entries.contains_key(&key)
+            }
+            Self::Hashed(_) => false,
+        };
+        if promote {
+            let Self::Ordered(ordered) = std::mem::replace(self, Self::Hashed(HashMap::new()))
+            else {
+                unreachable!("promotion starts from ordered tracker storage");
+            };
+            let mut hashed = HashMap::with_capacity(ordered.len().saturating_add(1));
+            hashed.extend(ordered);
+            *self = Self::Hashed(hashed);
+        }
+        match self {
+            Self::Ordered(entries) => entries.insert(key, value),
+            Self::Hashed(entries) => entries.insert(key, value),
+        }
+    }
+
+    fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        match self {
+            Self::Ordered(entries) => entries.retain(|key, value| keep(key, value)),
+            Self::Hashed(entries) => entries.retain(|key, value| keep(key, value)),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_hashed(&self) -> bool {
+        matches!(self, Self::Hashed(_))
+    }
+}
 
 /// Per-client replication budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,7 +393,7 @@ impl std::error::Error for ReplicationTrackerError {}
 #[derive(Clone, Debug)]
 pub struct ReplicationTracker {
     config: ReplicationTrackerConfig,
-    records: BTreeMap<ReplicationTrackKey, ReplicationTrackRecord>,
+    records: AdaptiveTrackMap<ReplicationTrackKey, ReplicationTrackRecord>,
     stats: ReplicationTrackerStats,
 }
 
@@ -320,7 +408,7 @@ impl ReplicationTracker {
     pub fn new(config: ReplicationTrackerConfig) -> Self {
         Self {
             config,
-            records: BTreeMap::new(),
+            records: AdaptiveTrackMap::new(),
             stats: ReplicationTrackerStats::default(),
         }
     }
@@ -2087,5 +2175,89 @@ mod tests {
         assert_eq!(tracker.last_sent(client_id, first), Some(Tick::new(2)));
         assert_eq!(tracker.last_sent(client_id, second), Some(Tick::new(2)));
         assert_eq!(tracker.get(client_id, third), None);
+    }
+
+    #[test]
+    fn replication_tracker_promotes_without_losing_ack_or_prune_state() {
+        let first_client = ClientId::new(1);
+        let second_client = ClientId::new(2);
+        let mut tracker = ReplicationTracker::new(ReplicationTrackerConfig {
+            max_entries: HASHED_REPLICATION_TRACKER_MIN_ENTRIES + 1,
+        });
+        let initial_entities: Vec<_> = (0..HASHED_REPLICATION_TRACKER_MIN_ENTRIES - 2)
+            .map(|index| {
+                EntityHandle::new(u32::try_from(index).expect("test entity index fits u32"), 1)
+            })
+            .collect();
+        tracker
+            .record_plan_sent(
+                first_client,
+                &ReplicationPlan {
+                    entities: initial_entities.clone(),
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(1),
+            )
+            .expect("initial records should fit");
+        let second_entity = EntityHandle::new(u32::MAX, 1);
+        tracker
+            .record_plan_sent(
+                second_client,
+                &ReplicationPlan {
+                    entities: vec![second_entity],
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(1),
+            )
+            .expect("second client record should fit");
+        assert!(!tracker.records.is_hashed());
+
+        let first_entity = initial_entities[0];
+        tracker
+            .record_plan_sent(
+                first_client,
+                &ReplicationPlan {
+                    entities: vec![first_entity],
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(2),
+            )
+            .expect("existing record should update without promotion");
+        assert!(!tracker.records.is_hashed());
+
+        let final_entity = EntityHandle::new(
+            u32::try_from(HASHED_REPLICATION_TRACKER_MIN_ENTRIES)
+                .expect("test entity index fits u32"),
+            1,
+        );
+        tracker
+            .record_plan_sent(
+                first_client,
+                &ReplicationPlan {
+                    entities: vec![final_entity],
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(2),
+            )
+            .expect("threshold record should promote");
+        assert!(tracker.records.is_hashed());
+        assert!(tracker.acknowledge(first_client, final_entity, Tick::new(3)));
+        assert_eq!(tracker.clear_client(second_client), 1);
+        assert!(tracker.records.is_hashed());
+        assert_eq!(
+            tracker.prune_sent_before(Tick::new(2)),
+            initial_entities.len() - 1
+        );
+        assert!(tracker.records.is_hashed());
+        assert_eq!(tracker.len(), 2);
+        assert_eq!(tracker.stats().entries, 2);
+        assert_eq!(tracker.stats().acked_records, 1);
+        assert_eq!(
+            tracker
+                .get(first_client, final_entity)
+                .expect("acked record should survive")
+                .last_acked,
+            Some(Tick::new(3))
+        );
     }
 }

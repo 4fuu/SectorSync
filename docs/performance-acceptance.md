@@ -807,6 +807,32 @@ calls/tick, ticks, and total updates unless `--allow-heavy` is present; output
 includes latency percentiles, call/update/probe/count/checksum fields, guard
 metadata, workload/capacity/time verdicts, and `benchmark_ok=true`.
 
+## Replication Tracker Map Measurement
+
+`ReplicationTracker` starts with ordered record storage and promotes once to a
+hash map when adding the 2,048th distinct client/entity key. The one-way
+transition preserves last-sent and ACK ticks, capacity accounting, explicit
+client cleanup, tick pruning, and cumulative statistics. Tracker APIs do not
+expose storage iteration order.
+
+Compare identical keyed reads and ACK-style updates using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example tracker_map_lookup
+cargo run --release -q -p sectorsync-bench --example tracker_map_lookup -- --btree
+```
+
+At ten records, seven release runs produced median p50 values of 0.771 ms for
+ordered lookup and 1.945 ms for hash lookup. At 1,024 records ordered lookup
+remained faster (1.861 ms versus 2.586 ms); at 2,048 records hash lookup was
+1.745 ms versus 2.120 ms ordered. At the default 4,096 records hash lookup was
+2.222 ms versus 3.923 ms, about a 43% reduction. Each run performs one million
+mixed reads and 125,000 ACK updates with identical final record counts and
+checksums. Guards cap records, operations/tick, ticks, and total operations
+unless `--allow-heavy` is present; output includes latency percentiles,
+operation/ACK/count/checksum fields, guard metadata, workload/count/time
+verdicts, and `benchmark_ok=true`.
+
 ## Station Registry Lookup Measurement
 
 `StationSet` and `StationIndexSet` retain deterministic Vec iteration while

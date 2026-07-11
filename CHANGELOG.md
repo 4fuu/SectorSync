@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Replication tracker records now retain ordered lookup for small sets and
+  promote once to hash lookup at 2,048 client/entity keys, preserving send,
+  ACK, cleanup, capacity, and statistics state across migration.
 - Replication tracking now accepts plans through an O(1) conservative capacity
   guard when the full plan fits in remaining capacity, falling back to the exact
   per-entity scan only near the configured bound.

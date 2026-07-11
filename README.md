@@ -251,6 +251,8 @@ cargo run -p sectorsync-bench --release --example bounded_dedup_index
 cargo run -p sectorsync-bench --release --example bounded_dedup_index -- --btree
 cargo run -p sectorsync-bench --release --example tracker_capacity_guard
 cargo run -p sectorsync-bench --release --example tracker_capacity_guard -- --exact-scan
+cargo run -p sectorsync-bench --release --example tracker_map_lookup
+cargo run -p sectorsync-bench --release --example tracker_map_lookup -- --btree
 cargo run -p sectorsync-bench --release --example event_drain_reuse
 cargo run -p sectorsync-bench --release --example event_drain_reuse -- --fresh-output
 cargo run -p sectorsync-bench --features parallel --example parallel_replication
