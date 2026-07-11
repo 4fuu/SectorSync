@@ -235,6 +235,8 @@ cargo run -p sectorsync-bench --release --example reliable_retry_reuse
 cargo run -p sectorsync-bench --release --example reliable_retry_reuse -- --fresh-scan
 cargo run -p sectorsync-bench --release --example reliable_window_lookup
 cargo run -p sectorsync-bench --release --example reliable_window_lookup -- --full-scan
+cargo run -p sectorsync-bench --release --example bounded_dedup_index
+cargo run -p sectorsync-bench --release --example bounded_dedup_index -- --btree
 cargo run -p sectorsync-bench --release --example event_drain_reuse
 cargo run -p sectorsync-bench --release --example event_drain_reuse -- --fresh-output
 cargo run -p sectorsync-bench --features parallel --example parallel_replication

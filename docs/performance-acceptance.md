@@ -725,6 +725,30 @@ reduction on this development host. Client and Station tests cover independent
 peer counts, ACK decrement, zero-count cleanup, timeout cleanup, send failure,
 window limits, and saturated-sequence replacement.
 
+## Bounded Duplicate Index Measurement
+
+Security replay and reliable Client/Station duplicate histories retain FIFO
+eviction but select their membership index from the configured bound. Histories
+below 256 entries use `BTreeSet`; histories of 256 or more use `HashSet` without
+preallocating the configured maximum at construction.
+
+Compare the hash and ordered index shapes with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example bounded_dedup_index
+cargo run --release -q -p sectorsync-bench --example bounded_dedup_index -- --btree
+```
+
+The default workload retains 4,096 keys and performs 1,000,000 mixed insert,
+evict, and duplicate lookup operations. Five release runs produced median p50
+values of 2.358 ms for hash lookup and 5.352 ms for ordered lookup on this
+development host, about a 56% reduction. At 16 retained keys, ordered lookup was
+faster (1.863 ms versus 2.855 ms); checks at 32, 64, 128, and 256 placed the
+observed crossover between 128 and 256, which defines the conservative switch
+threshold. Output retains operation conservation, retained count, checksum,
+latency percentiles, guard metadata, workload/time verdicts, and
+`benchmark_ok=true` as portable acceptance signals.
+
 ## Station Registry Lookup Measurement
 
 `StationSet` and `StationIndexSet` retain deterministic Vec iteration while

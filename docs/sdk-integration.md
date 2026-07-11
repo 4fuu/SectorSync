@@ -118,6 +118,11 @@ reliable header in place. This is automatic in `handle_inbound`; use
 inspecting frame bytes directly, and compatible owned `decode` only when the
 payload must be materialized independently. ACK ordering, duplicate suppression,
 source metadata, and bounded delivery history are unchanged.
+Duplicate histories and security replay windows select their lookup index from
+the configured bound automatically: capacities below 256 retain the compact
+ordered-set path, while capacities of 256 or more use hash lookup. No full-bound
+allocation occurs at construction, so applications should configure history for
+their actual retry/replay horizon rather than inflating it for performance.
 
 For repeated security sealing, retain `PacketSecurityScratch` and call
 `seal_into`, `seal_with_nonce_into`, or `seal_with_key_ring_into`. The scratch

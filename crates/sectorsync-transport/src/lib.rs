@@ -2,13 +2,79 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 
 use sectorsync_core::prelude::{ClientId, StationId, Tick};
+
+const HASHED_BOUNDED_SET_MIN_CAPACITY: usize = 256;
+
+#[derive(Clone, Debug)]
+enum BoundedLookupSet<K> {
+    Ordered(BTreeSet<K>),
+    Hashed(HashSet<K>),
+}
+
+impl<K: Copy + Eq + Hash + Ord> BoundedLookupSet<K> {
+    fn new(max_entries: usize) -> Self {
+        if max_entries >= HASHED_BOUNDED_SET_MIN_CAPACITY {
+            Self::Hashed(HashSet::new())
+        } else {
+            Self::Ordered(BTreeSet::new())
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordered(entries) => entries.len(),
+            Self::Hashed(entries) => entries.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Ordered(entries) => entries.is_empty(),
+            Self::Hashed(entries) => entries.is_empty(),
+        }
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        match self {
+            Self::Ordered(entries) => entries.contains(key),
+            Self::Hashed(entries) => entries.contains(key),
+        }
+    }
+
+    fn insert(&mut self, key: K) {
+        match self {
+            Self::Ordered(entries) => {
+                entries.insert(key);
+            }
+            Self::Hashed(entries) => {
+                entries.insert(key);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &K) {
+        match self {
+            Self::Ordered(entries) => {
+                entries.remove(key);
+            }
+            Self::Hashed(entries) => {
+                entries.remove(key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_hashed(&self) -> bool {
+        matches!(self, Self::Hashed(_))
+    }
+}
 
 /// Default maximum UDP datagram bytes read by `UdpTransport`.
 pub const DEFAULT_UDP_RECV_BUFFER_SIZE: usize = 16 * 1024;
@@ -884,7 +950,7 @@ impl PacketCipher for PlaintextPacketCipher {
 #[derive(Clone, Debug)]
 pub struct PacketReplayWindow {
     max_seen: usize,
-    seen: BTreeSet<(u32, u64)>,
+    seen: BoundedLookupSet<(u32, u64)>,
     order: VecDeque<(u32, u64)>,
 }
 
@@ -893,7 +959,7 @@ impl PacketReplayWindow {
     pub fn new(max_seen: usize) -> Self {
         Self {
             max_seen,
-            seen: BTreeSet::new(),
+            seen: BoundedLookupSet::new(max_seen),
             order: VecDeque::new(),
         }
     }
@@ -2335,7 +2401,7 @@ impl Default for ReliableClientSender {
 #[derive(Clone, Debug)]
 pub struct ReliableClientReceiver {
     config: ReliableClientConfig,
-    delivered: BTreeSet<(ClientId, u64)>,
+    delivered: BoundedLookupSet<(ClientId, u64)>,
     delivered_order: VecDeque<(ClientId, u64)>,
     stats: ReliableClientStats,
 }
@@ -2345,7 +2411,7 @@ impl ReliableClientReceiver {
     pub fn new(config: ReliableClientConfig) -> Self {
         Self {
             config,
-            delivered: BTreeSet::new(),
+            delivered: BoundedLookupSet::new(config.max_delivered_history),
             delivered_order: VecDeque::new(),
             stats: ReliableClientStats::default(),
         }
@@ -3119,7 +3185,7 @@ impl Default for ReliableStationSender {
 #[derive(Clone, Debug)]
 pub struct ReliableStationReceiver {
     config: ReliableStationConfig,
-    delivered: BTreeSet<(StationId, u64)>,
+    delivered: BoundedLookupSet<(StationId, u64)>,
     delivered_order: VecDeque<(StationId, u64)>,
     stats: ReliableStationStats,
 }
@@ -3129,7 +3195,7 @@ impl ReliableStationReceiver {
     pub fn new(config: ReliableStationConfig) -> Self {
         Self {
             config,
-            delivered: BTreeSet::new(),
+            delivered: BoundedLookupSet::new(config.max_delivered_history),
             delivered_order: VecDeque::new(),
             stats: ReliableStationStats::default(),
         }
@@ -4743,6 +4809,25 @@ mod tests {
         assert_eq!(replay.len(), 2);
         assert!(!replay.contains(1, 1));
         assert!(replay.accept(1, 1));
+    }
+
+    #[test]
+    fn bounded_duplicate_indexes_adapt_to_configured_capacity() {
+        let ordered = PacketReplayWindow::new(HASHED_BOUNDED_SET_MIN_CAPACITY - 1);
+        let hashed = PacketReplayWindow::new(HASHED_BOUNDED_SET_MIN_CAPACITY);
+        assert!(!ordered.seen.is_hashed());
+        assert!(hashed.seen.is_hashed());
+
+        let client = ReliableClientReceiver::new(ReliableClientConfig {
+            max_delivered_history: HASHED_BOUNDED_SET_MIN_CAPACITY,
+            ..ReliableClientConfig::default()
+        });
+        let station = ReliableStationReceiver::new(ReliableStationConfig {
+            max_delivered_history: HASHED_BOUNDED_SET_MIN_CAPACITY,
+            ..ReliableStationConfig::default()
+        });
+        assert!(client.delivered.is_hashed());
+        assert!(station.delivered.is_hashed());
     }
 
     #[test]

@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Security replay and reliable Client/Station duplicate-suppression windows now
+  choose their bounded lookup index from configured capacity: compact ordered
+  sets for small histories and faster hash lookup for histories of 256 or more.
 - Client transport bridges now offer one fallible mixed-frame visitor pump for
   ACK, borrowed replication, and barrier frames without nested replication
   materialization; owned mixed pumping remains compatible.
