@@ -48,4 +48,4 @@ pub use crate::spatial::{Aabb3, Bounds, CellCoord3, Frustum3, GridSpec, Plane3, 
 pub use crate::spatial_index::{
     CellIndex, CellIndexUpdate, CellOccupancy, CellQueryScratch, CellQueryStats, CellQueryStrategy,
 };
-pub use crate::station::{Station, StationConfig, StationError};
+pub use crate::station::{Station, StationConfig, StationError, StationRestoreStats};

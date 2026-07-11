@@ -10,6 +10,8 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Station restore now preallocates record, generation, and entity-id index
+  storage from snapshot size and offers tracked capacity observations.
 - Station and frozen barrier snapshot export now support caller-owned reusable
   entity buffers and Station slots while retaining compatible owned snapshots.
 - Split schedule execution now offers reusable ownership-update, nested

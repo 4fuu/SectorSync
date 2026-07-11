@@ -253,6 +253,12 @@ snapshot APIs when data must be moved into an upgrade hook, persistence adapter,
 or longer-lived queue. SectorSync still owns only the frozen in-memory snapshot,
 not durable storage or recovery policy.
 
+`Station::restore` automatically sizes record, generation, and entity-id index
+storage from the migrated snapshot before insertion. Use `restore_tracked` only
+when the integration needs `StationRestoreStats` for capacity telemetry or
+acceptance checks; both APIs preserve the same validation and restored state.
+The upgrade executor uses the preallocated path automatically.
+
 SectorSync does not load scripts or decide whether the game should use seamless
 or visible paused updates.
 

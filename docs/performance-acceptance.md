@@ -1023,6 +1023,33 @@ counts, checksums, barrier metrics, zero fresh batches, and retained nested
 capacity are the portable acceptance signals; host timings are directional
 rather than universal.
 
+## Multi-Room Station Restore Capacity Measurement
+
+`Station::restore` constructs record, generation, and entity-id lookup storage
+with the snapshot entity count before inserting records. `restore_tracked`
+returns the same Station plus `StationRestoreStats` so integrations and the
+benchmark can verify initial/final capacities and growth behavior directly.
+
+Run the guarded restore measurement using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example station_restore_capacity
+```
+
+The default preloaded workload restores 20 rooms with 512 entities each for
+ten batches. All consumed snapshot copies are built before timing. Guards cap
+100 rooms, 2,000 entities per room, 20 ticks, and 500,000 aggregate entity
+restores without `--allow-heavy`; execution has a 10-second budget.
+
+Five release runs each restored 200 Stations and 102,400 entities. Preallocated
+restore reported zero initial record/index capacity shortfalls and zero
+record/index growth events. A temporary local comparison using the previous
+zero-capacity constructor reported 200 shortfalls and 200 growth events in both
+storage classes. Median tick p99 was effectively neutral at 1.031 ms
+preallocated versus 1.026 ms previous, so no latency improvement is claimed.
+Zero growth, exact Station/entity counts, checksum stability, capacity totals,
+guard metadata, and `benchmark_ok=true` are the portable acceptance signals.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

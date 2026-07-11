@@ -35,6 +35,25 @@ pub struct Station {
     by_id: HashMap<EntityId, EntityHandle>,
 }
 
+/// Capacity observations from restoring one Station snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StationRestoreStats {
+    /// Entity records requested by the snapshot.
+    pub snapshot_entities: usize,
+    /// Record-slot capacity available before inserting snapshot entities.
+    pub initial_entity_capacity: usize,
+    /// Entity-id index capacity available before inserting snapshot entities.
+    pub initial_id_index_capacity: usize,
+    /// Record-slot capacity after all snapshot entities were inserted.
+    pub final_entity_capacity: usize,
+    /// Entity-id index capacity after all snapshot entities were inserted.
+    pub final_id_index_capacity: usize,
+    /// Whether record/generation storage grew during insertion.
+    pub entity_capacity_grew: bool,
+    /// Whether the entity-id index grew during insertion.
+    pub id_index_capacity_grew: bool,
+}
+
 impl Station {
     /// Creates an empty station.
     pub fn new(config: StationConfig) -> Self {
@@ -444,6 +463,14 @@ impl Station {
 
     /// Restores station state from a snapshot.
     pub fn restore(config: StationConfig, snapshot: StationSnapshot) -> Result<Self, StationError> {
+        Self::restore_tracked(config, snapshot).map(|(station, _)| station)
+    }
+
+    /// Restores station state and reports capacity behavior during insertion.
+    pub fn restore_tracked(
+        config: StationConfig,
+        snapshot: StationSnapshot,
+    ) -> Result<(Self, StationRestoreStats), StationError> {
         if snapshot.meta.station_id != config.station_id {
             return Err(StationError::SnapshotStationMismatch {
                 expected: config.station_id,
@@ -451,7 +478,10 @@ impl Station {
             });
         }
 
-        let mut station = Self::new(config);
+        let entity_count = snapshot.entities.len();
+        let mut station = Self::with_capacity(config, entity_count);
+        let initial_entity_capacity = station.entity_capacity();
+        let initial_id_index_capacity = station.id_index_capacity();
         station.tick = snapshot.meta.tick;
         station.owner_epoch = snapshot.meta.owner_epoch;
 
@@ -464,7 +494,16 @@ impl Station {
             station.insert_allocated(handle, record);
         }
 
-        Ok(station)
+        let stats = StationRestoreStats {
+            snapshot_entities: entity_count,
+            initial_entity_capacity,
+            initial_id_index_capacity,
+            final_entity_capacity: station.entity_capacity(),
+            final_id_index_capacity: station.id_index_capacity(),
+            entity_capacity_grew: station.entity_capacity() > initial_entity_capacity,
+            id_index_capacity_grew: station.id_index_capacity() > initial_id_index_capacity,
+        };
+        Ok((station, stats))
     }
 
     fn allocate_handle(&mut self) -> EntityHandle {
@@ -650,9 +689,17 @@ mod tests {
         assert_eq!(reusable, snapshot);
         assert_eq!(reusable.entities.as_ptr(), retained_pointer);
         assert_eq!(reusable.entities.capacity(), retained_capacity);
-        let restored = Station::restore(config(), snapshot).expect("restore should work");
+        let (restored, restore_stats) =
+            Station::restore_tracked(config(), snapshot).expect("restore should work");
 
         assert_eq!(restored.len(), 1);
+        assert!(restored.entity_capacity() >= 1);
+        assert!(restored.id_index_capacity() >= 1);
+        assert_eq!(restore_stats.snapshot_entities, 1);
+        assert!(restore_stats.initial_entity_capacity >= 1);
+        assert!(restore_stats.initial_id_index_capacity >= 1);
+        assert!(!restore_stats.entity_capacity_grew);
+        assert!(!restore_stats.id_index_capacity_grew);
         assert_eq!(restored.tick(), Tick::new(1));
         assert_eq!(
             restored

@@ -61,6 +61,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
 - Frozen multi-Station snapshots can retain Station slots and entity-record
   capacity across repeated in-memory exports.
+- Snapshot restore preallocates Station entity/index storage and can report
+  whether either capacity grew during insertion.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
 - Cell migration scans borrowed index membership and supports caller-owned
