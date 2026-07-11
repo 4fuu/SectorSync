@@ -99,6 +99,9 @@ directly into the owned transport packet and do not clone the in-flight payload.
 The compatibility `retry_due` API remains appropriate for occasional retries.
 Transport failure leaves attempts unchanged; timeout and retry order remain
 bounded by the configured window, interval, and attempt limits.
+`in_flight_for` and send-window admission use an active-peer count index instead
+of scanning all packets. ACK and timeout removal update that index immediately;
+the final packet for a peer also removes its count entry.
 
 ### 3. Apply Station-Local Business Work
 

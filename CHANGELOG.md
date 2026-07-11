@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Reliable Client and Station senders now maintain per-peer in-flight counts,
+  replacing full packet-map scans during window admission and count queries;
+  ACK, timeout, and saturated-sequence replacement keep counts synchronized.
 - Reliable Client and Station data frames can now encode borrowed payloads
   directly, and retry scans support caller-owned key scratch; sender retries no
   longer clone in-flight packets or payloads while compatibility APIs remain.

@@ -665,6 +665,35 @@ not a timing threshold. Transport tests cover byte equality, capacity retention,
 duplicate suppression, failed-send attempt preservation, and ordered timeout
 behavior.
 
+## Reliable Window Count Measurement
+
+Reliable Client and Station senders maintain a `BTreeMap` count per active peer
+or target. `in_flight_for` and send-window admission therefore perform one
+O(log active peers) lookup instead of scanning the full in-flight packet map.
+New-key insertion increments the count only when the packet map actually grows;
+ACK and timeout removal decrement it and remove zero-count entries. Saturated
+`u64::MAX` sequence replacement retains the existing count.
+
+Compare the indexed query against the previous full-key scan with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example reliable_window_lookup
+cargo run --release -q -p sectorsync-bench --example reliable_window_lookup -- --full-scan
+```
+
+The default workload keeps 4,096 packets across 256 peers and performs 10,000
+window queries. Guards cap 8,000 packets, 2,000 peers, 2,000 queries per tick,
+and ten ticks without `--allow-heavy`; execution has a 10-second budget. Output
+includes query count/checksum, full-scan count, in-flight conservation, latency
+percentiles, guard metadata, path/workload verdicts, and `benchmark_ok`.
+
+Five alternating release A/B runs produced the same `160,000` count checksum.
+Indexed lookup performed zero full scans; the comparison performed 10,000.
+Median tick p99 was 0.034 ms indexed versus 0.947 ms scanning, about a 96%
+reduction on this development host. Client and Station tests cover independent
+peer counts, ACK decrement, zero-count cleanup, timeout cleanup, send failure,
+window limits, and saturated-sequence replacement.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

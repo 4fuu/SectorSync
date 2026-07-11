@@ -1806,6 +1806,7 @@ pub struct ReliableClientSender {
     config: ReliableClientConfig,
     next_sequence: BTreeMap<ClientId, u64>,
     in_flight: BTreeMap<(ClientId, u64), InFlightReliableClientPacket>,
+    in_flight_by_peer: BTreeMap<ClientId, usize>,
     stats: ReliableClientStats,
 }
 
@@ -1816,6 +1817,7 @@ impl ReliableClientSender {
             config,
             next_sequence: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            in_flight_by_peer: BTreeMap::new(),
             stats: ReliableClientStats::default(),
         }
     }
@@ -1837,10 +1839,10 @@ impl ReliableClientSender {
 
     /// Returns in-flight reliable packets for one peer client.
     pub fn in_flight_for(&self, peer_client: ClientId) -> usize {
-        self.in_flight
-            .keys()
-            .filter(|(client_id, _)| *client_id == peer_client)
-            .count()
+        self.in_flight_by_peer
+            .get(&peer_client)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Sends a new reliable packet and stores it until acknowledged or timed
@@ -1861,7 +1863,7 @@ impl ReliableClientSender {
 
         let sequence = self.allocate_sequence(packet.client_id);
         Self::send_data_frame(transport, packet.client_id, sequence, &packet.bytes)?;
-        self.in_flight.insert(
+        self.insert_in_flight(
             (packet.client_id, sequence),
             InFlightReliableClientPacket {
                 peer_client: packet.client_id,
@@ -1879,8 +1881,7 @@ impl ReliableClientSender {
     /// Processes an ACK from `ack_source_client`.
     pub fn acknowledge(&mut self, ack_source_client: ClientId, sequence: u64) -> bool {
         let removed = self
-            .in_flight
-            .remove(&(ack_source_client, sequence))
+            .remove_in_flight(&(ack_source_client, sequence))
             .is_some();
         if removed {
             self.stats.acks_received = self.stats.acks_received.saturating_add(1);
@@ -1923,7 +1924,7 @@ impl ReliableClientSender {
                 continue;
             };
             if packet.attempts >= self.config.max_attempts {
-                self.in_flight.remove(key);
+                self.remove_in_flight(key);
                 self.stats.timed_out = self.stats.timed_out.saturating_add(1);
                 report.timed_out = report.timed_out.saturating_add(1);
                 continue;
@@ -1962,6 +1963,24 @@ impl ReliableClientSender {
         let sequence = *next;
         *next = next.saturating_add(1);
         sequence
+    }
+
+    fn insert_in_flight(&mut self, key: (ClientId, u64), packet: InFlightReliableClientPacket) {
+        if self.in_flight.insert(key, packet).is_none() {
+            let count = self.in_flight_by_peer.entry(key.0).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn remove_in_flight(&mut self, key: &(ClientId, u64)) -> Option<InFlightReliableClientPacket> {
+        let removed = self.in_flight.remove(key)?;
+        if let Some(count) = self.in_flight_by_peer.get_mut(&removed.peer_client) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.in_flight_by_peer.remove(&removed.peer_client);
+            }
+        }
+        Some(removed)
     }
 
     fn send_data_frame<T: TransportSink>(
@@ -2505,6 +2524,7 @@ pub struct ReliableStationSender {
     config: ReliableStationConfig,
     next_sequence: BTreeMap<StationId, u64>,
     in_flight: BTreeMap<(StationId, u64), InFlightReliableStationPacket>,
+    in_flight_by_target: BTreeMap<StationId, usize>,
     stats: ReliableStationStats,
 }
 
@@ -2515,6 +2535,7 @@ impl ReliableStationSender {
             config,
             next_sequence: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            in_flight_by_target: BTreeMap::new(),
             stats: ReliableStationStats::default(),
         }
     }
@@ -2536,10 +2557,10 @@ impl ReliableStationSender {
 
     /// Returns in-flight reliable packets for one target station.
     pub fn in_flight_for(&self, target_station: StationId) -> usize {
-        self.in_flight
-            .keys()
-            .filter(|(station_id, _)| *station_id == target_station)
-            .count()
+        self.in_flight_by_target
+            .get(&target_station)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Sends a new reliable packet and stores it until acknowledged or timed out.
@@ -2565,7 +2586,7 @@ impl ReliableStationSender {
             sequence,
             &packet.bytes,
         )?;
-        self.in_flight.insert(
+        self.insert_in_flight(
             (packet.target_station, sequence),
             InFlightReliableStationPacket {
                 source_station: packet.source_station,
@@ -2584,8 +2605,7 @@ impl ReliableStationSender {
     /// Processes an ACK from `ack_source_station`.
     pub fn acknowledge(&mut self, ack_source_station: StationId, sequence: u64) -> bool {
         let removed = self
-            .in_flight
-            .remove(&(ack_source_station, sequence))
+            .remove_in_flight(&(ack_source_station, sequence))
             .is_some();
         if removed {
             self.stats.acks_received = self.stats.acks_received.saturating_add(1);
@@ -2628,7 +2648,7 @@ impl ReliableStationSender {
                 continue;
             };
             if packet.attempts >= self.config.max_attempts {
-                self.in_flight.remove(key);
+                self.remove_in_flight(key);
                 self.stats.timed_out = self.stats.timed_out.saturating_add(1);
                 report.timed_out = report.timed_out.saturating_add(1);
                 continue;
@@ -2668,6 +2688,27 @@ impl ReliableStationSender {
         let sequence = *next;
         *next = next.saturating_add(1);
         sequence
+    }
+
+    fn insert_in_flight(&mut self, key: (StationId, u64), packet: InFlightReliableStationPacket) {
+        if self.in_flight.insert(key, packet).is_none() {
+            let count = self.in_flight_by_target.entry(key.0).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn remove_in_flight(
+        &mut self,
+        key: &(StationId, u64),
+    ) -> Option<InFlightReliableStationPacket> {
+        let removed = self.in_flight.remove(key)?;
+        if let Some(count) = self.in_flight_by_target.get_mut(&removed.target_station) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.in_flight_by_target.remove(&removed.target_station);
+            }
+        }
+        Some(removed)
     }
 
     fn send_data_frame<T: StationTransportSink>(
@@ -4398,6 +4439,8 @@ mod tests {
         assert_eq!(timeout.retried, 0);
         assert_eq!(timeout.timed_out, 1);
         assert_eq!(sender.in_flight_len(), 0);
+        assert_eq!(sender.in_flight_for(server_id), 0);
+        assert!(!sender.in_flight_by_peer.contains_key(&server_id));
     }
 
     #[test]
@@ -4529,6 +4572,52 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn reliable_client_window_counts_track_peers_and_saturated_sequence_replacement() {
+        let first_peer = ClientId::new(1);
+        let second_peer = ClientId::new(2);
+        let mut transport = FakeTransport::default();
+        let mut sender = ReliableClientSender::new(ReliableClientConfig {
+            max_in_flight_per_peer: 3,
+            retry_after_ticks: 2,
+            max_attempts: 4,
+            max_payload_bytes: 16,
+            max_delivered_history: 0,
+        });
+        let mut send = |sender: &mut ReliableClientSender, peer_client| {
+            sender
+                .send(
+                    &mut transport,
+                    OutboundPacket {
+                        client_id: peer_client,
+                        bytes: b"count".to_vec(),
+                    },
+                    0,
+                )
+                .expect("bounded packet should send")
+        };
+
+        assert_eq!(send(&mut sender, first_peer), 1);
+        assert_eq!(send(&mut sender, first_peer), 2);
+        assert_eq!(send(&mut sender, second_peer), 1);
+        assert_eq!(sender.in_flight_for(first_peer), 2);
+        assert_eq!(sender.in_flight_for(second_peer), 1);
+        assert!(sender.acknowledge(first_peer, 1));
+        assert_eq!(sender.in_flight_for(first_peer), 1);
+
+        sender.next_sequence.insert(first_peer, u64::MAX);
+        assert_eq!(send(&mut sender, first_peer), u64::MAX);
+        assert_eq!(sender.in_flight_for(first_peer), 2);
+        assert_eq!(send(&mut sender, first_peer), u64::MAX);
+        assert_eq!(sender.in_flight_for(first_peer), 2);
+
+        assert!(sender.acknowledge(first_peer, u64::MAX));
+        assert!(sender.acknowledge(first_peer, 2));
+        assert_eq!(sender.in_flight_for(first_peer), 0);
+        assert!(!sender.in_flight_by_peer.contains_key(&first_peer));
+        assert_eq!(sender.in_flight_for(second_peer), 1);
     }
 
     #[test]
@@ -4809,6 +4898,8 @@ mod tests {
         assert_eq!(timeout.retried, 0);
         assert_eq!(timeout.timed_out, 1);
         assert_eq!(sender.in_flight_len(), 0);
+        assert_eq!(sender.in_flight_for(target), 0);
+        assert!(!sender.in_flight_by_target.contains_key(&target));
     }
 
     #[test]
@@ -4937,6 +5028,56 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn reliable_station_window_counts_track_targets_and_saturated_sequence_replacement() {
+        let source = StationId::new(1);
+        let first_target = StationId::new(2);
+        let second_target = StationId::new(3);
+        let mut transport = InMemoryStationTransport::default();
+        transport.register_station(first_target);
+        transport.register_station(second_target);
+        let mut sender = ReliableStationSender::new(ReliableStationConfig {
+            max_in_flight_per_target: 3,
+            retry_after_ticks: 2,
+            max_attempts: 4,
+            max_payload_bytes: 16,
+            max_delivered_history: 0,
+        });
+        let mut send = |sender: &mut ReliableStationSender, target_station| {
+            sender
+                .send(
+                    &mut transport,
+                    StationOutboundPacket {
+                        source_station: source,
+                        target_station,
+                        bytes: b"count".to_vec(),
+                    },
+                    0,
+                )
+                .expect("bounded packet should send")
+        };
+
+        assert_eq!(send(&mut sender, first_target), 1);
+        assert_eq!(send(&mut sender, first_target), 2);
+        assert_eq!(send(&mut sender, second_target), 1);
+        assert_eq!(sender.in_flight_for(first_target), 2);
+        assert_eq!(sender.in_flight_for(second_target), 1);
+        assert!(sender.acknowledge(first_target, 1));
+        assert_eq!(sender.in_flight_for(first_target), 1);
+
+        sender.next_sequence.insert(first_target, u64::MAX);
+        assert_eq!(send(&mut sender, first_target), u64::MAX);
+        assert_eq!(sender.in_flight_for(first_target), 2);
+        assert_eq!(send(&mut sender, first_target), u64::MAX);
+        assert_eq!(sender.in_flight_for(first_target), 2);
+
+        assert!(sender.acknowledge(first_target, u64::MAX));
+        assert!(sender.acknowledge(first_target, 2));
+        assert_eq!(sender.in_flight_for(first_target), 0);
+        assert!(!sender.in_flight_by_target.contains_key(&first_target));
+        assert_eq!(sender.in_flight_for(second_target), 1);
     }
 
     #[test]
