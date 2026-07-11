@@ -254,6 +254,7 @@ struct Room {
     transport_hub: InMemoryTransportHub,
     server_transport: InMemoryTransportEndpoint,
     dirty_handles: Vec<EntityHandle>,
+    dirty_generations: Vec<u32>,
     ready_events: Vec<StationEvent>,
 }
 
@@ -294,6 +295,7 @@ struct Stats {
     retained_query_candidates: usize,
     retained_command_slots: usize,
     retained_component_slots: usize,
+    retained_dirty_generation_slots: usize,
     registered_component_columns: usize,
     indexed_entities: usize,
     point_memberships: usize,
@@ -432,6 +434,9 @@ fn collect_room_stats(rooms: &[Room], stats: &mut Stats) {
         stats.registered_component_columns = stats
             .registered_component_columns
             .saturating_add(room.components.column_count());
+        stats.retained_dirty_generation_slots = stats
+            .retained_dirty_generation_slots
+            .saturating_add(room.dirty_generations.capacity());
         stats.indexed_entities = stats
             .indexed_entities
             .saturating_add(room.index.entity_count());
@@ -536,6 +541,7 @@ fn create_room(room_id: usize, entities_per_room: usize, descriptors: &Descripto
         transport_hub: hub,
         server_transport,
         dirty_handles,
+        dirty_generations: vec![u32::MAX; capacity],
         ready_events: Vec::new(),
     }
 }
@@ -776,7 +782,15 @@ fn replicate_room(
     stats: &mut Stats,
 ) {
     let viewers = room_viewers(room);
-    let components = &room.components;
+    room.dirty_generations.fill(u32::MAX);
+    for handle in &room.dirty_handles {
+        let index = usize::try_from(handle.index()).expect("handle index fits usize");
+        if room.dirty_generations.len() <= index {
+            room.dirty_generations.resize(index + 1, u32::MAX);
+        }
+        room.dirty_generations[index] = handle.generation();
+    }
+    let dirty_generations = &room.dirty_generations;
     let plans = ReplicationPlanner::plan_for_viewers_work_bounded_into(
         &room.station,
         &room.index,
@@ -784,7 +798,11 @@ fn replicate_room(
         &viewers,
         &RangeOnlyVisibility,
         budget,
-        |_, handle, _| components.has_dirty_selected(handle, &selection.component_ids),
+        |_, handle, _| {
+            dirty_generations
+                .get(usize::try_from(handle.index()).expect("handle index fits usize"))
+                .is_some_and(|generation| *generation == handle.generation())
+        },
         &mut room.planning,
         &mut room.plans,
     );
@@ -1039,6 +1057,10 @@ fn print_retained_resources(stats: &Stats) {
     println!(
         "retained_component_slots={}",
         stats.retained_component_slots
+    );
+    println!(
+        "retained_dirty_generation_slots={}",
+        stats.retained_dirty_generation_slots
     );
     println!(
         "registered_component_columns={}",

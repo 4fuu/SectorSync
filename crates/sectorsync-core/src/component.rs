@@ -1,6 +1,6 @@
 //! Custom component registry and station-local blob storage.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::ids::{ComponentId, EntityHandle};
 use crate::spatial::Vec3;
@@ -722,8 +722,11 @@ struct ComponentColumn {
 /// Station-local sparse component blob store.
 #[derive(Clone, Debug, Default)]
 pub struct ComponentStore {
-    columns: Vec<(ComponentId, ComponentColumn)>,
+    dense_columns: Vec<Option<ComponentColumn>>,
+    sparse_columns: BTreeMap<ComponentId, ComponentColumn>,
 }
+
+const DENSE_COMPONENT_COLUMN_LIMIT: usize = 256;
 
 impl ComponentStore {
     /// Reserves sparse blob entries for one component column.
@@ -735,7 +738,9 @@ impl ComponentStore {
 
     /// Component column slots currently retained without another allocation.
     pub fn column_slots_capacity(&self) -> usize {
-        self.columns.capacity()
+        self.dense_columns
+            .capacity()
+            .saturating_add(self.sparse_columns.len())
     }
 
     /// Sparse entity entries retained for one component without another rehash.
@@ -876,14 +881,28 @@ impl ComponentStore {
         component_id: ComponentId,
         entity: EntityHandle,
     ) -> Option<&mut ComponentBlob> {
-        let index = self.column_index(component_id).ok()?;
-        self.columns[index].1.values.get_mut(&entity)
+        let index = usize::from(component_id.get());
+        if index < DENSE_COMPONENT_COLUMN_LIMIT {
+            self.dense_columns
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .and_then(|column| column.values.get_mut(&entity))
+        } else {
+            self.sparse_columns
+                .get_mut(&component_id)
+                .and_then(|column| column.values.get_mut(&entity))
+        }
     }
 
     /// Clears dirty flags for all components on one entity.
     pub fn clear_dirty_for_entity(&mut self, entity: EntityHandle) -> usize {
         let mut cleared = 0;
-        for (_, column) in &mut self.columns {
+        for column in self
+            .dense_columns
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .chain(self.sparse_columns.values_mut())
+        {
             if let Some(blob) = column.values.get_mut(&entity)
                 && blob.dirty
             {
@@ -908,7 +927,18 @@ impl ComponentStore {
         removed: &mut Vec<(ComponentId, ComponentBlob)>,
     ) -> usize {
         removed.clear();
-        for (component_id, column) in &mut self.columns {
+        for (index, column) in self.dense_columns.iter_mut().enumerate() {
+            let Some(column) = column else {
+                continue;
+            };
+            if let Some(blob) = column.values.remove(&entity) {
+                removed.push((
+                    ComponentId::new(u16::try_from(index).expect("dense component id fits u16")),
+                    blob,
+                ));
+            }
+        }
+        for (component_id, column) in &mut self.sparse_columns {
             if let Some(blob) = column.values.remove(&entity) {
                 removed.push((*component_id, blob));
             }
@@ -919,7 +949,12 @@ impl ComponentStore {
     /// Removes and drops all component blobs for an entity without output storage.
     pub fn clear_entity(&mut self, entity: EntityHandle) -> usize {
         let mut removed = 0_usize;
-        for (_, column) in &mut self.columns {
+        for column in self
+            .dense_columns
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .chain(self.sparse_columns.values_mut())
+        {
             removed = removed.saturating_add(usize::from(column.values.remove(&entity).is_some()));
         }
         removed
@@ -948,38 +983,42 @@ impl ComponentStore {
 
     /// Returns number of component blobs stored in all columns.
     pub fn blob_count(&self) -> usize {
-        self.columns
+        self.dense_columns
             .iter()
-            .map(|(_, column)| column.values.len())
+            .filter_map(Option::as_ref)
+            .chain(self.sparse_columns.values())
+            .map(|column| column.values.len())
             .sum()
     }
 
     fn column_mut(&mut self, component_id: ComponentId) -> &mut ComponentColumn {
-        let index = match self.column_index(component_id) {
-            Ok(index) => index,
-            Err(index) => {
-                self.columns
-                    .insert(index, (component_id, ComponentColumn::default()));
-                index
+        let index = usize::from(component_id.get());
+        if index < DENSE_COMPONENT_COLUMN_LIMIT {
+            if self.dense_columns.len() <= index {
+                self.dense_columns.resize_with(index + 1, || None);
             }
-        };
-        &mut self.columns[index].1
+            self.dense_columns[index].get_or_insert_with(ComponentColumn::default)
+        } else {
+            self.sparse_columns.entry(component_id).or_default()
+        }
     }
 
     fn column(&self, component_id: ComponentId) -> Option<&ComponentColumn> {
-        self.column_index(component_id)
-            .ok()
-            .map(|index| &self.columns[index].1)
-    }
-
-    fn column_index(&self, component_id: ComponentId) -> Result<usize, usize> {
-        self.columns
-            .binary_search_by_key(&component_id, |(id, _)| *id)
+        let index = usize::from(component_id.get());
+        if index < DENSE_COMPONENT_COLUMN_LIMIT {
+            self.dense_columns.get(index).and_then(Option::as_ref)
+        } else {
+            self.sparse_columns.get(&component_id)
+        }
     }
 
     /// Number of component columns currently registered in the store.
     pub fn column_count(&self) -> usize {
-        self.columns.len()
+        self.dense_columns
+            .iter()
+            .filter(|column| column.is_some())
+            .count()
+            + self.sparse_columns.len()
     }
 }
 

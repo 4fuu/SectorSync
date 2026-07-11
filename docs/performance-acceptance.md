@@ -374,10 +374,12 @@ tick p99 on the development host. They selected 537,076 entities but encoded
 
 After moving the benchmark's caller-owned dirty rule into planner eligibility,
 the same deterministic workload selected and encoded 41,409 entities, reducing
-the ratio to 1.000 and tracker ACK work from 527,157 to 40,234. Encoded bytes
-remained 3,035,294 and tick p99 was 6.759 ms, confirming that this change removes
-selection/tracking overhead without altering wire output. Host timings are
-diagnostic rather than portable acceptance thresholds.
+the ratio to 1.000 and tracker ACK work from 527,157 to 40,234. The final path
+compiles dirty handles into a dense index/generation marker before viewer
+planning, avoiding repeated component-store probes. Encoded bytes remain
+3,035,294. Five final release runs reported median tick p99 of 6.940 ms and
+median total elapsed time of 34.531 ms; the initial recorded run took 62.737 ms.
+Host timings are directional rather than portable acceptance thresholds.
 
 The workload uses the explicit work-bounded planner path. Its
 `unexamined_after_budget` counter is machine-readable; it remains zero in the
@@ -392,9 +394,10 @@ queued packets and events, and released 20 retained packet slots. Lifecycle
 acceptance checks the expected endpoint count, zero backlog, and nonzero released
 capacity whenever recreation occurs.
 
-The trace assigns inventory to sparse `ComponentId` 65,535. Compact sorted
-column storage retains 80 slots for 60 registered room-local columns across 20
-rooms; capacity no longer scales to the maximum numeric ID. All 2,620 indexed
+The trace assigns inventory to sparse `ComponentId` 65,535. Direct low-ID slots
+plus the sparse high-ID table retain 100 slots for 60 registered room-local
+columns across 20 rooms; capacity no longer scales to the maximum numeric ID.
+All 2,620 indexed
 entities at measurement time use inline single-cell membership, eliminating
 their former one-element membership allocations. Both conditions have explicit
 machine-readable threshold verdicts.

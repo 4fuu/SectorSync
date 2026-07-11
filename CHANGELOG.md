@@ -23,9 +23,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Runtime Station/index registries, event routing, and bounded in-memory client
   and Station transports now expose explicit teardown APIs that preserve
   deterministic registry order and report discarded queued work.
-- Point entities now store their single spatial cell inline, and component
-  columns use compact sorted storage so memory scales with registered columns
-  rather than the largest `ComponentId`.
+- Point entities now store their single spatial cell inline. Component columns
+  use direct low-ID slots plus an ordered sparse high-ID table, so hot built-in
+  lookups stay O(1) without memory scaling to the largest `ComponentId`.
 - Reliable Client/Station retry senders now index retry deadlines instead of
   scanning every in-flight packet on each poll, and split target selection uses
   the aligned decision array without repeated Station-id scans.

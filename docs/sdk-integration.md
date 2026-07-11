@@ -257,6 +257,12 @@ invent ACK semantics.
 budget is rolled back and reported through `skipped_entities_by_frame_bytes`.
 This is a wire guarantee, unlike planner estimates and capacity hints.
 
+For high-frequency sparse updates, compile the application's dirty-handle list
+into a caller-owned dense generation marker (indexed by `EntityHandle::index`)
+and query it from the eligibility predicate. This keeps per-client delivery and
+dirty semantics external while avoiding repeated component-column probes for
+every spatial candidate.
+
 When deterministic first-fit selection is acceptable, the explicit
 `*_work_bounded_*` APIs stop scanning as soon as the entity or estimated-byte
 budget fills. `unexamined_after_budget` reports the untouched spatial suffix;
