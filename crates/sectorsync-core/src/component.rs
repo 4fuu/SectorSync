@@ -701,6 +701,26 @@ pub struct ComponentStore {
 }
 
 impl ComponentStore {
+    /// Reserves sparse blob entries for one component column.
+    pub fn reserve_component(&mut self, component_id: ComponentId, additional_entities: usize) {
+        self.column_mut(component_id)
+            .values
+            .reserve(additional_entities);
+    }
+
+    /// Component column slots currently retained without another allocation.
+    pub fn column_slots_capacity(&self) -> usize {
+        self.columns.capacity()
+    }
+
+    /// Sparse entity entries retained for one component without another rehash.
+    pub fn component_capacity(&self, component_id: ComponentId) -> usize {
+        self.columns
+            .get(usize::from(component_id.get()))
+            .and_then(Option::as_ref)
+            .map_or(0, |column| column.values.capacity())
+    }
+
     /// Writes an opaque component blob.
     pub fn set_blob(
         &mut self,
@@ -859,6 +879,34 @@ impl ComponentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_column_capacity_is_explicit_and_observable() {
+        let component_id = ComponentId::new(3);
+        let mut store = ComponentStore::default();
+        store.reserve_component(component_id, 16);
+
+        assert!(store.column_slots_capacity() >= 4);
+        assert!(store.component_capacity(component_id) >= 16);
+
+        let descriptor = ComponentDescriptor::sparse_blob(
+            component_id,
+            "reserved",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let handle = EntityHandle::new(1, 0);
+        store
+            .set_blob(&descriptor, handle, 1, vec![1, 2, 3, 4])
+            .expect("reserved component should write");
+        assert_eq!(
+            store
+                .get_blob(component_id, handle)
+                .map(|blob| blob.bytes.as_slice()),
+            Some(&[1, 2, 3, 4][..])
+        );
+    }
 
     #[test]
     fn registry_rejects_duplicate_ids_and_names() {

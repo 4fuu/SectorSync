@@ -153,11 +153,36 @@ pub struct CellIndex {
 impl CellIndex {
     /// Creates an empty cell index.
     pub fn new(grid: GridSpec) -> Self {
+        Self::with_capacity(grid, 0, 0)
+    }
+
+    /// Creates an empty index with explicit entity and occupied-cell capacity.
+    pub fn with_capacity(
+        grid: GridSpec,
+        entity_capacity: usize,
+        occupied_cell_capacity: usize,
+    ) -> Self {
         Self {
             grid,
-            cells: HashMap::new(),
-            entity_cells: HashMap::new(),
+            cells: HashMap::with_capacity(occupied_cell_capacity),
+            entity_cells: HashMap::with_capacity(entity_capacity),
         }
+    }
+
+    /// Reserves capacity for additional indexed entities and occupied cells.
+    pub fn reserve(&mut self, additional_entities: usize, additional_cells: usize) {
+        self.entity_cells.reserve(additional_entities);
+        self.cells.reserve(additional_cells);
+    }
+
+    /// Indexed-entity entries currently retained without another rehash.
+    pub fn entity_capacity(&self) -> usize {
+        self.entity_cells.capacity()
+    }
+
+    /// Occupied-cell entries currently retained without another rehash.
+    pub fn occupied_cell_capacity(&self) -> usize {
+        self.cells.capacity()
     }
 
     /// Returns the grid spec.
@@ -335,6 +360,25 @@ const fn cell_in_range(cell: CellCoord3, min: CellCoord3, max: CellCoord3) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_index_capacity_is_retained_and_grows_on_request() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::with_capacity(grid, 8, 4);
+
+        assert!(index.entity_capacity() >= 8);
+        assert!(index.occupied_cell_capacity() >= 4);
+        index.reserve(32, 16);
+        assert!(index.entity_capacity() >= 32);
+        assert!(index.occupied_cell_capacity() >= 16);
+
+        let handle = EntityHandle::new(1, 0);
+        index.upsert(handle, Position3::new(1.0, 2.0, 3.0), Bounds::Point);
+        assert_eq!(
+            index.query_sphere(Position3::new(1.0, 2.0, 3.0), 1.0),
+            vec![handle]
+        );
+    }
 
     #[test]
     fn index_exposes_handles_by_cell() {

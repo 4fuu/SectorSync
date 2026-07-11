@@ -39,9 +39,13 @@ does not interpret their business meaning.
 Create capacities and ownership explicitly before accepting traffic:
 
 1. Create each `Station` with its station, node, instance, and tick metadata.
-2. Create one station-local `CellIndex` and keep it synchronized with entity
+   Use `Station::with_capacity` when expected local entity count is known;
+   reserve free handles separately only for expected despawn churn.
+2. Create one station-local `CellIndex`, optionally with explicit entity and
+   occupied-cell capacity, and keep it synchronized with entity
    spawn, movement, removal, handoff, and cell migration.
-3. Compile `PolicyTable` entries and register custom component descriptors.
+3. Compile `PolicyTable` entries, register custom component descriptors, and
+   call `ComponentStore::reserve_component` for known sparse-column sizes.
 4. Configure bounded command queues, event queues, transport packet limits,
    replication budgets, trackers, gateway sessions, and deployment routes.
 5. Register station/client transport endpoints and expected packet sources.

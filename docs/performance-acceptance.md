@@ -198,7 +198,9 @@ thread; every viewer performs a real Cell query and replication plan, and every
 dirty component selected for a viewer is encoded directly into a concrete binary
 delta. Viewer plan/entity output capacity is retained across sweeps. The runner
 reports planning and encoding p99 plus `batch_plan_slots_max` and
-`batch_entity_capacity_max` separately:
+`batch_entity_capacity_max` separately. Station, id-index, free-handle,
+spatial-index, occupied-cell, and component-column retained capacities are also
+reported, and `threshold_retained_capacity_ok` requires active storage coverage:
 
 ```powershell
 $env:CARGO_BUILD_JOBS=4
@@ -237,6 +239,13 @@ reported 23.58-31.25 ms sweep p99, 11.87-14.70 ms planning p99, and
 For the denser 4-10 player, 16-entities-per-player shape, reusable batch output
 retained at most ten plan slots and 1,280 selected-entity slots per Station.
 Three release runs reported 19.11-23.87 ms sweep p99.
+
+The default path preallocates known per-Station entity capacity. Use
+`--no-preallocate` only for an A/B comparison. In the 500-room, 4-10 player,
+16-entities-per-player shape, preallocation retained exactly 55,904 Station
+record slots versus 77,568 growth-based slots. Three alternating runs reported
+23.12-25.13 ms setup with preallocation and 24.24-28.01 ms without it; median
+setup fell from 25.85 ms to 24.15 ms.
 
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or

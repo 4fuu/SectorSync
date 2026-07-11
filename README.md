@@ -19,6 +19,7 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Exactly one authoritative owner per entity and read-only ghost semantics.
 - Range, frustum, tag, cadence, priority, and byte-budget replication filters.
 - Reusable caller-owned query and replication scratch buffers.
+- Explicit Station, spatial-index, and component-column capacity reservation.
 - Bounded command, event, client packet, and station packet queues.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
   event frames.

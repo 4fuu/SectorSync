@@ -42,6 +42,7 @@ struct Config {
     entities_per_room: usize,
     component_bytes: usize,
     dirty_percent: usize,
+    preallocate: bool,
     ticks: usize,
     time_budget_ms: u64,
     sweep_p99_budget_ms: f64,
@@ -61,6 +62,7 @@ impl Default for Config {
             entities_per_room: 0,
             component_bytes: DEFAULT_COMPONENT_BYTES,
             dirty_percent: DEFAULT_DIRTY_PERCENT,
+            preallocate: true,
             ticks: DEFAULT_TICKS,
             time_budget_ms: DEFAULT_TIME_BUDGET_MS,
             sweep_p99_budget_ms: DEFAULT_SWEEP_P99_BUDGET_MS,
@@ -75,6 +77,7 @@ impl Config {
         let args = args.collect::<Vec<_>>();
         let mut config = Self {
             allow_heavy: args.iter().any(|arg| arg == "--allow-heavy"),
+            preallocate: !args.iter().any(|arg| arg == "--no-preallocate"),
             ..Self::default()
         };
         for arg in args {
@@ -216,18 +219,33 @@ struct Inventory {
     entities: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RetainedCapacity {
+    station_entities: usize,
+    station_ids: usize,
+    station_free_handles: usize,
+    index_entities: usize,
+    index_cells: usize,
+    occupied_cells: usize,
+    component_entities: usize,
+    component_column_slots: usize,
+}
+
 fn main() {
     let config = Config::from_args(env::args().skip(1));
     let setup_start = Instant::now();
     let mut rooms = create_rooms(config);
     let setup_ms = setup_start.elapsed().as_secs_f64() * 1_000.0;
     let inventory = inventory(&rooms);
+    let retained = retained_capacity(&rooms);
     let run_start = Instant::now();
     let stats = run(&mut rooms, config);
     let elapsed = run_start.elapsed();
     let sweep_p99 = percentile_ms(&stats.sweep_ms, 0.99);
     let workload_ok = workload_completed(config, inventory, &stats);
-    let benchmark_ok = workload_ok && sweep_p99 <= config.sweep_p99_budget_ms;
+    let retained_capacity_ok = retained_capacity_sufficient(inventory, retained);
+    let benchmark_ok =
+        workload_ok && retained_capacity_ok && sweep_p99 <= config.sweep_p99_budget_ms;
 
     println!("SectorSync many-room single-thread benchmark");
     println!("single_thread=true");
@@ -246,6 +264,7 @@ fn main() {
     println!("stations={}", inventory.stations);
     println!("players={}", inventory.players);
     println!("entities={}", inventory.entities);
+    print_retained_capacity(retained);
     println!("min_players_per_room={}", config.min_players);
     println!("max_players_per_room={}", config.max_players);
     println!("players_per_station={}", config.players_per_station);
@@ -262,6 +281,7 @@ fn main() {
     println!("component_bytes={}", config.component_bytes);
     println!("dirty_percent={}", config.dirty_percent);
     println!("dirty_distribution=per-room-scaled");
+    println!("preallocate={}", config.preallocate);
     println!("ticks={}", config.ticks);
     println!("ticks_completed={}", stats.ticks_completed);
     println!("room_updates={}", stats.room_updates);
@@ -296,6 +316,7 @@ fn main() {
         sweep_p99 <= config.sweep_p99_budget_ms
     );
     println!("threshold_workload_completed_ok={workload_ok}");
+    println!("threshold_retained_capacity_ok={retained_capacity_ok}");
     println!("time_budget_ms={}", config.time_budget_ms);
     println!("time_budget_exhausted={}", stats.time_budget_exhausted);
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1_000.0);
@@ -303,6 +324,31 @@ fn main() {
     if !benchmark_ok {
         std::process::exit(1);
     }
+}
+
+fn retained_capacity_sufficient(inventory: Inventory, retained: RetainedCapacity) -> bool {
+    retained.station_entities >= inventory.entities
+        && retained.station_ids >= inventory.entities
+        && retained.index_entities >= inventory.entities
+        && retained.index_cells >= retained.occupied_cells
+        && retained.component_entities >= inventory.entities
+}
+
+fn print_retained_capacity(retained: RetainedCapacity) {
+    println!("station_entity_capacity={}", retained.station_entities);
+    println!("station_id_capacity={}", retained.station_ids);
+    println!(
+        "station_free_handle_capacity={}",
+        retained.station_free_handles
+    );
+    println!("index_entity_capacity={}", retained.index_entities);
+    println!("index_cell_capacity={}", retained.index_cells);
+    println!("occupied_cells={}", retained.occupied_cells);
+    println!("component_entity_capacity={}", retained.component_entities);
+    println!(
+        "component_column_slots_capacity={}",
+        retained.component_column_slots
+    );
 }
 
 fn workload_completed(config: Config, inventory: Inventory, stats: &Stats) -> bool {
@@ -351,22 +397,17 @@ fn create_rooms(config: Config) -> Vec<Room> {
             let station_count = config.stations_for_players(players);
             let entities = config.entities_for_players(players);
             let mut stations = (0..station_count)
-                .map(|_| {
+                .map(|station_index| {
                     let station_id = StationId::new(next_station_id);
                     next_station_id = next_station_id.saturating_add(1);
-                    StationWork {
-                        station: Station::new(StationConfig {
-                            station_id,
-                            node_id: NodeId::new(1),
-                            instance_id,
-                            tick_rate_hz: 30,
-                        }),
-                        index: CellIndex::new(GridSpec::new(32.0).expect("valid benchmark grid")),
-                        components: ComponentStore::default(),
-                        viewers: Vec::new(),
-                        scratch: ReplicationScratch::default(),
-                        batch_scratch: ReplicationBatchScratch::new(),
-                    }
+                    let entity_capacity = entities / station_count
+                        + usize::from(station_index < entities % station_count);
+                    create_station_work(
+                        station_id,
+                        instance_id,
+                        entity_capacity,
+                        config.preallocate,
+                    )
                 })
                 .collect::<Vec<_>>();
 
@@ -425,6 +466,41 @@ fn create_rooms(config: Config) -> Vec<Room> {
         .collect()
 }
 
+fn create_station_work(
+    station_id: StationId,
+    instance_id: InstanceId,
+    entity_capacity: usize,
+    preallocate: bool,
+) -> StationWork {
+    let grid = GridSpec::new(32.0).expect("valid benchmark grid");
+    let mut components = ComponentStore::default();
+    if preallocate {
+        components.reserve_component(ComponentId::new(1), entity_capacity);
+    }
+    let station_config = StationConfig {
+        station_id,
+        node_id: NodeId::new(1),
+        instance_id,
+        tick_rate_hz: 30,
+    };
+    StationWork {
+        station: if preallocate {
+            Station::with_capacity(station_config, entity_capacity)
+        } else {
+            Station::new(station_config)
+        },
+        index: if preallocate {
+            CellIndex::with_capacity(grid, entity_capacity, entity_capacity.min(36))
+        } else {
+            CellIndex::new(grid)
+        },
+        components,
+        viewers: Vec::new(),
+        scratch: ReplicationScratch::default(),
+        batch_scratch: ReplicationBatchScratch::new(),
+    }
+}
+
 fn benchmark_position(index: usize) -> Position3 {
     let x = u16::try_from(index.wrapping_mul(17) % 192).expect("coordinate fits u16");
     let z = u16::try_from(index.wrapping_mul(29) % 192).expect("coordinate fits u16");
@@ -444,6 +520,37 @@ fn inventory(rooms: &[Room]) -> Inventory {
         players: rooms.iter().map(|room| room.players).sum(),
         entities: rooms.iter().map(|room| room.entities).sum(),
     }
+}
+
+fn retained_capacity(rooms: &[Room]) -> RetainedCapacity {
+    let mut retained = RetainedCapacity::default();
+    for work in rooms.iter().flat_map(|room| &room.stations) {
+        retained.station_entities = retained
+            .station_entities
+            .saturating_add(work.station.entity_capacity());
+        retained.station_ids = retained
+            .station_ids
+            .saturating_add(work.station.id_index_capacity());
+        retained.station_free_handles = retained
+            .station_free_handles
+            .saturating_add(work.station.free_list_capacity());
+        retained.index_entities = retained
+            .index_entities
+            .saturating_add(work.index.entity_capacity());
+        retained.index_cells = retained
+            .index_cells
+            .saturating_add(work.index.occupied_cell_capacity());
+        retained.occupied_cells = retained
+            .occupied_cells
+            .saturating_add(work.index.occupied_cell_count());
+        retained.component_entities = retained
+            .component_entities
+            .saturating_add(work.components.component_capacity(ComponentId::new(1)));
+        retained.component_column_slots = retained
+            .component_column_slots
+            .saturating_add(work.components.column_slots_capacity());
+    }
+    retained
 }
 
 fn run(rooms: &mut [Room], config: Config) -> Stats {
@@ -576,6 +683,13 @@ mod tests {
     }
 
     #[test]
+    fn preallocation_is_enabled_by_default_and_can_be_disabled_for_comparison() {
+        assert!(Config::default().preallocate);
+        let config = Config::from_args(["--no-preallocate".to_owned()].into_iter());
+        assert!(!config.preallocate);
+    }
+
+    #[test]
     fn default_guard_clamps_oversized_manual_workload() {
         let config = Config::from_args(
             [
@@ -667,6 +781,7 @@ mod tests {
         }));
 
         let stats = run(&mut rooms, config);
+        let retained = retained_capacity(&rooms);
 
         assert_eq!(stats.ticks_completed, 2);
         assert_eq!(stats.room_updates, 6);
@@ -674,6 +789,10 @@ mod tests {
         assert!(stats.selected_entities > 0);
         assert_eq!(stats.encoded_frames, stats.viewer_queries);
         assert_eq!(stats.encoded_entities, stats.selected_entities);
+        assert!(retained.station_entities >= inventory(&rooms).entities);
+        assert!(retained.index_entities >= inventory(&rooms).entities);
+        assert!(retained.component_entities >= inventory(&rooms).entities);
+        assert!(retained.index_cells >= retained.occupied_cells);
         assert!(!stats.time_budget_exhausted);
         assert!(workload_completed(config, inventory(&rooms), &stats));
     }

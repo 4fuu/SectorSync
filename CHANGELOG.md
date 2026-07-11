@@ -21,6 +21,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Parallel replication scratch is bounded by configured worker count instead of
   Station batch count, and reusable batch output APIs retain viewer plan/entity
   capacity across planning calls.
+- Station, spatial index, and sparse component columns support explicit capacity
+  reservation, with retained-capacity signals and A/B coverage in the many-room
+  benchmark.
 
 ## [2026.7.10] - 2026-07-10
 

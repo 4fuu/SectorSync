@@ -38,15 +38,47 @@ pub struct Station {
 impl Station {
     /// Creates an empty station.
     pub fn new(config: StationConfig) -> Self {
+        Self::with_capacity(config, 0)
+    }
+
+    /// Creates an empty station with capacity for local entity records.
+    pub fn with_capacity(config: StationConfig, entity_capacity: usize) -> Self {
         Self {
             config,
             tick: Tick::new(0),
             owner_epoch: OwnerEpoch::new(0),
-            records: Vec::new(),
-            generations: Vec::new(),
+            records: Vec::with_capacity(entity_capacity),
+            generations: Vec::with_capacity(entity_capacity),
             free: Vec::new(),
-            by_id: HashMap::new(),
+            by_id: HashMap::with_capacity(entity_capacity),
         }
+    }
+
+    /// Reserves capacity for at least `additional` more local entities.
+    pub fn reserve_entities(&mut self, additional: usize) {
+        self.records.reserve(additional);
+        self.generations.reserve(additional);
+        self.by_id.reserve(additional);
+    }
+
+    /// Reserves recycled-handle slots for caller-expected despawn churn.
+    pub fn reserve_free_handles(&mut self, additional: usize) {
+        self.free.reserve(additional);
+    }
+
+    /// Entity record slots currently retained without another allocation.
+    pub fn entity_capacity(&self) -> usize {
+        self.records.capacity().min(self.generations.capacity())
+    }
+
+    /// Entity-id lookup entries currently retained without another rehash.
+    pub fn id_index_capacity(&self) -> usize {
+        self.by_id.capacity()
+    }
+
+    /// Recycled handle indexes currently retained without another allocation.
+    pub fn free_list_capacity(&self) -> usize {
+        self.free.capacity()
     }
 
     /// Returns station configuration.
@@ -556,6 +588,32 @@ mod tests {
             instance_id: InstanceId::new(7),
             tick_rate_hz: 20,
         }
+    }
+
+    #[test]
+    fn explicit_entity_capacity_is_retained_and_grows_on_request() {
+        let mut station = Station::with_capacity(config(), 8);
+
+        assert!(station.entity_capacity() >= 8);
+        assert!(station.id_index_capacity() >= 8);
+        assert_eq!(station.free_list_capacity(), 0);
+
+        station.reserve_entities(32);
+        assert!(station.entity_capacity() >= 32);
+        assert!(station.id_index_capacity() >= 32);
+        assert_eq!(station.free_list_capacity(), 0);
+        station.reserve_free_handles(8);
+        assert!(station.free_list_capacity() >= 8);
+
+        let handle = station
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(0.0, 0.0, 0.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("reserved station should spawn");
+        assert_eq!(handle, EntityHandle::new(0, 0));
     }
 
     #[test]
