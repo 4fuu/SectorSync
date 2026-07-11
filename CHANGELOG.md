@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Reliable Client and Station data frames can now encode borrowed payloads
+  directly, and retry scans support caller-owned key scratch; sender retries no
+  longer clone in-flight packets or payloads while compatibility APIs remain.
 - Periodic load sampling now offers caller-owned subscriber aggregation,
   occupancy, Station sample, and per-cell output storage; the spatial index also
   supports reusable deterministic occupancy output while owned APIs remain

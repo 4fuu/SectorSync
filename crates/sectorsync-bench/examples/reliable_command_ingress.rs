@@ -6,7 +6,7 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_transport::{
     ClientTransportLimits, InMemoryTransportEndpoint, InMemoryTransportHub, OutboundPacket,
-    ReliableClientConfig, ReliableClientEndpoint, TransportReceiver,
+    ReliableClientConfig, ReliableClientEndpoint, ReliableClientRetryScratch, TransportReceiver,
 };
 use sectorsync_wire::{
     BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame, CommandFrame, FrameDecoder,
@@ -37,6 +37,7 @@ fn main() {
     };
     let mut client_link = ReliableClientEndpoint::new(reliable_config);
     let mut server_link = ReliableClientEndpoint::new(reliable_config);
+    let mut retry_scratch = ReliableClientRetryScratch::new();
 
     let command = CommandFrame {
         client_id,
@@ -64,7 +65,7 @@ fn main() {
         )
         .expect("reliable command should send");
     let command_retry = client_link
-        .retry_due(&mut client_transport, 2)
+        .retry_due_with_scratch(&mut client_transport, 2, &mut retry_scratch)
         .expect("command should retry once");
     assert_eq!(command_retry.retried, 1);
 
@@ -134,7 +135,7 @@ fn main() {
         )
         .expect("reliable command ACK should send");
     let ack_retry = server_link
-        .retry_due(&mut server_transport, 12)
+        .retry_due_with_scratch(&mut server_transport, 12, &mut retry_scratch)
         .expect("command ACK should retry once");
     assert_eq!(ack_retry.retried, 1);
 

@@ -91,6 +91,15 @@ Offline, advances their route epochs, and updates detection/offline counters
 without allocating an intermediate ID list. Use `stale_nodes` separately only
 when the embedding control plane actually needs ordered stale IDs.
 
+For reliable Client or Station links, retain `ReliableClientRetryScratch` or
+`ReliableStationRetryScratch` and call `retry_due_with_scratch` on the endpoint.
+The scratch stores only the deterministic due-key scan and may be shared across
+non-overlapping endpoint calls. Reliable senders encode stored payload slices
+directly into the owned transport packet and do not clone the in-flight payload.
+The compatibility `retry_due` API remains appropriate for occasional retries.
+Transport failure leaves attempts unchanged; timeout and retry order remain
+bounded by the configured window, interval, and attempt limits.
+
 ### 3. Apply Station-Local Business Work
 
 At the station tick boundary, pop a bounded number of commands from
@@ -261,6 +270,7 @@ collect OS metrics, or choose production alerting policy.
 | Gateway admission and negative ACK behavior | `gateway_command_pipeline` |
 | Gateway-to-node route resolution and dispatch | `gateway_deployment_dispatch` |
 | Direct UDP command ingress and ACK | `command_ingress` |
+| Reliable Client/Station retry and duplicate suppression | `reliable_command_ingress`, `reliable_station_event` |
 | Internal station dispatch and target validation | `gateway_deployment_dispatch` |
 | AOI-to-frame replication transport | `replication_bridge`, `replication_bridge_priority` |
 | Pause/freeze/resume client notification | `barrier_transport` |

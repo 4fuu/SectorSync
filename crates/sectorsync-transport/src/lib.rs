@@ -1563,27 +1563,36 @@ pub enum ReliableClientFrame {
 }
 
 impl ReliableClientFrame {
+    /// Appends a data frame from a borrowed payload without materializing an owned frame.
+    pub fn encode_data(
+        sequence: u64,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), ReliableClientEncodeError> {
+        out.extend_from_slice(&RELIABLE_CLIENT_MAGIC);
+        out.push(RELIABLE_CLIENT_KIND_DATA);
+        out.extend_from_slice(&sequence.to_le_bytes());
+        let len = u32::try_from(payload.len()).map_err(|_| {
+            ReliableClientEncodeError::PayloadTooLarge {
+                actual: payload.len(),
+            }
+        })?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(payload);
+        Ok(())
+    }
+
     /// Encodes a reliable client frame.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ReliableClientEncodeError> {
-        out.extend_from_slice(&RELIABLE_CLIENT_MAGIC);
         match self {
-            Self::Data { sequence, payload } => {
-                out.push(RELIABLE_CLIENT_KIND_DATA);
-                out.extend_from_slice(&sequence.to_le_bytes());
-                let len = u32::try_from(payload.len()).map_err(|_| {
-                    ReliableClientEncodeError::PayloadTooLarge {
-                        actual: payload.len(),
-                    }
-                })?;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(payload);
-            }
+            Self::Data { sequence, payload } => Self::encode_data(*sequence, payload, out),
             Self::Ack { sequence } => {
+                out.extend_from_slice(&RELIABLE_CLIENT_MAGIC);
                 out.push(RELIABLE_CLIENT_KIND_ACK);
                 out.extend_from_slice(&sequence.to_le_bytes());
+                Ok(())
             }
         }
-        Ok(())
     }
 
     /// Decodes a reliable client frame.
@@ -1773,6 +1782,24 @@ struct InFlightReliableClientPacket {
     attempts: u8,
 }
 
+/// Caller-owned reusable storage for reliable client retry scans.
+#[derive(Clone, Debug, Default)]
+pub struct ReliableClientRetryScratch {
+    due_keys: Vec<(ClientId, u64)>,
+}
+
+impl ReliableClientRetryScratch {
+    /// Creates empty retry storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Due-key capacity retained across retry passes.
+    pub fn retained_key_capacity(&self) -> usize {
+        self.due_keys.capacity()
+    }
+}
+
 /// Bounded reliable client sender state.
 #[derive(Clone, Debug)]
 pub struct ReliableClientSender {
@@ -1867,23 +1894,36 @@ impl ReliableClientSender {
         transport: &mut T,
         now_tick: u64,
     ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
-        let keys = self
-            .in_flight
-            .iter()
-            .filter_map(|(key, packet)| {
+        self.retry_due_with_scratch(
+            transport,
+            now_tick,
+            &mut ReliableClientRetryScratch::default(),
+        )
+    }
+
+    /// Retries due packets using caller-owned scan storage.
+    pub fn retry_due_with_scratch<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        now_tick: u64,
+        scratch: &mut ReliableClientRetryScratch,
+    ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
+        scratch.due_keys.clear();
+        scratch
+            .due_keys
+            .extend(self.in_flight.iter().filter_map(|(key, packet)| {
                 let due =
                     now_tick.saturating_sub(packet.last_sent_tick) >= self.config.retry_after_ticks;
                 due.then_some(*key)
-            })
-            .collect::<Vec<_>>();
+            }));
         let mut report = ReliableRetryReport::default();
 
-        for key in keys {
-            let Some(packet) = self.in_flight.get(&key).cloned() else {
+        for key in &scratch.due_keys {
+            let Some(packet) = self.in_flight.get(key) else {
                 continue;
             };
             if packet.attempts >= self.config.max_attempts {
-                self.in_flight.remove(&key);
+                self.in_flight.remove(key);
                 self.stats.timed_out = self.stats.timed_out.saturating_add(1);
                 report.timed_out = report.timed_out.saturating_add(1);
                 continue;
@@ -1895,7 +1935,7 @@ impl ReliableClientSender {
                 packet.sequence,
                 &packet.payload,
             )?;
-            if let Some(stored) = self.in_flight.get_mut(&key) {
+            if let Some(stored) = self.in_flight.get_mut(key) {
                 stored.last_sent_tick = now_tick;
                 stored.attempts = stored.attempts.saturating_add(1);
             }
@@ -1935,12 +1975,8 @@ impl ReliableClientSender {
                 .len()
                 .saturating_add(RELIABLE_CLIENT_DATA_HEADER_BYTES),
         );
-        ReliableClientFrame::Data {
-            sequence,
-            payload: payload.to_vec(),
-        }
-        .encode(&mut bytes)
-        .map_err(ReliableClientError::Encode)?;
+        ReliableClientFrame::encode_data(sequence, payload, &mut bytes)
+            .map_err(ReliableClientError::Encode)?;
         transport
             .send(OutboundPacket {
                 client_id: peer_client,
@@ -2100,6 +2136,17 @@ impl ReliableClientEndpoint {
         self.sender.retry_due(transport, now_tick)
     }
 
+    /// Retries due reliable client packets using caller-owned scan storage.
+    pub fn retry_due_with_scratch<T: TransportSink>(
+        &mut self,
+        transport: &mut T,
+        now_tick: u64,
+        scratch: &mut ReliableClientRetryScratch,
+    ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
+        self.sender
+            .retry_due_with_scratch(transport, now_tick, scratch)
+    }
+
     /// Handles one inbound reliable client packet.
     pub fn handle_inbound<T: TransportSink>(
         &mut self,
@@ -2236,27 +2283,36 @@ pub enum ReliableStationFrame {
 }
 
 impl ReliableStationFrame {
+    /// Appends a data frame from a borrowed payload without materializing an owned frame.
+    pub fn encode_data(
+        sequence: u64,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), ReliableStationEncodeError> {
+        out.extend_from_slice(&RELIABLE_STATION_MAGIC);
+        out.push(RELIABLE_KIND_DATA);
+        out.extend_from_slice(&sequence.to_le_bytes());
+        let len = u32::try_from(payload.len()).map_err(|_| {
+            ReliableStationEncodeError::PayloadTooLarge {
+                actual: payload.len(),
+            }
+        })?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(payload);
+        Ok(())
+    }
+
     /// Encodes a reliable station frame.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ReliableStationEncodeError> {
-        out.extend_from_slice(&RELIABLE_STATION_MAGIC);
         match self {
-            Self::Data { sequence, payload } => {
-                out.push(RELIABLE_KIND_DATA);
-                out.extend_from_slice(&sequence.to_le_bytes());
-                let len = u32::try_from(payload.len()).map_err(|_| {
-                    ReliableStationEncodeError::PayloadTooLarge {
-                        actual: payload.len(),
-                    }
-                })?;
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(payload);
-            }
+            Self::Data { sequence, payload } => Self::encode_data(*sequence, payload, out),
             Self::Ack { sequence } => {
+                out.extend_from_slice(&RELIABLE_STATION_MAGIC);
                 out.push(RELIABLE_KIND_ACK);
                 out.extend_from_slice(&sequence.to_le_bytes());
+                Ok(())
             }
         }
-        Ok(())
     }
 
     /// Decodes a reliable station frame.
@@ -2416,6 +2472,24 @@ struct InFlightReliableStationPacket {
     attempts: u8,
 }
 
+/// Caller-owned reusable storage for reliable station retry scans.
+#[derive(Clone, Debug, Default)]
+pub struct ReliableStationRetryScratch {
+    due_keys: Vec<(StationId, u64)>,
+}
+
+impl ReliableStationRetryScratch {
+    /// Creates empty retry storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Due-key capacity retained across retry passes.
+    pub fn retained_key_capacity(&self) -> usize {
+        self.due_keys.capacity()
+    }
+}
+
 /// Retry pass report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReliableRetryReport {
@@ -2525,23 +2599,36 @@ impl ReliableStationSender {
         transport: &mut T,
         now_tick: u64,
     ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
-        let keys = self
-            .in_flight
-            .iter()
-            .filter_map(|(key, packet)| {
+        self.retry_due_with_scratch(
+            transport,
+            now_tick,
+            &mut ReliableStationRetryScratch::default(),
+        )
+    }
+
+    /// Retries due packets using caller-owned scan storage.
+    pub fn retry_due_with_scratch<T: StationTransportSink>(
+        &mut self,
+        transport: &mut T,
+        now_tick: u64,
+        scratch: &mut ReliableStationRetryScratch,
+    ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
+        scratch.due_keys.clear();
+        scratch
+            .due_keys
+            .extend(self.in_flight.iter().filter_map(|(key, packet)| {
                 let due =
                     now_tick.saturating_sub(packet.last_sent_tick) >= self.config.retry_after_ticks;
                 due.then_some(*key)
-            })
-            .collect::<Vec<_>>();
+            }));
         let mut report = ReliableRetryReport::default();
 
-        for key in keys {
-            let Some(packet) = self.in_flight.get(&key).cloned() else {
+        for key in &scratch.due_keys {
+            let Some(packet) = self.in_flight.get(key) else {
                 continue;
             };
             if packet.attempts >= self.config.max_attempts {
-                self.in_flight.remove(&key);
+                self.in_flight.remove(key);
                 self.stats.timed_out = self.stats.timed_out.saturating_add(1);
                 report.timed_out = report.timed_out.saturating_add(1);
                 continue;
@@ -2554,7 +2641,7 @@ impl ReliableStationSender {
                 packet.sequence,
                 &packet.payload,
             )?;
-            if let Some(stored) = self.in_flight.get_mut(&key) {
+            if let Some(stored) = self.in_flight.get_mut(key) {
                 stored.last_sent_tick = now_tick;
                 stored.attempts = stored.attempts.saturating_add(1);
             }
@@ -2595,12 +2682,8 @@ impl ReliableStationSender {
                 .len()
                 .saturating_add(RELIABLE_STATION_DATA_HEADER_BYTES),
         );
-        ReliableStationFrame::Data {
-            sequence,
-            payload: payload.to_vec(),
-        }
-        .encode(&mut bytes)
-        .map_err(ReliableStationError::Encode)?;
+        ReliableStationFrame::encode_data(sequence, payload, &mut bytes)
+            .map_err(ReliableStationError::Encode)?;
         transport
             .send_station(StationOutboundPacket {
                 source_station,
@@ -2760,6 +2843,17 @@ impl ReliableStationEndpoint {
         now_tick: u64,
     ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
         self.sender.retry_due(transport, now_tick)
+    }
+
+    /// Retries due reliable station packets using caller-owned scan storage.
+    pub fn retry_due_with_scratch<T: StationTransportSink>(
+        &mut self,
+        transport: &mut T,
+        now_tick: u64,
+        scratch: &mut ReliableStationRetryScratch,
+    ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
+        self.sender
+            .retry_due_with_scratch(transport, now_tick, scratch)
     }
 
     /// Handles one inbound reliable station packet.
@@ -4105,6 +4199,10 @@ mod tests {
         };
         let mut bytes = Vec::new();
         data.encode(&mut bytes).expect("data frame should encode");
+        let mut direct = Vec::new();
+        ReliableClientFrame::encode_data(42, b"command", &mut direct)
+            .expect("borrowed data frame should encode");
+        assert_eq!(direct, bytes);
         assert_eq!(
             ReliableClientFrame::decode(&bytes).expect("data frame should decode"),
             data
@@ -4198,12 +4296,22 @@ mod tests {
                 0,
             )
             .expect("reliable command should send");
+        let mut retry_scratch = ReliableClientRetryScratch::new();
         let retry = client
-            .retry_due(&mut client_transport, 2)
+            .retry_due_with_scratch(&mut client_transport, 2, &mut retry_scratch)
             .expect("retry should send");
         assert_eq!(retry.retried, 1);
         assert_eq!(retry.timed_out, 0);
         assert_eq!(client.sender.stats().retries_sent, 1);
+        let retained_keys = retry_scratch.retained_key_capacity();
+        assert!(retained_keys >= 1);
+        assert_eq!(
+            client
+                .retry_due_with_scratch(&mut client_transport, 2, &mut retry_scratch)
+                .expect("non-due scan should succeed"),
+            ReliableRetryReport::default()
+        );
+        assert_eq!(retry_scratch.retained_key_capacity(), retained_keys);
         assert_eq!(
             hub.queued_len(server_id).expect("queue should exist"),
             Some(2)
@@ -4232,6 +4340,64 @@ mod tests {
         assert_eq!(server.receiver.stats().data_delivered, 1);
         assert_eq!(server.receiver.stats().duplicates_suppressed, 1);
         assert_eq!(server.receiver.stats().acks_sent, 2);
+    }
+
+    #[test]
+    fn reliable_client_failed_retry_preserves_attempt_before_timeout() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 1,
+            max_packet_bytes: 128,
+        });
+        let mut client_transport = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        let mut server_transport = hub
+            .endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+        let mut sender = ReliableClientSender::new(ReliableClientConfig {
+            max_in_flight_per_peer: 1,
+            retry_after_ticks: 1,
+            max_attempts: 2,
+            max_payload_bytes: 64,
+            max_delivered_history: 0,
+        });
+        let mut scratch = ReliableClientRetryScratch::new();
+        sender
+            .send(
+                &mut client_transport,
+                OutboundPacket {
+                    client_id: server_id,
+                    bytes: b"retry".to_vec(),
+                },
+                0,
+            )
+            .expect("initial packet should fill queue");
+
+        assert!(matches!(
+            sender.retry_due_with_scratch(&mut client_transport, 1, &mut scratch),
+            Err(ReliableClientError::Transport(
+                InMemoryTransportError::QueueFull { .. }
+            ))
+        ));
+        server_transport
+            .try_recv()
+            .expect("queue should read")
+            .expect("initial packet should remain");
+        assert_eq!(
+            sender
+                .retry_due_with_scratch(&mut client_transport, 1, &mut scratch)
+                .expect("failed attempt must remain retryable")
+                .retried,
+            1
+        );
+        let timeout = sender
+            .retry_due_with_scratch(&mut client_transport, 2, &mut scratch)
+            .expect("exhausted packet should time out");
+        assert_eq!(timeout.retried, 0);
+        assert_eq!(timeout.timed_out, 1);
+        assert_eq!(sender.in_flight_len(), 0);
     }
 
     #[test]
@@ -4457,6 +4623,10 @@ mod tests {
         };
         let mut bytes = Vec::new();
         data.encode(&mut bytes).expect("data frame should encode");
+        let mut direct = Vec::new();
+        ReliableStationFrame::encode_data(42, b"station-event", &mut direct)
+            .expect("borrowed data frame should encode");
+        assert_eq!(direct, bytes);
         assert_eq!(
             ReliableStationFrame::decode(&bytes).expect("data frame should decode"),
             data
@@ -4544,12 +4714,22 @@ mod tests {
                 0,
             )
             .expect("reliable packet should send");
+        let mut retry_scratch = ReliableStationRetryScratch::new();
         let retry = first
-            .retry_due(&mut transport, 2)
+            .retry_due_with_scratch(&mut transport, 2, &mut retry_scratch)
             .expect("retry should send");
         assert_eq!(retry.retried, 1);
         assert_eq!(retry.timed_out, 0);
         assert_eq!(first.sender.stats().retries_sent, 1);
+        let retained_keys = retry_scratch.retained_key_capacity();
+        assert!(retained_keys >= 1);
+        assert_eq!(
+            first
+                .retry_due_with_scratch(&mut transport, 2, &mut retry_scratch)
+                .expect("non-due scan should succeed"),
+            ReliableRetryReport::default()
+        );
+        assert_eq!(retry_scratch.retained_key_capacity(), retained_keys);
         assert_eq!(transport.queued_len(station_two), Some(2));
 
         let first_raw = transport
@@ -4575,6 +4755,60 @@ mod tests {
         assert_eq!(second.receiver.stats().data_delivered, 1);
         assert_eq!(second.receiver.stats().duplicates_suppressed, 1);
         assert_eq!(second.receiver.stats().acks_sent, 2);
+    }
+
+    #[test]
+    fn reliable_station_failed_retry_preserves_attempt_before_timeout() {
+        let source = StationId::new(1);
+        let target = StationId::new(2);
+        let mut transport = InMemoryStationTransport::new(StationTransportLimits {
+            max_queued_packets_per_station: 1,
+            max_packet_bytes: 128,
+        });
+        transport.register_station(target);
+        let mut sender = ReliableStationSender::new(ReliableStationConfig {
+            max_in_flight_per_target: 1,
+            retry_after_ticks: 1,
+            max_attempts: 2,
+            max_payload_bytes: 64,
+            max_delivered_history: 0,
+        });
+        let mut scratch = ReliableStationRetryScratch::new();
+        sender
+            .send(
+                &mut transport,
+                StationOutboundPacket {
+                    source_station: source,
+                    target_station: target,
+                    bytes: b"retry".to_vec(),
+                },
+                0,
+            )
+            .expect("initial packet should fill queue");
+
+        assert!(matches!(
+            sender.retry_due_with_scratch(&mut transport, 1, &mut scratch),
+            Err(ReliableStationError::Transport(
+                StationTransportError::QueueFull { .. }
+            ))
+        ));
+        transport
+            .try_recv_station(target)
+            .expect("queue should read")
+            .expect("initial packet should remain");
+        assert_eq!(
+            sender
+                .retry_due_with_scratch(&mut transport, 1, &mut scratch)
+                .expect("failed attempt must remain retryable")
+                .retried,
+            1
+        );
+        let timeout = sender
+            .retry_due_with_scratch(&mut transport, 2, &mut scratch)
+            .expect("exhausted packet should time out");
+        assert_eq!(timeout.retried, 0);
+        assert_eq!(timeout.timed_out, 1);
+        assert_eq!(sender.in_flight_len(), 0);
     }
 
     #[test]

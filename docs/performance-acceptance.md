@@ -627,6 +627,44 @@ tests verify deterministic occupancy, exact sample equivalence, duplicate
 subscriber aggregation, and retained outer and nested storage; benchmark tests
 verify guard enforcement and cross-path checksums.
 
+## Reliable Frame And Retry Reuse Measurement
+
+`ReliableClientFrame::encode_data` and `ReliableStationFrame::encode_data`
+append borrowed payloads directly to the final wire buffer. Reliable senders use
+these paths for initial sends and retries, avoiding the temporary owned-frame
+payload copy. `ReliableClientRetryScratch` and `ReliableStationRetryScratch`
+retain due-key scan capacity; endpoint `retry_due_with_scratch` methods expose
+the reusable path while existing `retry_due` methods remain compatible.
+
+Run the isolated encoding and real Station sender comparisons with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example reliable_frame_encode
+cargo run --release -q -p sectorsync-bench --example reliable_frame_encode -- --owned-frame
+cargo run --release -q -p sectorsync-bench --example reliable_retry_reuse
+cargo run --release -q -p sectorsync-bench --example reliable_retry_reuse -- --fresh-scan
+```
+
+The encoding workload writes 2,000 frames per tick with 2 KiB payloads for ten
+ticks. Guards cap 4,000 frames per tick, 4 KiB payloads, and 20 ticks without
+`--allow-heavy`. Five alternating release A/B runs produced identical 20,000
+frames, `41,300,000` wire bytes, and a `44,760,000` checksum. Borrowed encoding
+created zero temporary payload copies versus 20,000 for owned frames. Median
+tick p99 was 0.253 ms borrowed versus 0.455 ms owned, about a 44% reduction on
+this development host.
+
+The retry workload keeps 512 packets with 512-byte payloads in flight across
+200 retry calls. It caps 2,000 packets, 4 KiB payloads, 25 calls per tick, and
+ten ticks, plus a 10-second execution budget. Both paths retried 102,400 packets
+and emitted `54,169,600` wire bytes with a `72,192,000` checksum and zero
+wire divergence. Reusable scans retained 512 keys and created zero fresh key
+collections; compatibility scans created 200. Five-run p99 medians were 1.184 ms
+reusable and 1.140 ms fresh, so no host-latency improvement is claimed for scan
+reuse alone. Its acceptance criterion is allocation removal and exact behavior,
+not a timing threshold. Transport tests cover byte equality, capacity retention,
+duplicate suppression, failed-send attempt preservation, and ordered timeout
+behavior.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

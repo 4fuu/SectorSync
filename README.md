@@ -40,6 +40,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
   event frames.
 - Low-level in-memory, reliable packet, and non-blocking UDP adapters.
+- Reliable Client and Station senders encode borrowed payloads directly and
+  support caller-owned retry scan scratch without cloning in-flight payloads.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
@@ -183,6 +185,10 @@ cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --release --example deployment_stale_scan
 cargo run -p sectorsync-bench --release --example deployment_stale_scan -- --collect-mark
 cargo run -p sectorsync-bench --example station_event_transport
+cargo run -p sectorsync-bench --release --example reliable_frame_encode
+cargo run -p sectorsync-bench --release --example reliable_frame_encode -- --owned-frame
+cargo run -p sectorsync-bench --release --example reliable_retry_reuse
+cargo run -p sectorsync-bench --release --example reliable_retry_reuse -- --fresh-scan
 cargo run -p sectorsync-bench --release --example event_drain_reuse
 cargo run -p sectorsync-bench --release --example event_drain_reuse -- --fresh-output
 cargo run -p sectorsync-bench --features parallel --example parallel_replication
