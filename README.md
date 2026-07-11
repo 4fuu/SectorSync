@@ -52,6 +52,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   configured datagram buffer for synchronous packet consumption.
 - Reliable Client and Station senders encode borrowed payloads directly and
   support caller-owned retry scan scratch without cloning in-flight payloads.
+- Reliable receivers borrow-decode frames and reuse inbound wire Vec storage
+  for unique delivered payloads.
 - Reliable sender window admission uses per-peer counters instead of scanning
   all in-flight packets as concurrent reliable windows grow.
 - Packet security sealing supports caller-owned payload/tag scratch and borrowed

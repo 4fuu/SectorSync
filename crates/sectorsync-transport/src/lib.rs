@@ -1845,6 +1845,36 @@ pub enum ReliableClientFrame {
     },
 }
 
+/// Borrowed reliable client frame decoded from caller-owned bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReliableClientFrameRef<'a> {
+    /// Reliable data packet with borrowed payload bytes.
+    Data {
+        /// Sender-local sequence number scoped to the peer client.
+        sequence: u64,
+        /// Payload borrowed from the encoded frame.
+        payload: &'a [u8],
+    },
+    /// Acknowledgement for a reliable data packet.
+    Ack {
+        /// Acknowledged sequence number.
+        sequence: u64,
+    },
+}
+
+impl ReliableClientFrameRef<'_> {
+    /// Materializes the compatible owned reliable client frame.
+    pub fn to_owned(self) -> ReliableClientFrame {
+        match self {
+            Self::Data { sequence, payload } => ReliableClientFrame::Data {
+                sequence,
+                payload: payload.to_vec(),
+            },
+            Self::Ack { sequence } => ReliableClientFrame::Ack { sequence },
+        }
+    }
+}
+
 impl ReliableClientFrame {
     /// Appends a data frame from a borrowed payload without materializing an owned frame.
     pub fn encode_data(
@@ -1880,6 +1910,13 @@ impl ReliableClientFrame {
 
     /// Decodes a reliable client frame.
     pub fn decode(input: &[u8]) -> Result<Self, ReliableClientDecodeError> {
+        Self::decode_ref(input).map(ReliableClientFrameRef::to_owned)
+    }
+
+    /// Decodes a reliable client frame while borrowing data payload bytes.
+    pub fn decode_ref(
+        input: &[u8],
+    ) -> Result<ReliableClientFrameRef<'_>, ReliableClientDecodeError> {
         let mut cursor = ReliableCursor::new(input);
         let magic = cursor
             .read_array::<4>()
@@ -1900,11 +1937,11 @@ impl ReliableClientFrame {
                     .map_err(ReliableClientDecodeError::from_station_decode)?
                     as usize;
                 let payload = cursor
-                    .read_bytes(len)
+                    .read_slice(len)
                     .map_err(ReliableClientDecodeError::from_station_decode)?;
-                Self::Data { sequence, payload }
+                ReliableClientFrameRef::Data { sequence, payload }
             }
-            RELIABLE_CLIENT_KIND_ACK => Self::Ack { sequence },
+            RELIABLE_CLIENT_KIND_ACK => ReliableClientFrameRef::Ack { sequence },
             other => return Err(ReliableClientDecodeError::UnknownKind(other)),
         };
         cursor
@@ -2458,12 +2495,29 @@ impl ReliableClientEndpoint {
         let source_client = packet
             .client_id
             .ok_or(ReliableClientError::MissingSourceClient)?;
-        match ReliableClientFrame::decode(&packet.bytes).map_err(ReliableClientError::Decode)? {
-            ReliableClientFrame::Data { sequence, payload } => {
-                self.receiver
-                    .handle_data(transport, packet, source_client, sequence, payload)
+        match ReliableClientFrame::decode_ref(&packet.bytes).map_err(ReliableClientError::Decode)? {
+            ReliableClientFrameRef::Data { sequence, payload } => {
+                let payload_len = payload.len();
+                let payload_offset = packet.bytes.len().saturating_sub(payload_len);
+                let InboundPacket {
+                    client_id,
+                    remote_addr,
+                    bytes,
+                } = packet;
+                let payload = reuse_reliable_payload(bytes, payload_offset, payload_len);
+                self.receiver.handle_data(
+                    transport,
+                    InboundPacket {
+                        client_id,
+                        remote_addr,
+                        bytes: Vec::new(),
+                    },
+                    source_client,
+                    sequence,
+                    payload,
+                )
             }
-            ReliableClientFrame::Ack { sequence } => {
+            ReliableClientFrameRef::Ack { sequence } => {
                 self.sender.acknowledge(source_client, sequence);
                 Ok(None)
             }
@@ -2584,6 +2638,36 @@ pub enum ReliableStationFrame {
     },
 }
 
+/// Borrowed reliable Station frame decoded from caller-owned bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReliableStationFrameRef<'a> {
+    /// Reliable data packet with borrowed payload bytes.
+    Data {
+        /// Sender-local sequence number scoped to the target Station.
+        sequence: u64,
+        /// Payload borrowed from the encoded frame.
+        payload: &'a [u8],
+    },
+    /// Acknowledgement for a reliable data packet.
+    Ack {
+        /// Acknowledged sequence number.
+        sequence: u64,
+    },
+}
+
+impl ReliableStationFrameRef<'_> {
+    /// Materializes the compatible owned reliable Station frame.
+    pub fn to_owned(self) -> ReliableStationFrame {
+        match self {
+            Self::Data { sequence, payload } => ReliableStationFrame::Data {
+                sequence,
+                payload: payload.to_vec(),
+            },
+            Self::Ack { sequence } => ReliableStationFrame::Ack { sequence },
+        }
+    }
+}
+
 impl ReliableStationFrame {
     /// Appends a data frame from a borrowed payload without materializing an owned frame.
     pub fn encode_data(
@@ -2619,6 +2703,13 @@ impl ReliableStationFrame {
 
     /// Decodes a reliable station frame.
     pub fn decode(input: &[u8]) -> Result<Self, ReliableStationDecodeError> {
+        Self::decode_ref(input).map(ReliableStationFrameRef::to_owned)
+    }
+
+    /// Decodes a reliable Station frame while borrowing data payload bytes.
+    pub fn decode_ref(
+        input: &[u8],
+    ) -> Result<ReliableStationFrameRef<'_>, ReliableStationDecodeError> {
         let mut cursor = ReliableCursor::new(input);
         let magic = cursor.read_array::<4>()?;
         if magic != RELIABLE_STATION_MAGIC {
@@ -2629,10 +2720,10 @@ impl ReliableStationFrame {
         let frame = match kind {
             RELIABLE_KIND_DATA => {
                 let len = cursor.read_u32()? as usize;
-                let payload = cursor.read_bytes(len)?;
-                Self::Data { sequence, payload }
+                let payload = cursor.read_slice(len)?;
+                ReliableStationFrameRef::Data { sequence, payload }
             }
-            RELIABLE_KIND_ACK => Self::Ack { sequence },
+            RELIABLE_KIND_ACK => ReliableStationFrameRef::Ack { sequence },
             other => return Err(ReliableStationDecodeError::UnknownKind(other)),
         };
         cursor.finish()?;
@@ -3186,11 +3277,30 @@ impl ReliableStationEndpoint {
         transport: &mut T,
         packet: StationInboundPacket,
     ) -> Result<Option<StationInboundPacket>, ReliableStationError<T::Error>> {
-        match ReliableStationFrame::decode(&packet.bytes).map_err(ReliableStationError::Decode)? {
-            ReliableStationFrame::Data { sequence, payload } => self
-                .receiver
-                .handle_data(transport, packet, sequence, payload),
-            ReliableStationFrame::Ack { sequence } => {
+        match ReliableStationFrame::decode_ref(&packet.bytes)
+            .map_err(ReliableStationError::Decode)?
+        {
+            ReliableStationFrameRef::Data { sequence, payload } => {
+                let payload_len = payload.len();
+                let payload_offset = packet.bytes.len().saturating_sub(payload_len);
+                let StationInboundPacket {
+                    source_station,
+                    target_station,
+                    bytes,
+                } = packet;
+                let payload = reuse_reliable_payload(bytes, payload_offset, payload_len);
+                self.receiver.handle_data(
+                    transport,
+                    StationInboundPacket {
+                        source_station,
+                        target_station,
+                        bytes: Vec::new(),
+                    },
+                    sequence,
+                    payload,
+                )
+            }
+            ReliableStationFrameRef::Ack { sequence } => {
                 self.sender.acknowledge(packet.source_station, sequence);
                 Ok(None)
             }
@@ -3239,9 +3349,9 @@ impl<'a> ReliableCursor<'a> {
         Ok(out)
     }
 
-    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, ReliableStationDecodeError> {
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], ReliableStationDecodeError> {
         self.require(len)?;
-        let bytes = self.input[self.offset..self.offset + len].to_vec();
+        let bytes = &self.input[self.offset..self.offset + len];
         self.offset += len;
         Ok(bytes)
     }
@@ -3267,6 +3377,12 @@ impl<'a> ReliableCursor<'a> {
             ))
         }
     }
+}
+
+fn reuse_reliable_payload(mut wire_bytes: Vec<u8>, offset: usize, len: usize) -> Vec<u8> {
+    wire_bytes.copy_within(offset..offset.saturating_add(len), 0);
+    wire_bytes.truncate(len);
+    wire_bytes
 }
 
 /// Bounded in-memory station transport limits.
@@ -4737,8 +4853,26 @@ mod tests {
             .expect("borrowed data frame should encode");
         assert_eq!(direct, bytes);
         assert_eq!(
+            ReliableClientFrame::decode_ref(&bytes).expect("data frame view should decode"),
+            ReliableClientFrameRef::Data {
+                sequence: 42,
+                payload: b"command"
+            }
+        );
+        assert_eq!(
             ReliableClientFrame::decode(&bytes).expect("data frame should decode"),
             data
+        );
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(
+            ReliableClientFrame::decode_ref(truncated).expect_err("view should reject truncation"),
+            ReliableClientFrame::decode(truncated).expect_err("owned should reject truncation")
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            ReliableClientFrame::decode_ref(&trailing).expect_err("view should reject trailing"),
+            ReliableClientFrame::decode(&trailing).expect_err("owned should reject trailing")
         );
 
         let ack = ReliableClientFrame::Ack { sequence: 42 };
@@ -4781,6 +4915,7 @@ mod tests {
             .try_recv()
             .expect("server receive should work")
             .expect("data packet should exist");
+        let wire_pointer = raw.bytes.as_ptr();
         let delivered = server
             .handle_inbound(&mut server_transport, raw)
             .expect("data packet should handle")
@@ -4788,6 +4923,7 @@ mod tests {
         assert_eq!(delivered.client_id, Some(client_id));
         assert_eq!(delivered.remote_addr, memory_addr(20007));
         assert_eq!(delivered.bytes, b"command");
+        assert_eq!(delivered.bytes.as_ptr(), wire_pointer);
         assert_eq!(server.receiver.stats().data_delivered, 1);
         assert_eq!(server.receiver.stats().acks_sent, 1);
 
@@ -5209,8 +5345,26 @@ mod tests {
             .expect("borrowed data frame should encode");
         assert_eq!(direct, bytes);
         assert_eq!(
+            ReliableStationFrame::decode_ref(&bytes).expect("data frame view should decode"),
+            ReliableStationFrameRef::Data {
+                sequence: 42,
+                payload: b"station-event"
+            }
+        );
+        assert_eq!(
             ReliableStationFrame::decode(&bytes).expect("data frame should decode"),
             data
+        );
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(
+            ReliableStationFrame::decode_ref(truncated).expect_err("view should reject truncation"),
+            ReliableStationFrame::decode(truncated).expect_err("owned should reject truncation")
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            ReliableStationFrame::decode_ref(&trailing).expect_err("view should reject trailing"),
+            ReliableStationFrame::decode(&trailing).expect_err("owned should reject trailing")
         );
 
         let ack = ReliableStationFrame::Ack { sequence: 42 };
@@ -5250,6 +5404,7 @@ mod tests {
             .try_recv_station(station_two)
             .expect("receive should work")
             .expect("data packet should exist");
+        let wire_pointer = raw.bytes.as_ptr();
         let delivered = second
             .handle_inbound(&mut transport, raw)
             .expect("data packet should handle")
@@ -5257,6 +5412,7 @@ mod tests {
         assert_eq!(delivered.source_station, station_one);
         assert_eq!(delivered.target_station, station_two);
         assert_eq!(delivered.bytes, b"event");
+        assert_eq!(delivered.bytes.as_ptr(), wire_pointer);
         assert_eq!(second.receiver.stats().data_delivered, 1);
         assert_eq!(second.receiver.stats().acks_sent, 1);
 

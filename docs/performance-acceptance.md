@@ -665,6 +665,37 @@ not a timing threshold. Transport tests cover byte equality, capacity retention,
 duplicate suppression, failed-send attempt preservation, and ordered timeout
 behavior.
 
+## Reliable Receive Payload Ownership Measurement
+
+`ReliableClientFrame::decode_ref` and `ReliableStationFrame::decode_ref`
+validate frame structure while borrowing data payload bytes. Standard reliable
+endpoints use those views, move the payload to the front of the already-owned
+wire Vec, and truncate it before delivery. Compatible owned frame decoders
+materialize a new payload Vec.
+
+Compare wire reuse with owned payload decoding using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example reliable_receive_ownership
+cargo run --release -q -p sectorsync-bench --example reliable_receive_ownership -- --owned-decode
+cargo run --release -q -p sectorsync-bench --example reliable_receive_ownership -- --station
+cargo run --release -q -p sectorsync-bench --example reliable_receive_ownership -- --station --owned-decode
+```
+
+The default preloaded workload receives 2,000 frames per tick with 1 KiB
+payloads for ten ticks. Guards cap 4,000 frames per tick, 4 KiB payloads, 20
+ticks, and 64 MiB aggregate payload work without `--allow-heavy`; execution has
+a 10-second budget.
+
+Five alternating release A/B runs per frame kind each processed 20,000 frames
+and `20,480,000` payload bytes with a `20,880,000` checksum. Wire reuse retained
+the original Vec pointer for all 20,000 payloads and created zero fresh payloads;
+owned decoding created 20,000. Client median tick p99 was 0.494 ms reuse versus
+0.623 ms owned, about a 20.7% reduction. Station median tick p99 was 0.527 ms
+reuse versus 0.672 ms owned, about a 21.6% reduction. Exact bytes/checksums,
+full pointer reuse, zero fresh payloads, endpoint ACK/duplicate tests, guard
+metadata, and `benchmark_ok=true` are the portable acceptance signals.
+
 ## Reliable Window Count Measurement
 
 Reliable Client and Station senders maintain a `BTreeMap` count per active peer

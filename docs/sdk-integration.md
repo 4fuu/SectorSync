@@ -111,6 +111,14 @@ bounded by the configured window, interval, and attempt limits.
 of scanning all packets. ACK and timeout removal update that index immediately;
 the final packet for a peer also removes its count entry.
 
+Reliable Client and Station endpoints borrow-decode inbound frames and reuse
+the received wire Vec as the unique delivered payload after removing the fixed
+reliable header in place. This is automatic in `handle_inbound`; use
+`ReliableClientFrame::decode_ref` or `ReliableStationFrame::decode_ref` when
+inspecting frame bytes directly, and compatible owned `decode` only when the
+payload must be materialized independently. ACK ordering, duplicate suppression,
+source metadata, and bounded delivery history are unchanged.
+
 For repeated security sealing, retain `PacketSecurityScratch` and call
 `seal_into`, `seal_with_nonce_into`, or `seal_with_key_ring_into`. The scratch
 retains encrypted-payload and authentication-tag storage; the final wire Vec

@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Reliable Client and Station receive endpoints now borrow-decode frames and
+  reuse each inbound wire Vec as the delivered payload instead of allocating a
+  second payload buffer; compatible owned decoders remain available.
 - Station restore now preallocates record, generation, and entity-id index
   storage from snapshot size and offers tracked capacity observations.
 - Station and frozen barrier snapshot export now support caller-owned reusable
