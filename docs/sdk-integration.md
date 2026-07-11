@@ -94,7 +94,9 @@ result back through controlled APIs such as:
 - `CellIndex::upsert` after transform/bounds changes. Point updates that remain
   in the same cell avoid index mutation and allocation automatically; point
   updates that cross cells retain their entity-cell list and update the mapping
-  in place. Use `upsert_tracked` only when the application needs the outcome.
+  in place. Sphere/AABB updates compare existing multi-cell membership before
+  allocating a replacement list. Use `upsert_tracked` only when the application
+  needs the outcome.
 - `EventRouter` or station event transport for ordered cross-station effects.
 
 Ghost records are read-only and must never finalize business state.

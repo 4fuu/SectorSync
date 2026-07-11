@@ -232,15 +232,17 @@ impl CellIndex {
             }
             vec![cell]
         } else {
-            let cells = self.grid.cells_for_bounds(position, bounds);
+            let aabb = bounds.to_aabb(position);
+            let min = self.grid.cell_at(aabb.min);
+            let max = self.grid.cell_at(aabb.max);
             if self
                 .entity_cells
                 .get(&handle)
-                .is_some_and(|current| current == &cells)
+                .is_some_and(|current| cells_match_range(current, min, max))
             {
                 return CellIndexUpdate::Unchanged;
             }
-            cells
+            collect_cell_range(min, max)
         };
         let existed = self.remove(handle);
         for cell in &cells {
@@ -395,6 +397,35 @@ impl CellIndex {
     }
 }
 
+fn cells_match_range(cells: &[CellCoord3], min: CellCoord3, max: CellCoord3) -> bool {
+    if cells.len() != query_cell_volume(min, max) {
+        return false;
+    }
+    let mut cells = cells.iter();
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                if cells.next() != Some(&CellCoord3::new(x, y, z)) {
+                    return false;
+                }
+            }
+        }
+    }
+    cells.next().is_none()
+}
+
+fn collect_cell_range(min: CellCoord3, max: CellCoord3) -> Vec<CellCoord3> {
+    let mut cells = Vec::with_capacity(query_cell_volume(min, max));
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                cells.push(CellCoord3::new(x, y, z));
+            }
+        }
+    }
+    cells
+}
+
 fn query_cell_volume(min: CellCoord3, max: CellCoord3) -> usize {
     fn axis_cells(min: i32, max: i32) -> usize {
         if max < min {
@@ -494,9 +525,32 @@ mod tests {
             index.upsert_tracked(handle, Position3::new(9.0, 0.0, 0.0), bounds),
             CellIndexUpdate::Inserted
         );
+        let retained_cells = index
+            .entity_cells
+            .get(&handle)
+            .expect("bounded entity has cells")
+            .as_ptr();
         assert_eq!(
             index.upsert_tracked(handle, Position3::new(9.5, 0.0, 0.0), bounds),
             CellIndexUpdate::Unchanged
+        );
+        assert_eq!(
+            index
+                .entity_cells
+                .get(&handle)
+                .expect("unchanged bounds retain cells")
+                .as_ptr(),
+            retained_cells
+        );
+
+        let relocated_position = Position3::new(12.5, 0.0, 0.0);
+        assert_eq!(
+            index.upsert_tracked(handle, relocated_position, bounds),
+            CellIndexUpdate::Relocated
+        );
+        assert_eq!(
+            index.cells_for_handle(handle),
+            Some(grid.cells_for_bounds(relocated_position, bounds).as_slice())
         );
     }
 

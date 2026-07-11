@@ -33,6 +33,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Component storage now supports validated in-place slice updates and
   caller-owned typed encoding scratch, avoiding repeated blob-buffer allocation
   on high-frequency component writes.
+- Multi-cell sphere/AABB index updates now compare retained membership directly
+  in deterministic grid order and allocate a new cell list only when membership
+  actually changes.
 
 ## [2026.7.10] - 2026-07-10
 

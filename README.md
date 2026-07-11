@@ -18,6 +18,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Uniform 3D cell indexing with deterministic AOI candidate queries.
 - Point updates skip unchanged work and relocate their entity-cell mapping in
   place when crossing cells.
+- Multi-cell sphere/AABB updates compare retained membership without a temporary
+  cell-list allocation.
 - Exactly one authoritative owner per entity and read-only ghost semantics.
 - Range, frustum, tag, cadence, priority, and byte-budget replication filters.
 - Reusable caller-owned query and replication scratch buffers.
@@ -231,6 +233,18 @@ comparison. Use `--component-update-percent` to exercise repeated component
 writes; `--force-component-replace` is its allocation/replacement comparison.
 This measures spatial planning and wire encoding, not gameplay, matchmaking,
 room lifecycle, persistence, or network capacity.
+
+Repeated sphere/AABB updates that remain within the same covered cells have a
+separate guarded release benchmark:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example multi_cell_bounds
+cargo run --release -q -p sectorsync-bench --example multi_cell_bounds -- `
+  --materialize-cell-list
+```
+
+The second command materializes the temporary cell list removed by the
+optimized path for an explicit A/B comparison.
 
 For explicit parallel planning, `ParallelReplicationScratch` retains at most one
 planning scratch lane per configured worker, not per Station batch. The

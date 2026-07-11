@@ -295,6 +295,30 @@ idle-room scheduling, command/event pumps, kernel networking, persistence, or
 matchmaking. Treat it as evidence for active-room spatial planning and encoding,
 not a complete room-server capacity promise.
 
+## Multi-Cell Bounds Update Measurement
+
+The guarded `multi_cell_bounds` benchmark covers repeated sphere updates whose
+27-cell membership remains unchanged. The default path compares retained cells
+directly in deterministic grid order. `--materialize-cell-list` additionally
+constructs and consumes the temporary list removed by the optimized path:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example multi_cell_bounds
+cargo run --release -q -p sectorsync-bench --example multi_cell_bounds -- `
+  --materialize-cell-list
+```
+
+The default guard allows at most 50,000 entities and 20 ticks without
+`--allow-heavy`; execution also has a 10-second budget. Machine-readable output
+includes update percentiles, update outcome counts, materialized cell count,
+path/workload/membership verdicts, and `benchmark_ok`.
+
+For 20,000 bounded entities across ten ticks, all 200,000 updates retained their
+membership. Three alternating release runs reported median update p99 of
+3.194 ms without materialization versus 7.914 ms when materializing 5,400,000
+temporary cell coordinates. This isolates the removed list-construction work;
+real boundary crossings still rebuild persistent membership as required.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
