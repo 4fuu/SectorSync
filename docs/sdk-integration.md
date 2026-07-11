@@ -196,6 +196,13 @@ mutated independently of that packet. Use `FrameDecoder::decode` or
 across that lifetime boundary. Source/target validation and application of
 component semantics remain caller responsibilities on this low-level path.
 
+For synchronous UDP receive loops, `UdpTransport::try_recv_ref` and
+`UdpStationTransport::try_recv_station_ref` expose bytes from each adapter's
+configured reusable datagram buffer. Consume and decode the view before the
+next mutable adapter operation. Use the compatible `TransportReceiver` or
+`StationTransportReceiver` methods when a packet must be queued, transferred,
+or retained independently of the adapter.
+
 Only clear dirty state after the integration's chosen delivery/ACK contract
 confirms it. `ReplicationTracker` provides bounded send/ACK bookkeeping but does
 not invent that protocol.

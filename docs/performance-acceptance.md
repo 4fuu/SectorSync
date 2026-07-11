@@ -813,11 +813,40 @@ decoded payload work to 64 MiB without `--allow-heavy`. Execution has a
 Five alternating release A/B runs each decoded 1,000 frames, 64,000 entities,
 256,000 components, and `16,384,000` payload bytes with a `46,080,000`
 checksum. Borrowed decoding materialized zero owned frames; the comparison
-materialized 1,000 owned nested frames. Median tick p99 was 0.795 ms borrowed
-versus 2.793 ms owned, about a 72% reduction on this development host. Timings
+materialized 1,000 owned nested frames. After restoring single-pass parsing for
+the compatible owned decoder, median tick p99 was 0.754 ms borrowed versus
+2.511 ms owned, about a 70% reduction on this development host. Timings
 are local evidence; identical workload/checksum, complete validation, borrowed
 payload pointers, and zero owned materializations are the portable acceptance
 signals.
+
+## Borrowed UDP Receive Measurement
+
+`UdpTransport::try_recv_ref` and
+`UdpStationTransport::try_recv_station_ref` borrow datagram bytes from the
+adapter's configured reusable receive buffer. The compatible receiver traits
+materialize owned payload Vecs when packets must leave that lifetime.
+
+Compare borrowed and owned localhost receive paths using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example udp_receive_borrowed
+cargo run --release -q -p sectorsync-bench --example udp_receive_borrowed -- --owned
+```
+
+The default workload sends and receives 500 localhost datagrams per tick with
+1 KiB payloads for ten ticks. Guards cap 2,000 packets per tick, 4 KiB payloads,
+20 ticks, and 64 MiB aggregate payload work without `--allow-heavy`. Every
+packet has at most 1,000 non-blocking polls and the run has a 10-second budget.
+
+Five alternating release A/B runs each received 5,000 packets and `5,120,000`
+payload bytes with a `900,000` checksum and zero poll misses. Borrowed receive
+materialized zero owned packets and reused the same buffer 4,999 times; the
+comparison materialized 5,000 owned packets. Median tick p99 was 5.667 ms
+borrowed versus 5.259 ms owned, so this syscall-dominated localhost measurement
+does not show a latency improvement. The portable benefit is removal of
+per-datagram owned payload allocation for immediate consumers, not a claim that
+UDP syscall latency decreases.
 
 ## Optional Heavy Calibration
 

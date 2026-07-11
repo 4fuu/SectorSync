@@ -1015,7 +1015,7 @@ impl FrameDecoder for BinaryFrameDecoder {
             .ok_or(BinaryDecodeError::UnknownFrameKind(kind_byte))?;
         let frame = match kind {
             FrameKind::Replication => {
-                RuntimeFrame::Replication(decode_replication_ref(&mut cursor)?.to_owned())
+                RuntimeFrame::Replication(decode_replication_owned(&mut cursor)?)
             }
             FrameKind::CommandAck => RuntimeFrame::CommandAck(CommandAckFrame {
                 client_id: ClientId::new(cursor.read_u64()?),
@@ -1331,6 +1331,38 @@ fn decode_replication_ref<'a>(
         estimated_payload_bytes,
         encoded_entities,
         encoded_entity_count,
+    })
+}
+
+fn decode_replication_owned(
+    cursor: &mut Cursor<'_>,
+) -> Result<ReplicationFrame, BinaryDecodeError> {
+    let client_id = ClientId::new(cursor.read_u64()?);
+    let server_tick = Tick::new(cursor.read_u64()?);
+    let entity_count = cursor.read_u32()?;
+    let estimated_payload_bytes = cursor.read_u32()?;
+    let encoded_entity_count = cursor.read_u32()? as usize;
+    let mut entities = Vec::with_capacity(encoded_entity_count);
+    for _ in 0..encoded_entity_count {
+        let entity_id = EntityId::new(cursor.read_u64()?);
+        let owner_epoch = OwnerEpoch::new(cursor.read_u64()?);
+        let encoded_component_count = cursor.read_u16()? as usize;
+        let mut components = Vec::with_capacity(encoded_component_count);
+        for _ in 0..encoded_component_count {
+            components.push(decode_component_ref(cursor)?.to_owned());
+        }
+        entities.push(EntityDelta {
+            entity_id,
+            owner_epoch,
+            components,
+        });
+    }
+    Ok(ReplicationFrame {
+        client_id,
+        server_tick,
+        entity_count,
+        estimated_payload_bytes,
+        entities,
     })
 }
 

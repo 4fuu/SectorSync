@@ -87,6 +87,13 @@ traits at packet or batch granularity. A receiver must return `Ok(None)` when no
 packet is ready; it must not block a station tick. Enforce bounded packet bytes,
 queue depth, and work per pump call in the adapter.
 
+The standard UDP adapters offer borrowed `try_recv_ref` variants for immediate
+synchronous consumption. Their byte slices alias the configured internal
+receive buffer and expire on the next mutable adapter operation. This removes
+per-datagram owned payload materialization but does not remove socket syscall,
+kernel buffering, or application decode costs. Use owned receiver traits at
+queue and cross-thread ownership boundaries.
+
 Keep these concerns outside the standard UDP and in-memory adapters:
 
 - Connection establishment and reconnect loops.

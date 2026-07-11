@@ -33,6 +33,28 @@ pub struct InboundPacket {
     pub bytes: Vec<u8>,
 }
 
+/// Borrowed inbound packet backed by a transport-owned receive buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboundPacketRef<'a> {
+    /// Known client id for `remote_addr`, if the transport has one registered.
+    pub client_id: Option<ClientId>,
+    /// Address the datagram came from.
+    pub remote_addr: SocketAddr,
+    /// Encoded bytes valid until the transport is mutably reused.
+    pub bytes: &'a [u8],
+}
+
+impl InboundPacketRef<'_> {
+    /// Materializes the compatible owned packet shape.
+    pub fn to_owned(self) -> InboundPacket {
+        InboundPacket {
+            client_id: self.client_id,
+            remote_addr: self.remote_addr,
+            bytes: self.bytes.to_vec(),
+        }
+    }
+}
+
 /// Outbound station-to-station packet after wire encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StationOutboundPacket {
@@ -53,6 +75,28 @@ pub struct StationInboundPacket {
     pub target_station: StationId,
     /// Encoded bytes.
     pub bytes: Vec<u8>,
+}
+
+/// Borrowed station packet backed by a transport-owned receive buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationInboundPacketRef<'a> {
+    /// Source station resolved from the remote address.
+    pub source_station: StationId,
+    /// Target station owned by the receiving adapter.
+    pub target_station: StationId,
+    /// Encoded bytes valid until the transport is mutably reused.
+    pub bytes: &'a [u8],
+}
+
+impl StationInboundPacketRef<'_> {
+    /// Materializes the compatible owned packet shape.
+    pub fn to_owned(self) -> StationInboundPacket {
+        StationInboundPacket {
+            source_station: self.source_station,
+            target_station: self.target_station,
+            bytes: self.bytes.to_vec(),
+        }
+    }
 }
 
 /// Batch of outbound station-to-station packets.
@@ -3610,6 +3654,41 @@ impl UdpStationTransport {
     pub const fn stats(&self) -> UdpStationTransportStats {
         self.stats
     }
+
+    /// Receives one station packet while borrowing the reusable UDP buffer.
+    ///
+    /// Consume or copy the returned bytes before the next mutable operation on
+    /// this adapter. The call remains non-blocking and returns `Ok(None)` when
+    /// no datagram is ready.
+    pub fn try_recv_station_ref(
+        &mut self,
+        target_station: StationId,
+    ) -> Result<Option<StationInboundPacketRef<'_>>, UdpStationTransportError> {
+        if target_station != self.local_station {
+            return Err(UdpStationTransportError::TargetStationMismatch {
+                local_station: self.local_station,
+                requested_target: target_station,
+            });
+        }
+        match self.socket.recv_from(&mut self.recv_buffer) {
+            Ok((len, remote_addr)) => {
+                let source_station = self
+                    .addr_to_station
+                    .get(&remote_addr)
+                    .copied()
+                    .ok_or(UdpStationTransportError::UnknownRemote(remote_addr))?;
+                self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+                self.stats.bytes_received = self.stats.bytes_received.saturating_add(len);
+                Ok(Some(StationInboundPacketRef {
+                    source_station,
+                    target_station: self.local_station,
+                    bytes: &self.recv_buffer[..len],
+                }))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 impl StationTransportSink for UdpStationTransport {
@@ -3646,30 +3725,9 @@ impl StationTransportReceiver for UdpStationTransport {
         &mut self,
         target_station: StationId,
     ) -> Result<Option<StationInboundPacket>, Self::Error> {
-        if target_station != self.local_station {
-            return Err(UdpStationTransportError::TargetStationMismatch {
-                local_station: self.local_station,
-                requested_target: target_station,
-            });
-        }
-        match self.socket.recv_from(&mut self.recv_buffer) {
-            Ok((len, remote_addr)) => {
-                let source_station = self
-                    .addr_to_station
-                    .get(&remote_addr)
-                    .copied()
-                    .ok_or(UdpStationTransportError::UnknownRemote(remote_addr))?;
-                self.stats.packets_received = self.stats.packets_received.saturating_add(1);
-                self.stats.bytes_received = self.stats.bytes_received.saturating_add(len);
-                Ok(Some(StationInboundPacket {
-                    source_station,
-                    target_station: self.local_station,
-                    bytes: self.recv_buffer[..len].to_vec(),
-                }))
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        Ok(self
+            .try_recv_station_ref(target_station)?
+            .map(StationInboundPacketRef::to_owned))
     }
 }
 
@@ -3797,6 +3855,23 @@ impl UdpTransport {
     pub fn recv_buffer_size(&self) -> usize {
         self.recv_buffer.len()
     }
+
+    /// Receives one packet while borrowing the reusable UDP buffer.
+    ///
+    /// Consume or copy the returned bytes before the next mutable operation on
+    /// this adapter. The call remains non-blocking and returns `Ok(None)` when
+    /// no datagram is ready.
+    pub fn try_recv_ref(&mut self) -> Result<Option<InboundPacketRef<'_>>, UdpTransportError> {
+        match self.socket.recv_from(&mut self.recv_buffer) {
+            Ok((len, remote_addr)) => Ok(Some(InboundPacketRef {
+                client_id: self.addr_to_client.get(&remote_addr).copied(),
+                remote_addr,
+                bytes: &self.recv_buffer[..len],
+            })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 impl TransportSink for UdpTransport {
@@ -3825,15 +3900,7 @@ impl TransportReceiver for UdpTransport {
     type Error = UdpTransportError;
 
     fn try_recv(&mut self) -> Result<Option<InboundPacket>, Self::Error> {
-        match self.socket.recv_from(&mut self.recv_buffer) {
-            Ok((len, remote_addr)) => Ok(Some(InboundPacket {
-                client_id: self.addr_to_client.get(&remote_addr).copied(),
-                remote_addr,
-                bytes: self.recv_buffer[..len].to_vec(),
-            })),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        Ok(self.try_recv_ref()?.map(InboundPacketRef::to_owned))
     }
 }
 
@@ -4007,6 +4074,28 @@ mod tests {
         panic!("udp packet was not received");
     }
 
+    fn recv_ref_with_retry(
+        transport: &mut UdpTransport,
+    ) -> (Option<ClientId>, SocketAddr, usize, u8, u8, usize) {
+        for _ in 0..50 {
+            if let Some(packet) = transport
+                .try_recv_ref()
+                .expect("borrowed udp receive should work")
+            {
+                return (
+                    packet.client_id,
+                    packet.remote_addr,
+                    packet.bytes.len(),
+                    packet.bytes.first().copied().unwrap_or(0),
+                    packet.bytes.last().copied().unwrap_or(0),
+                    packet.bytes.as_ptr() as usize,
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("borrowed udp packet was not received");
+    }
+
     fn recv_station_with_retry(
         transport: &mut UdpStationTransport,
         station_id: StationId,
@@ -4021,6 +4110,29 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         panic!("udp station packet was not received");
+    }
+
+    fn recv_station_ref_with_retry(
+        transport: &mut UdpStationTransport,
+        station_id: StationId,
+    ) -> (StationId, StationId, usize, u8, u8, usize) {
+        for _ in 0..50 {
+            if let Some(packet) = transport
+                .try_recv_station_ref(station_id)
+                .expect("borrowed udp station receive should work")
+            {
+                return (
+                    packet.source_station,
+                    packet.target_station,
+                    packet.bytes.len(),
+                    packet.bytes.first().copied().unwrap_or(0),
+                    packet.bytes.last().copied().unwrap_or(0),
+                    packet.bytes.as_ptr() as usize,
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("borrowed udp station packet was not received");
     }
 
     #[derive(Clone, Debug, Default)]
@@ -5478,10 +5590,20 @@ mod tests {
                 bytes: b"command".to_vec(),
             })
             .expect("client should send");
-        let inbound = recv_with_retry(&mut server);
-        assert_eq!(inbound.client_id, Some(client_id));
-        assert_eq!(inbound.remote_addr, client_addr);
-        assert_eq!(inbound.bytes, b"command");
+        let first = recv_ref_with_retry(&mut server);
+        assert_eq!(first.0, Some(client_id));
+        assert_eq!(first.1, client_addr);
+        assert_eq!((first.2, first.3, first.4), (7, b'c', b'd'));
+
+        client
+            .send(OutboundPacket {
+                client_id: server_id,
+                bytes: b"next".to_vec(),
+            })
+            .expect("client should send another packet");
+        let second = recv_ref_with_retry(&mut server);
+        assert_eq!((second.2, second.3, second.4), (4, b'n', b't'));
+        assert_eq!(second.5, first.5);
 
         server
             .send(OutboundPacket {
@@ -5534,10 +5656,21 @@ mod tests {
                 bytes: b"handoff-prepare".to_vec(),
             })
             .expect("first station should send");
-        let inbound = recv_station_with_retry(&mut second, station_two);
-        assert_eq!(inbound.source_station, station_one);
-        assert_eq!(inbound.target_station, station_two);
-        assert_eq!(inbound.bytes, b"handoff-prepare");
+        let prepare = recv_station_ref_with_retry(&mut second, station_two);
+        assert_eq!(prepare.0, station_one);
+        assert_eq!(prepare.1, station_two);
+        assert_eq!((prepare.2, prepare.3, prepare.4), (15, b'h', b'e'));
+
+        first
+            .send_station(StationOutboundPacket {
+                source_station: station_one,
+                target_station: station_two,
+                bytes: b"next".to_vec(),
+            })
+            .expect("first station should send another packet");
+        let next = recv_station_ref_with_retry(&mut second, station_two);
+        assert_eq!((next.2, next.3, next.4), (4, b'n', b't'));
+        assert_eq!(next.5, prepare.5);
 
         second
             .send_station(StationOutboundPacket {
@@ -5550,10 +5683,10 @@ mod tests {
         assert_eq!(inbound.source_station, station_two);
         assert_eq!(inbound.target_station, station_one);
         assert_eq!(inbound.bytes, b"handoff-commit");
-        assert_eq!(first.stats().packets_sent, 1);
+        assert_eq!(first.stats().packets_sent, 2);
         assert_eq!(first.stats().packets_received, 1);
         assert_eq!(second.stats().packets_sent, 1);
-        assert_eq!(second.stats().packets_received, 1);
+        assert_eq!(second.stats().packets_received, 2);
     }
 
     #[test]

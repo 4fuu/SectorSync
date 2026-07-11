@@ -42,6 +42,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
   event frames.
 - Low-level in-memory, reliable packet, and non-blocking UDP adapters.
+- UDP client and Station adapters support borrowed receive views that reuse the
+  configured datagram buffer for synchronous packet consumption.
 - Reliable Client and Station senders encode borrowed payloads directly and
   support caller-owned retry scan scratch without cloning in-flight payloads.
 - Reliable sender window admission uses per-peer counters instead of scanning
@@ -203,6 +205,8 @@ cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --release --example deployment_stale_scan
 cargo run -p sectorsync-bench --release --example deployment_stale_scan -- --collect-mark
 cargo run -p sectorsync-bench --example station_event_transport
+cargo run -p sectorsync-bench --release --example udp_receive_borrowed
+cargo run -p sectorsync-bench --release --example udp_receive_borrowed -- --owned
 cargo run -p sectorsync-bench --release --example reliable_frame_encode
 cargo run -p sectorsync-bench --release --example reliable_frame_encode -- --owned-frame
 cargo run -p sectorsync-bench --release --example reliable_retry_reuse
