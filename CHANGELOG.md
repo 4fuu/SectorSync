@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Gateway session storage now retains ordered lookup for small tables and
+  promotes once to hash lookup at 1,024 sessions, preserving route, admission,
+  reconnect, expiry, capacity, and statistics semantics across migration.
 - Core Command and Station Event priority queues now allocate slots on demand
   instead of reserving every configured maximum at construction; per-priority
   and aggregate retained capacities are observable for multi-room host metrics.

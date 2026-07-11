@@ -544,7 +544,7 @@ executable borrowed `split_migration` flow.
 
 ## Gateway Expiry Scan Measurement
 
-`GatewaySessionTable::expire_disconnected` now uses one `BTreeMap::retain` pass.
+`GatewaySessionTable::expire_disconnected` uses one in-place map `retain` pass.
 Connected sessions and disconnected sessions at or inside the grace boundary
 remain; stale sessions are removed in place and counted from the map length
 delta. The isolated benchmark compares this production algorithm shape with the
@@ -569,6 +569,31 @@ The retain path created zero temporary id collections; the comparison created
 collect/remove, about a 67% reduction on this development host. Core tests cover
 connected sessions, the exact grace boundary, stale removal, repeated expiry,
 and cumulative statistics; the benchmark test compares final maps exactly.
+
+## Gateway Session Lookup Measurement
+
+`GatewaySessionTable` starts with ordered session storage and promotes once to
+hash storage when adding the 1,024th distinct Client. The one-way transition
+preserves route, generation, route epoch, sequence/rate state, connection state,
+expiry behavior, capacity checks, and cumulative statistics. Gateway APIs do
+not expose storage iteration order.
+
+Compare Gateway-shaped records under identical route and admission operations:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example gateway_session_lookup
+cargo run --release -q -p sectorsync-bench --example gateway_session_lookup -- --btree
+```
+
+At ten sessions, seven release runs produced median p50 values of 0.578 ms for
+ordered lookup and 1.166 ms for hash lookup. At 1,024 sessions hash lookup was
+1.326 ms versus 1.588 ms ordered; at the default 4,096 sessions it was 1.140 ms
+versus 2.952 ms, about a 61% reduction. Each run performs one million mixed
+route reads and admission-style updates with identical 125,000 admission counts
+and checksums. Guards cap sessions, operations/tick, ticks, and total operations
+unless `--allow-heavy` is present; output includes latency percentiles,
+operation/admission/checksum fields, guard metadata, workload/admission/time
+verdicts, and `benchmark_ok=true`.
 
 ## Deployment Stale-Node Scan Measurement
 

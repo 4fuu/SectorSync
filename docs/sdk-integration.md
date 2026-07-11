@@ -126,6 +126,13 @@ retains connected sessions and sessions exactly at the grace boundary, and
 increments expiration statistics only for removed records. Account/session
 credential lifecycle remains external.
 
+Gateway session lookup adapts without configuration. Tables start with ordered
+storage for small room/local Gateway deployments and promote once to hash
+storage when adding the 1,024th distinct session. Routes, reconnect generations,
+admission counters, disconnected state, expiry, and capacity accounting survive
+the migration. Promoted tables stay hashed after expiry/removal to avoid churn
+around the threshold; no iteration order is exposed as Gateway behavior.
+
 For multi-node delivery, resolve `DeploymentRouteTable` metadata and send the
 stamped envelope through `CommandDispatchTransportBridge`. External service
 discovery decides where the node endpoint is; SectorSync only validates route

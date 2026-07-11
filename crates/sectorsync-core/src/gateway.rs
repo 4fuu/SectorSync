@@ -1,9 +1,97 @@
 //! Low-level gateway session and client routing primitives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 
 use crate::command::{CommandEnvelope, CommandRejectReason};
 use crate::ids::{ClientId, StationId, Tick};
+
+const HASHED_GATEWAY_SESSION_MIN_ENTRIES: usize = 1_024;
+
+#[derive(Clone, Debug)]
+enum AdaptiveSessionMap<K, V> {
+    Ordered(BTreeMap<K, V>),
+    Hashed(HashMap<K, V>),
+}
+
+impl<K: Copy + Eq + Hash + Ord, V> AdaptiveSessionMap<K, V> {
+    fn new() -> Self {
+        Self::Ordered(BTreeMap::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordered(entries) => entries.len(),
+            Self::Hashed(entries) => entries.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Ordered(entries) => entries.is_empty(),
+            Self::Hashed(entries) => entries.is_empty(),
+        }
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        match self {
+            Self::Ordered(entries) => entries.contains_key(key),
+            Self::Hashed(entries) => entries.contains_key(key),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self {
+            Self::Ordered(entries) => entries.get(key),
+            Self::Hashed(entries) => entries.get(key),
+        }
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        match self {
+            Self::Ordered(entries) => entries.get_mut(key),
+            Self::Hashed(entries) => entries.get_mut(key),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let promote = match self {
+            Self::Ordered(entries) => {
+                entries.len() >= HASHED_GATEWAY_SESSION_MIN_ENTRIES.saturating_sub(1)
+                    && !entries.contains_key(&key)
+            }
+            Self::Hashed(_) => false,
+        };
+        if promote {
+            let Self::Ordered(ordered) = std::mem::replace(self, Self::Hashed(HashMap::new()))
+            else {
+                unreachable!("promotion starts from ordered session storage");
+            };
+            let mut hashed = HashMap::with_capacity(ordered.len().saturating_add(1));
+            hashed.extend(ordered);
+            *self = Self::Hashed(hashed);
+        }
+        match self {
+            Self::Ordered(entries) => entries.insert(key, value),
+            Self::Hashed(entries) => entries.insert(key, value),
+        }
+    }
+
+    fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        match self {
+            Self::Ordered(entries) => entries.retain(|key, value| keep(key, value)),
+            Self::Hashed(entries) => entries.retain(|key, value| keep(key, value)),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_hashed(&self) -> bool {
+        matches!(self, Self::Hashed(_))
+    }
+}
 
 /// Gateway/session table configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,7 +346,7 @@ impl std::error::Error for GatewayError {}
 #[derive(Clone, Debug)]
 pub struct GatewaySessionTable {
     config: GatewayConfig,
-    sessions: BTreeMap<ClientId, GatewaySession>,
+    sessions: AdaptiveSessionMap<ClientId, GatewaySession>,
     stats: GatewayStats,
 }
 
@@ -267,7 +355,7 @@ impl GatewaySessionTable {
     pub fn new(config: GatewayConfig) -> Self {
         Self {
             config,
-            sessions: BTreeMap::new(),
+            sessions: AdaptiveSessionMap::new(),
             stats: GatewayStats::default(),
         }
     }
@@ -633,6 +721,66 @@ mod tests {
                 .station_id,
             StationId::new(2)
         );
+    }
+
+    #[test]
+    fn gateway_sessions_promote_without_losing_route_admission_or_expiry_state() {
+        let mut table = GatewaySessionTable::new(GatewayConfig {
+            max_sessions: HASHED_GATEWAY_SESSION_MIN_ENTRIES + 1,
+            reconnect_grace_ticks: 2,
+            max_commands_per_tick: 4,
+        });
+        for index in 0..HASHED_GATEWAY_SESSION_MIN_ENTRIES - 1 {
+            table
+                .connect(
+                    ClientId::new(u64::try_from(index).expect("test client id fits u64")),
+                    StationId::new(u32::try_from(index % 4).expect("test station id fits u32")),
+                    Tick::new(0),
+                )
+                .expect("session should connect");
+        }
+        assert!(!table.sessions.is_hashed());
+        table
+            .connect(ClientId::new(0), StationId::new(3), Tick::new(1))
+            .expect("existing session should refresh without promotion");
+        assert!(!table.sessions.is_hashed());
+        table
+            .admit_sequence(ClientId::new(0), 1, Tick::new(1))
+            .expect("command should admit before promotion");
+        table
+            .disconnect(ClientId::new(1), Tick::new(1))
+            .expect("session should disconnect before promotion");
+
+        let final_client = ClientId::new(
+            u64::try_from(HASHED_GATEWAY_SESSION_MIN_ENTRIES - 1).expect("test client id fits u64"),
+        );
+        table
+            .connect(final_client, StationId::new(2), Tick::new(2))
+            .expect("threshold session should connect");
+        assert!(table.sessions.is_hashed());
+        assert_eq!(
+            table
+                .route(ClientId::new(0))
+                .expect("route should survive")
+                .station_id,
+            StationId::new(3)
+        );
+        assert_eq!(
+            table
+                .admit_sequence(ClientId::new(0), 2, Tick::new(2))
+                .expect("admission should survive")
+                .sequence,
+            2
+        );
+        assert_eq!(table.expire_disconnected(Tick::new(4)), 1);
+        assert!(table.sessions.is_hashed());
+        assert_eq!(table.len(), HASHED_GATEWAY_SESSION_MIN_ENTRIES - 1);
+        assert_eq!(
+            table.stats.sessions_created,
+            HASHED_GATEWAY_SESSION_MIN_ENTRIES
+        );
+        assert_eq!(table.stats.sessions_expired, 1);
+        assert_eq!(table.stats.commands_admitted, 2);
     }
 
     #[test]
