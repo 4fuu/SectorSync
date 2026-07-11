@@ -994,6 +994,35 @@ development host. Identical action/update/entity counts, checksums, target
 indexes, zero fresh reports, and retained nested capacities are the portable
 acceptance signals; host timings are directional rather than universal.
 
+## Multi-Room Barrier Snapshot Storage Measurement
+
+`Station::snapshot_into` reuses one snapshot's entity Vec, while
+`BarrierController::export_snapshots_into` retains Station snapshot slots and
+nested entity capacity in caller-owned `BarrierSnapshotScratch`. Compatible
+owned snapshot APIs remain available for transfer or long-lived storage.
+
+Compare retained and fresh frozen snapshot batches using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example barrier_snapshot_reuse
+cargo run --release -q -p sectorsync-bench --example barrier_snapshot_reuse -- --fresh-storage
+```
+
+The default preloaded workload freezes 50 rooms with 256 entities each and
+exports ten snapshot batches. World construction and barrier alignment occur
+outside timing. Guards cap 100 rooms, 1,000 entities per room, 20 exports, and
+1,000,000 aggregate entity copies without `--allow-heavy`; execution has a
+10-second budget.
+
+Five alternating release A/B runs each exported 500 Station snapshots and
+128,000 entity records with an `819,264,000` entity-id checksum and matching
+barrier metrics. Reusable export created zero fresh batches; compatible export
+created ten. Median export p99 was 0.259 ms reusable versus 0.690 ms fresh,
+about a 62.5% reduction on this development host. Identical snapshot/entity
+counts, checksums, barrier metrics, zero fresh batches, and retained nested
+capacity are the portable acceptance signals; host timings are directional
+rather than universal.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

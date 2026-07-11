@@ -28,7 +28,7 @@ impl Default for SnapshotVersion {
 }
 
 /// Snapshot metadata for a single station.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotMeta {
     /// World instance id.
     pub instance_id: InstanceId,
@@ -45,7 +45,7 @@ pub struct SnapshotMeta {
 }
 
 /// In-memory station snapshot.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StationSnapshot {
     /// Snapshot metadata.
     pub meta: SnapshotMeta,

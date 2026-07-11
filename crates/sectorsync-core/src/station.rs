@@ -423,18 +423,23 @@ impl Station {
 
     /// Exports an in-memory station snapshot.
     pub fn snapshot(&self, version: SnapshotVersion) -> StationSnapshot {
-        let entities = self.iter().cloned().collect::<Vec<_>>();
-        StationSnapshot {
-            meta: SnapshotMeta {
-                instance_id: self.config.instance_id,
-                station_id: self.config.station_id,
-                tick: self.tick,
-                entity_count: entities.len(),
-                owner_epoch: self.owner_epoch,
-                version,
-            },
-            entities,
-        }
+        let mut snapshot = StationSnapshot::default();
+        self.snapshot_into(version, &mut snapshot);
+        snapshot
+    }
+
+    /// Exports an in-memory snapshot into caller-owned reusable storage.
+    pub fn snapshot_into(&self, version: SnapshotVersion, snapshot: &mut StationSnapshot) {
+        snapshot.entities.clear();
+        snapshot.entities.extend(self.iter().cloned());
+        snapshot.meta = SnapshotMeta {
+            instance_id: self.config.instance_id,
+            station_id: self.config.station_id,
+            tick: self.tick,
+            entity_count: snapshot.entities.len(),
+            owner_epoch: self.owner_epoch,
+            version,
+        };
     }
 
     /// Restores station state from a snapshot.
@@ -633,7 +638,18 @@ mod tests {
             .expect("owned move should work");
         station.advance_tick();
 
-        let snapshot = station.snapshot(SnapshotVersion::default());
+        let version = SnapshotVersion::default();
+        let snapshot = station.snapshot(version);
+        let mut reusable = StationSnapshot::default();
+        reusable.entities.reserve(1);
+        station.snapshot_into(version, &mut reusable);
+        assert_eq!(reusable, snapshot);
+        let retained_pointer = reusable.entities.as_ptr();
+        let retained_capacity = reusable.entities.capacity();
+        station.snapshot_into(version, &mut reusable);
+        assert_eq!(reusable, snapshot);
+        assert_eq!(reusable.entities.as_ptr(), retained_pointer);
+        assert_eq!(reusable.entities.capacity(), retained_capacity);
         let restored = Station::restore(config(), snapshot).expect("restore should work");
 
         assert_eq!(restored.len(), 1);

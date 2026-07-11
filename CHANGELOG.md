@@ -10,6 +10,8 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Station and frozen barrier snapshot export now support caller-owned reusable
+  entity buffers and Station slots while retaining compatible owned snapshots.
 - Split schedule execution now offers reusable ownership-update, nested
   migration-report, and shared migration working storage across multi-room
   passes while retaining compatible owned execution reports.

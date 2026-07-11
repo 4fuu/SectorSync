@@ -4947,6 +4947,60 @@ pub enum BarrierRuntimeError {
     MissingStation(StationId),
 }
 
+/// Caller-owned reusable station snapshot slots for frozen barrier exports.
+#[derive(Clone, Debug, Default)]
+pub struct BarrierSnapshotScratch {
+    snapshots: Vec<StationSnapshot>,
+    active_snapshots: usize,
+}
+
+impl BarrierSnapshotScratch {
+    /// Creates empty barrier snapshot storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves Station slots and per-Station entity capacity.
+    pub fn reserve(&mut self, stations: usize, entities_per_station: usize) {
+        if self.snapshots.len() < stations {
+            self.snapshots
+                .resize_with(stations, StationSnapshot::default);
+        }
+        for snapshot in &mut self.snapshots[..stations] {
+            if snapshot.entities.capacity() < entities_per_station {
+                snapshot
+                    .entities
+                    .reserve(entities_per_station.saturating_sub(snapshot.entities.len()));
+            }
+        }
+    }
+
+    /// Snapshot slots retained across exports.
+    pub fn retained_snapshot_slots(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Total entity capacity retained across Station snapshot slots.
+    pub fn retained_entity_capacity(&self) -> usize {
+        self.snapshots
+            .iter()
+            .map(|snapshot| snapshot.entities.capacity())
+            .sum()
+    }
+
+    fn prepare(&mut self, stations: usize) {
+        if self.snapshots.len() < stations {
+            self.snapshots
+                .resize_with(stations, StationSnapshot::default);
+        }
+        self.active_snapshots = stations;
+    }
+
+    fn active(&self) -> &[StationSnapshot] {
+        &self.snapshots[..self.active_snapshots]
+    }
+}
+
 impl core::fmt::Display for BarrierRuntimeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -5077,6 +5131,35 @@ impl BarrierController {
             .snapshots_exported
             .saturating_add(snapshots.len());
         Ok(snapshots)
+    }
+
+    /// Exports frozen snapshots into caller-owned reusable Station slots.
+    pub fn export_snapshots_into<'a>(
+        &mut self,
+        stations: &StationSet,
+        version: SnapshotVersion,
+        scratch: &'a mut BarrierSnapshotScratch,
+    ) -> Result<&'a [StationSnapshot], BarrierRuntimeError> {
+        let barrier = self.active.ok_or(BarrierRuntimeError::NoActiveBarrier)?;
+        if barrier.state != BarrierState::Frozen {
+            return Err(BarrierRuntimeError::NotFrozen(barrier.state));
+        }
+
+        scratch.prepare(self.phases.len());
+        for (snapshot, station_id) in scratch.snapshots[..scratch.active_snapshots]
+            .iter_mut()
+            .zip(self.phases.keys().copied())
+        {
+            let station = stations
+                .get(station_id)
+                .ok_or(BarrierRuntimeError::MissingStation(station_id))?;
+            station.snapshot_into(version, snapshot);
+        }
+        self.metrics.snapshots_exported = self
+            .metrics
+            .snapshots_exported
+            .saturating_add(scratch.active_snapshots);
+        Ok(scratch.active())
     }
 
     /// Resumes all stations covered by the barrier and returns final metrics.
@@ -5457,14 +5540,25 @@ mod tests {
         assert_eq!(frozen.state, BarrierState::Frozen);
         assert_eq!(frozen.frozen_count, 2);
 
+        let mut scratch = BarrierSnapshotScratch::new();
+        scratch.reserve(2, 1);
         let snapshots = controller
-            .export_snapshots(&stations, SnapshotVersion::default())
-            .expect("snapshot should work while frozen");
+            .export_snapshots_into(&stations, SnapshotVersion::default(), &mut scratch)
+            .expect("reusable snapshot should work while frozen");
         assert_eq!(snapshots.len(), 2);
+        let retained_slots = scratch.retained_snapshot_slots();
+        let retained_entities = scratch.retained_entity_capacity();
+        scratch.reserve(2, 1);
+        let snapshots = controller
+            .export_snapshots_into(&stations, SnapshotVersion::default(), &mut scratch)
+            .expect("second reusable snapshot should work while frozen");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(scratch.retained_snapshot_slots(), retained_slots);
+        assert_eq!(scratch.retained_entity_capacity(), retained_entities);
 
         let metrics = controller.resume().expect("resume should work");
         assert_eq!(metrics.station_count, 2);
-        assert_eq!(metrics.snapshots_exported, 2);
+        assert_eq!(metrics.snapshots_exported, 4);
         assert_eq!(controller.progress().state, BarrierState::Running);
     }
 

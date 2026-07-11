@@ -244,6 +244,15 @@ Preserve this control sequence:
 saturating sum of the ready priority limits. If releasing buffered commands hits
 a full ready queue, the blocked command remains buffered for retry.
 
+For repeated frozen-state inspection or external checkpoint collection, retain
+`BarrierSnapshotScratch`, reserve the expected Station/entity shape, and call
+`export_snapshots_into`. Each `StationSnapshot` slot reuses its entity Vec;
+consume the returned slice before the next export mutates the scratch. Use
+`Station::snapshot_into` for an individual Station and the compatible owned
+snapshot APIs when data must be moved into an upgrade hook, persistence adapter,
+or longer-lived queue. SectorSync still owns only the frozen in-memory snapshot,
+not durable storage or recovery policy.
+
 SectorSync does not load scripts or decide whether the game should use seamless
 or visible paused updates.
 

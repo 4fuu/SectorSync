@@ -59,6 +59,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Packet security opening supports borrowed envelope decoding and caller-owned
   plaintext scratch for allocation-free steady-state receive output.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
+- Frozen multi-Station snapshots can retain Station slots and entity-record
+  capacity across repeated in-memory exports.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
 - Cell migration scans borrowed index membership and supports caller-owned
