@@ -783,6 +783,30 @@ threshold. Output retains operation conservation, retained count, checksum,
 latency percentiles, guard metadata, workload/time verdicts, and
 `benchmark_ok=true` as portable acceptance signals.
 
+## Replication Tracker Capacity Guard Measurement
+
+`ReplicationTracker::record_plan_sent` first checks whether current entries plus
+the full plan length fit under `max_entries`. When they do, capacity is proven
+even if every entity is new, so insertion proceeds without per-entity lookups.
+Only plans near the bound perform the exact existing/new scan; capacity failure
+still occurs before any record or statistic changes.
+
+Compare the O(1) conservative guard with an unconditional exact scan using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example tracker_capacity_guard
+cargo run --release -q -p sectorsync-bench --example tracker_capacity_guard -- --exact-scan
+```
+
+The default workload keeps 4,096 records and repeatedly updates a 256-entity
+plan across 1,000 calls. Seven release runs reduced median p50 from 0.818 ms
+exact-scan to 0.380 ms fast-guard, about 54%, while capacity probes fell from
+256,000 to zero. Both paths perform 256,000 identical record updates and produce
+the same final count and checksum. Guards cap initial records, plan entities,
+calls/tick, ticks, and total updates unless `--allow-heavy` is present; output
+includes latency percentiles, call/update/probe/count/checksum fields, guard
+metadata, workload/capacity/time verdicts, and `benchmark_ok=true`.
+
 ## Station Registry Lookup Measurement
 
 `StationSet` and `StationIndexSet` retain deterministic Vec iteration while

@@ -446,6 +446,9 @@ impl ReplicationTracker {
         client_id: ClientId,
         entities: &[EntityHandle],
     ) -> Result<(), ReplicationTrackerError> {
+        if self.records.len().saturating_add(entities.len()) <= self.config.max_entries {
+            return Ok(());
+        }
         let mut needed = 0_usize;
         for entity in entities {
             if !self.records.contains_key(&ReplicationTrackKey {
@@ -2033,5 +2036,56 @@ mod tests {
         );
         assert!(tracker.is_empty());
         assert_eq!(tracker.stats().sent_records, 0);
+    }
+
+    #[test]
+    fn replication_tracker_uses_exact_capacity_check_near_limit() {
+        let client_id = ClientId::new(7);
+        let first = EntityHandle::new(1, 0);
+        let second = EntityHandle::new(2, 0);
+        let third = EntityHandle::new(3, 0);
+        let mut tracker = ReplicationTracker::new(ReplicationTrackerConfig { max_entries: 2 });
+        tracker
+            .record_plan_sent(
+                client_id,
+                &ReplicationPlan {
+                    entities: vec![first],
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(1),
+            )
+            .expect("initial record should fit");
+        tracker
+            .record_plan_sent(
+                client_id,
+                &ReplicationPlan {
+                    entities: vec![first, second],
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(2),
+            )
+            .expect("one existing and one new record should fit exactly");
+
+        let error = tracker
+            .record_plan_sent(
+                client_id,
+                &ReplicationPlan {
+                    entities: vec![first, second, third],
+                    stats: ReplicationStats::default(),
+                },
+                Tick::new(3),
+            )
+            .expect_err("new record should exceed exact capacity");
+        assert_eq!(
+            error,
+            ReplicationTrackerError::CapacityExceeded {
+                current: 2,
+                needed: 1,
+                max: 2,
+            }
+        );
+        assert_eq!(tracker.last_sent(client_id, first), Some(Tick::new(2)));
+        assert_eq!(tracker.last_sent(client_id, second), Some(Tick::new(2)));
+        assert_eq!(tracker.get(client_id, third), None);
     }
 }

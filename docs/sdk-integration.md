@@ -172,6 +172,13 @@ ordered-set path, while capacities of 256 or more use hash lookup. No full-bound
 allocation occurs at construction, so applications should configure history for
 their actual retry/replay horizon rather than inflating it for performance.
 
+`ReplicationTracker::record_plan_sent` skips the per-entity capacity pre-scan
+when current entries plus the entire plan length already fit under
+`max_entries`; this is conservative even if every entity is new. Near the
+limit it retains the exact existing/new scan and fails before mutating any
+record. Applications should keep the tracker bound sized for their real
+client/entity horizon rather than relying on the fast path to weaken limits.
+
 For repeated security sealing, retain `PacketSecurityScratch` and call
 `seal_into`, `seal_with_nonce_into`, or `seal_with_key_ring_into`. The scratch
 retains encrypted-payload and authentication-tag storage; the final wire Vec

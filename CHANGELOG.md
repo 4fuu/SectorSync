@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Replication tracking now accepts plans through an O(1) conservative capacity
+  guard when the full plan fits in remaining capacity, falling back to the exact
+  per-entity scan only near the configured bound.
 - Gateway `connect` now refreshes or replaces an existing session through one
   mutable lookup instead of a membership probe followed by a second lookup;
   all connection outcomes and counters remain unchanged.
