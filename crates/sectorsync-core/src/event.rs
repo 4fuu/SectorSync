@@ -160,6 +160,18 @@ impl EventQueues {
             .or_else(|| self.best_effort.pop_front())
     }
 
+    /// Appends events ready at `current_tick` while retaining delayed events in place.
+    ///
+    /// Priority and FIFO order match repeated [`Self::pop_next`] calls. The
+    /// caller owns `out` and may retain its capacity across ticks.
+    pub fn drain_ready_into(&mut self, current_tick: Tick, out: &mut Vec<StationEvent>) -> usize {
+        let before = out.len();
+        drain_priority_ready(&mut self.critical, current_tick, out);
+        drain_priority_ready(&mut self.important, current_tick, out);
+        drain_priority_ready(&mut self.best_effort, current_tick, out);
+        out.len() - before
+    }
+
     /// Returns total queued events.
     pub fn len(&self) -> usize {
         self.critical.len() + self.important.len() + self.best_effort.len()
@@ -168,5 +180,76 @@ impl EventQueues {
     /// Returns whether all queues are empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+fn drain_priority_ready(
+    queue: &mut VecDeque<StationEvent>,
+    current_tick: Tick,
+    out: &mut Vec<StationEvent>,
+) {
+    let queued = queue.len();
+    for _ in 0..queued {
+        let event = queue
+            .pop_front()
+            .expect("initial queue length bounds the drain loop");
+        if event.target_tick <= current_tick {
+            out.push(event);
+        } else {
+            queue.push_back(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::EventId;
+
+    fn event(id: u64, priority: EventPriority, target_tick: u64) -> StationEvent {
+        StationEvent {
+            id: EventId::new(id),
+            source: StationId::new(1),
+            target: StationId::new(2),
+            source_tick: Tick::new(0),
+            target_tick: Tick::new(target_tick),
+            priority,
+            kind: EventKind::Custom(u32::try_from(id).expect("test id fits u32")),
+        }
+    }
+
+    #[test]
+    fn ready_drain_preserves_priority_fifo_and_delayed_order() {
+        let mut queues = EventQueues::new(EventQueueLimits {
+            critical: 8,
+            important: 8,
+            best_effort: 8,
+        });
+        for value in [
+            event(1, EventPriority::Critical, 3),
+            event(2, EventPriority::Critical, 1),
+            event(3, EventPriority::Important, 1),
+            event(4, EventPriority::Important, 4),
+            event(5, EventPriority::BestEffort, 1),
+            event(6, EventPriority::BestEffort, 5),
+        ] {
+            queues.push(value).expect("test queue has capacity");
+        }
+        let mut ready = Vec::with_capacity(8);
+
+        assert_eq!(queues.drain_ready_into(Tick::new(1), &mut ready), 3);
+        assert_eq!(
+            ready.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [EventId::new(2), EventId::new(3), EventId::new(5)]
+        );
+        assert_eq!(queues.len(), 3);
+
+        ready.clear();
+        assert_eq!(queues.drain_ready_into(Tick::new(5), &mut ready), 3);
+        assert_eq!(
+            ready.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [EventId::new(1), EventId::new(4), EventId::new(6)]
+        );
+        assert!(queues.is_empty());
     }
 }

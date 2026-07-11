@@ -44,17 +44,18 @@ fn main() {
     assert_eq!(pump.events_routed, 1);
 
     let mut scheduler = StationScheduler::default();
+    let mut ready_events = Vec::new();
     scheduler.advance_all(&mut stations);
-    let early = scheduler
-        .drain_ready_events(&stations, &mut router)
+    scheduler
+        .drain_ready_events_into(&stations, &mut router, &mut ready_events)
         .expect("router drain should work");
-    assert!(early.is_empty());
+    assert!(ready_events.is_empty());
 
     scheduler.advance_all(&mut stations);
-    let drained = scheduler
-        .drain_ready_events(&stations, &mut router)
+    scheduler
+        .drain_ready_events_into(&stations, &mut router, &mut ready_events)
         .expect("router drain should work");
-    assert_eq!(drained, vec![event]);
+    assert_eq!(ready_events, vec![event]);
 
     println!(
         "station_event_transport sent_events={} packets={} routed={} drained={}",

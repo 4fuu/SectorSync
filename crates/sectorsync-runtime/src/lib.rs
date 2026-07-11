@@ -3223,26 +3223,36 @@ impl EventRouter {
         station_id: StationId,
         current_tick: Tick,
     ) -> Result<Vec<StationEvent>, EventRouterError> {
+        let mut ready = Vec::new();
+        self.drain_ready_into(station_id, current_tick, &mut ready)?;
+        Ok(ready)
+    }
+
+    /// Drains ready events into caller-owned storage while retaining its capacity.
+    pub fn drain_ready_into(
+        &mut self,
+        station_id: StationId,
+        current_tick: Tick,
+        ready: &mut Vec<StationEvent>,
+    ) -> Result<(), EventRouterError> {
+        ready.clear();
+        self.append_ready(station_id, current_tick, ready)?;
+        Ok(())
+    }
+
+    fn append_ready(
+        &mut self,
+        station_id: StationId,
+        current_tick: Tick,
+        ready: &mut Vec<StationEvent>,
+    ) -> Result<(), EventRouterError> {
         let queue = self
             .queues
             .get_mut(&station_id)
             .ok_or(EventRouterError::MissingTarget(station_id))?;
-        let mut ready = Vec::new();
-        let mut delayed = Vec::new();
-
-        while let Some(event) = queue.pop_next() {
-            if event.target_tick <= current_tick {
-                ready.push(event);
-            } else {
-                delayed.push(event);
-            }
-        }
-
-        for event in delayed {
-            queue.push(event)?;
-        }
-        self.stats.drained_events += ready.len();
-        Ok(ready)
+        let drained = queue.drain_ready_into(current_tick, ready);
+        self.stats.drained_events = self.stats.drained_events.saturating_add(drained);
+        Ok(())
     }
 
     /// Returns queued event count for one station.
@@ -3846,10 +3856,22 @@ impl StationScheduler {
         router: &mut EventRouter,
     ) -> Result<Vec<StationEvent>, EventRouterError> {
         let mut events = Vec::new();
-        for station in stations.iter() {
-            events.extend(router.drain_ready(station.config().station_id, station.tick())?);
-        }
+        self.drain_ready_events_into(stations, router, &mut events)?;
         Ok(events)
+    }
+
+    /// Drains all Station-ready events into reusable caller-owned output.
+    pub fn drain_ready_events_into(
+        &mut self,
+        stations: &StationSet,
+        router: &mut EventRouter,
+        events: &mut Vec<StationEvent>,
+    ) -> Result<(), EventRouterError> {
+        events.clear();
+        for station in stations.iter() {
+            router.append_ready(station.config().station_id, station.tick(), events)?;
+        }
+        Ok(())
     }
 }
 
@@ -5471,17 +5493,25 @@ mod tests {
             .expect("route should work");
 
         let mut scheduler = StationScheduler::default();
+        let mut drained = Vec::new();
         scheduler.advance_all(&mut stations);
-        let drained = scheduler
-            .drain_ready_events(&stations, &mut router)
+        scheduler
+            .drain_ready_events_into(&stations, &mut router, &mut drained)
             .expect("drain should work");
         assert!(drained.is_empty());
 
         scheduler.advance_all(&mut stations);
-        let drained = scheduler
-            .drain_ready_events(&stations, &mut router)
+        scheduler
+            .drain_ready_events_into(&stations, &mut router, &mut drained)
             .expect("drain should work");
         assert_eq!(drained.len(), 1);
+        let retained_capacity = drained.capacity();
+
+        scheduler
+            .drain_ready_events_into(&stations, &mut router, &mut drained)
+            .expect("empty drain should work");
+        assert!(drained.is_empty());
+        assert_eq!(drained.capacity(), retained_capacity);
         assert_eq!(router.stats().routed_events, 1);
         assert_eq!(router.stats().drained_events, 1);
     }

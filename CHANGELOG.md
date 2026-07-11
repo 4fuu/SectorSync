@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Event draining now rotates delayed events in bounded priority queues and
+  offers caller-owned ready-output APIs, eliminating delayed and per-Station
+  temporary vectors while preserving priority/FIFO order.
 - Parallel multi-Station replication planning now offers borrowed `*_into`
   results backed by caller-owned output slots, avoiding repeated per-room and
   per-viewer result allocation in steady-state loops while preserving ordered

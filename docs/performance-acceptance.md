@@ -417,6 +417,39 @@ Runtime tests also compare every active Station plan and aggregate statistic,
 verify capacity retention after a smaller subsequent batch, and cover empty
 input.
 
+## Event Drain Output Measurement
+
+`EventQueues::drain_ready_into` visits each priority queue only for its initial
+length, moves ready events to caller-owned output, and rotates delayed events to
+the same queue tail. This removes the previous delayed-event vector and requeue
+pass while retaining Critical, Important, BestEffort and FIFO ordering.
+`StationScheduler::drain_ready_events_into` additionally retains aggregate ready
+output across ticks:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example event_drain_reuse
+cargo run --release -q -p sectorsync-bench --example event_drain_reuse -- --fresh-output
+```
+
+The default workload uses 12 Stations, 16 events per Station, 20 drain calls per
+tick, and 20 ticks. Half of each call's events target the next tick, continuously
+exercising delayed rotation. Without `--allow-heavy`, guards cap 32 Stations, 64
+events per Station, 50 calls per tick, and 20 ticks; execution has a 10-second
+budget. Output includes routed/drained counts, fresh-output count, retained
+capacity, latency percentiles, guard metadata, workload/path verdicts, and
+`benchmark_ok`.
+
+Five alternating default A/B runs produced identical `76,800` routed and
+`76,704` drained counts. The reusable path created zero fresh outputs and
+retained capacity for 256 events; the compatibility path created 400 owned
+outputs. Latency was noisy and did not show a reliable advantage, so no timing
+improvement is claimed. At the guarded 64-event, 50-call shape, both paths again
+matched at `768,000` routed and `767,616` drained; median tick p99 was 1.438 ms
+with reuse and 1.516 ms with fresh output. The durable acceptance evidence is
+the removed intermediate allocation paths, exact event-count equivalence, core
+priority/FIFO tests, and retained-capacity test rather than a host-specific
+latency delta.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

@@ -32,6 +32,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Dense replication frames use bounded dirty-data sampling to reduce output
   buffer growth, while sparse frames conservatively retain normal allocation.
 - Bounded command, event, client packet, and station packet queues.
+- Event draining retains delayed priority queues in place and supports reusable
+  caller-owned ready output across Stations and ticks.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
   event frames.
 - Low-level in-memory, reliable packet, and non-blocking UDP adapters.
@@ -154,6 +156,9 @@ cargo run -p sectorsync-bench --example load_sampling
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
+cargo run -p sectorsync-bench --example station_event_transport
+cargo run -p sectorsync-bench --release --example event_drain_reuse
+cargo run -p sectorsync-bench --release --example event_drain_reuse -- --fresh-output
 cargo run -p sectorsync-bench --features parallel --example parallel_replication
 cargo run -p sectorsync-bench --release --features parallel --example parallel_output_reuse
 cargo run -p sectorsync-bench --release --features parallel --example parallel_output_reuse -- --fresh-output

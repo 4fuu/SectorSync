@@ -99,6 +99,13 @@ result back through controlled APIs such as:
   needs the outcome.
 - `EventRouter` or station event transport for ordered cross-station effects.
 
+For steady-state event loops, retain one `Vec<StationEvent>` and pass it to
+`EventRouter::drain_ready_into` for one Station or
+`StationScheduler::drain_ready_events_into` for an ordered Station set. Output
+is cleared without releasing capacity. Delayed Critical, Important, and
+BestEffort events remain in their existing priority queues in FIFO order;
+SectorSync does not infer retry policy or business timing state.
+
 Ghost records are read-only and must never finalize business state.
 
 ### 4. Plan And Send Replication
