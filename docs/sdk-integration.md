@@ -69,6 +69,10 @@ once to hash lookup for aggregated single-process deployments. Replacement of
 an existing endpoint does not trigger promotion, and queue contents survive the
 transition unchanged. Promoted registries stay hashed after removals to avoid
 allocation and migration churn around the threshold.
+Client packet sends use one mutable target lookup for both queue-limit
+validation and enqueueing. Missing-target, queue-full, and packet-size errors
+retain their existing ordering, and successful packet/byte counters advance
+only after the packet enters the target queue.
 
 ## Per-Tick Order
 

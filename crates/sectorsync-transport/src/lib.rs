@@ -1898,31 +1898,24 @@ impl TransportSink for InMemoryTransportEndpoint {
             .get(&self.local_client_id)
             .ok_or(InMemoryTransportError::MissingLocal(self.local_client_id))?
             .remote_addr;
-        let queue_len = inner
+        let target = inner
             .clients
-            .get(&packet.client_id)
-            .ok_or(InMemoryTransportError::MissingTarget(packet.client_id))?
-            .queue
-            .len();
-        if queue_len >= limits.max_queued_packets_per_client {
+            .get_mut(&packet.client_id)
+            .ok_or(InMemoryTransportError::MissingTarget(packet.client_id))?;
+        if target.queue.len() >= limits.max_queued_packets_per_client {
             inner.stats.packets_rejected_full = inner.stats.packets_rejected_full.saturating_add(1);
             return Err(InMemoryTransportError::QueueFull {
                 client_id: packet.client_id,
                 capacity: limits.max_queued_packets_per_client,
             });
         }
-
-        inner.stats.packets_sent = inner.stats.packets_sent.saturating_add(1);
-        inner.stats.bytes_sent = inner.stats.bytes_sent.saturating_add(actual);
-        let target = inner
-            .clients
-            .get_mut(&packet.client_id)
-            .ok_or(InMemoryTransportError::MissingTarget(packet.client_id))?;
         target.queue.push_back(InboundPacket {
             client_id: Some(self.local_client_id),
             remote_addr: source_addr,
             bytes: packet.bytes,
         });
+        inner.stats.packets_sent = inner.stats.packets_sent.saturating_add(1);
+        inner.stats.bytes_sent = inner.stats.bytes_sent.saturating_add(actual);
         Ok(())
     }
 }
@@ -5175,7 +5168,18 @@ mod tests {
             }
         );
 
+        let missing_id = ClientId::new(99);
+        let missing = client
+            .send(OutboundPacket {
+                client_id: missing_id,
+                bytes: vec![0; 4],
+            })
+            .expect_err("missing target should reject");
+        assert_eq!(missing, InMemoryTransportError::MissingTarget(missing_id));
+
         let stats = hub.stats().expect("stats should read");
+        assert_eq!(stats.packets_sent, 1);
+        assert_eq!(stats.bytes_sent, 4);
         assert_eq!(stats.packets_rejected_full, 1);
         assert_eq!(stats.packets_rejected_bytes, 1);
     }

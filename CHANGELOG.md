@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- In-memory Client sends now validate target capacity and enqueue through one
+  mutable endpoint lookup instead of probing the same target map twice per
+  packet; error ordering, backpressure, and statistics remain unchanged.
 - In-memory Client and Station endpoint maps now retain ordered lookup for
   small registries and promote once to hash lookup at 2,048 entries, improving
   large single-process registries without penalizing normal small rooms.

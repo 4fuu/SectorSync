@@ -943,6 +943,7 @@ Compare identical mixed immutable/mutable lookup streams with:
 ```powershell
 cargo run --release -q -p sectorsync-bench --example endpoint_map_lookup
 cargo run --release -q -p sectorsync-bench --example endpoint_map_lookup -- --btree
+cargo run --release -q -p sectorsync-bench --example endpoint_map_lookup -- --double-lookup
 ```
 
 Seven release runs at 1,024 endpoints produced median p50 values of 0.914 ms
@@ -953,6 +954,14 @@ million identical lookups with one mutation per eight operations. Guards cap
 endpoint count, lookups/tick, ticks, and total lookups unless `--allow-heavy`
 is present; output retains checksum/workload verdicts, latency percentiles,
 guard metadata, time-budget state, and `benchmark_ok=true`.
+
+The `--double-lookup` comparison models the previous Client send path, which
+queried target length and then queried the same target again for mutation. In
+seven release runs at ten ordered endpoints, removing the second probe reduced
+median p50 from 0.968 ms to 0.547 ms. At 4,096 hashed endpoints it reduced p50
+from 2.063 ms to 1.077 ms. Both modes execute one million logical operations
+with identical mutations and checksums; `map_probes` is exactly two million for
+the comparison and one million for the optimized shape.
 
 ## Replication Receive Visitor Measurement
 

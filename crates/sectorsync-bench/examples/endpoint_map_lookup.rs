@@ -15,12 +15,14 @@ const GUARD_MAX_TICKS: usize = 20;
 const GUARD_MAX_LOOKUPS: usize = 2_000_000;
 const TIME_BUDGET_MS: u64 = 10_000;
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug)]
 struct Config {
     endpoints: usize,
     lookups_per_tick: usize,
     ticks: usize,
     hash_map: bool,
+    double_lookup: bool,
     allow_heavy: bool,
     guard_applied: bool,
 }
@@ -77,6 +79,7 @@ fn main() {
 struct ResultSummary {
     ticks_completed: usize,
     lookups: usize,
+    map_probes: usize,
     mutations: usize,
     checksum: usize,
     p50: f64,
@@ -85,6 +88,7 @@ struct ResultSummary {
     max: f64,
     workload_ok: bool,
     checksum_ok: bool,
+    probe_count_ok: bool,
     time_budget_exhausted: bool,
     benchmark_ok: bool,
 }
@@ -98,6 +102,7 @@ fn run<M: EndpointMap<usize>>(config: Config, mut map: M) -> ResultSummary {
     let mut latencies = Vec::with_capacity(config.ticks);
     let mut ticks_completed = 0_usize;
     let mut lookups = 0_usize;
+    let mut map_probes = 0_usize;
     let mut mutations = 0_usize;
     let mut checksum = 0_usize;
     let mut time_budget_exhausted = false;
@@ -112,6 +117,10 @@ fn run<M: EndpointMap<usize>>(config: Config, mut map: M) -> ResultSummary {
                 .saturating_mul(17)
                 .saturating_add(tick.saturating_mul(31))
                 % config.endpoints;
+            if config.double_lookup {
+                black_box(map.endpoint(&key).expect("inserted endpoint should exist"));
+                map_probes = map_probes.saturating_add(1);
+            }
             if operation % 8 == 0 {
                 let value = map
                     .endpoint_mut(&key)
@@ -123,6 +132,7 @@ fn run<M: EndpointMap<usize>>(config: Config, mut map: M) -> ResultSummary {
                 checksum = checksum
                     .wrapping_add(*map.endpoint(&key).expect("inserted endpoint should exist"));
             }
+            map_probes = map_probes.saturating_add(1);
             lookups = lookups.saturating_add(1);
         }
         latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -132,15 +142,18 @@ fn run<M: EndpointMap<usize>>(config: Config, mut map: M) -> ResultSummary {
     latencies.sort_by(f64::total_cmp);
     let expected_lookups = config.lookups_per_tick.saturating_mul(config.ticks);
     let workload_ok = ticks_completed == config.ticks && lookups == expected_lookups;
+    let expected_probes = expected_lookups.saturating_mul(if config.double_lookup { 2 } else { 1 });
     let expected_mutations = config
         .lookups_per_tick
         .div_ceil(8)
         .saturating_mul(config.ticks);
     let checksum_ok = checksum != 0 && mutations == expected_mutations;
-    let benchmark_ok = workload_ok && checksum_ok && !time_budget_exhausted;
+    let probe_count_ok = map_probes == expected_probes;
+    let benchmark_ok = workload_ok && checksum_ok && probe_count_ok && !time_budget_exhausted;
     ResultSummary {
         ticks_completed,
         lookups,
+        map_probes,
         mutations,
         checksum,
         p50: percentile(&latencies, 0.50),
@@ -149,6 +162,7 @@ fn run<M: EndpointMap<usize>>(config: Config, mut map: M) -> ResultSummary {
         max: latencies.last().copied().unwrap_or_default(),
         workload_ok,
         checksum_ok,
+        probe_count_ok,
         time_budget_exhausted,
         benchmark_ok,
     }
@@ -159,6 +173,7 @@ fn parse_config() -> Config {
     let mut lookups_per_tick = DEFAULT_LOOKUPS_PER_TICK;
     let mut ticks = DEFAULT_TICKS;
     let mut hash_map = true;
+    let mut double_lookup = false;
     let mut allow_heavy = false;
     for arg in env::args().skip(1) {
         if let Some(value) = arg.strip_prefix("--endpoints=") {
@@ -169,6 +184,8 @@ fn parse_config() -> Config {
             ticks = value.parse().unwrap_or(ticks);
         } else if arg == "--btree" {
             hash_map = false;
+        } else if arg == "--double-lookup" {
+            double_lookup = true;
         } else if arg == "--allow-heavy" {
             allow_heavy = true;
         }
@@ -190,6 +207,7 @@ fn parse_config() -> Config {
         lookups_per_tick,
         ticks,
         hash_map,
+        double_lookup,
         allow_heavy,
         guard_applied: requested != (endpoints, lookups_per_tick, ticks),
     }
@@ -221,7 +239,9 @@ fn print_result(config: Config, result: &ResultSummary) {
     println!("ticks={}", config.ticks);
     println!("ticks_completed={}", result.ticks_completed);
     println!("hash_map={}", config.hash_map);
+    println!("double_lookup={}", config.double_lookup);
     println!("lookups={}", result.lookups);
+    println!("map_probes={}", result.map_probes);
     println!("mutations={}", result.mutations);
     println!("lookup_checksum={}", result.checksum);
     println!("tick_ms_p50={:.3}", result.p50);
@@ -230,6 +250,7 @@ fn print_result(config: Config, result: &ResultSummary) {
     println!("tick_ms_max={:.3}", result.max);
     println!("threshold_workload_completed_ok={}", result.workload_ok);
     println!("threshold_checksum_ok={}", result.checksum_ok);
+    println!("threshold_probe_count_ok={}", result.probe_count_ok);
     println!("time_budget_ms={TIME_BUDGET_MS}");
     println!("time_budget_exhausted={}", result.time_budget_exhausted);
     println!("benchmark_ok={}", result.benchmark_ok);
