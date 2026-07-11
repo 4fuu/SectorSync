@@ -161,6 +161,7 @@ impl ReplicationTransportBridge {
                     considered: 0,
                     selected: 0,
                     skipped_by_budget: 0,
+                    unexamined_after_budget: 0,
                     skipped_by_cadence: 0,
                     estimated_bytes: 0,
                 },

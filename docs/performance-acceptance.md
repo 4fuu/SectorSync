@@ -379,6 +379,12 @@ remained 3,035,294 and tick p99 was 6.759 ms, confirming that this change remove
 selection/tracking overhead without altering wire output. Host timings are
 diagnostic rather than portable acceptance thresholds.
 
+The workload uses the explicit work-bounded planner path. Its
+`unexamined_after_budget` counter is machine-readable; it remains zero in the
+default sparse-dirty trace because no viewer fills the 256-entity budget. Core
+tests separately verify that a saturated first-fit plan stops after selecting
+its budget and reports the untouched candidate suffix.
+
 Machine-readable output retains phase percentiles, command/event/transport
 conservation, spawn/despawn and lifecycle counts, selected/encoded/component
 counts, actual bytes, packet-budget failures, tracker state/ACK counts, world

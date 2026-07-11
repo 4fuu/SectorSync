@@ -17,6 +17,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Replication planners now accept caller-owned eligibility predicates before
   budget consumption, with a component-store helper for checking whether any
   explicitly selected component is dirty.
+- Replication planners now offer explicit work-bounded first-fit entry points
+  that stop scanning when the budget fills and report unexamined candidates
+  separately from exact budget skips.
 
 ### Changed
 

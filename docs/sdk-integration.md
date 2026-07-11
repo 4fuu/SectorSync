@@ -237,6 +237,13 @@ global-dirty policy; per-client delivery state can instead live in the
 predicate's caller-owned state. The predicate does not clear dirty flags or
 invent ACK semantics.
 
+When deterministic first-fit selection is acceptable, the explicit
+`*_work_bounded_*` APIs stop scanning as soon as the entity or estimated-byte
+budget fills. `unexamined_after_budget` reports the untouched spatial suffix;
+`skipped_by_budget` remains reserved for candidates actually evaluated and
+rejected by the complete-scan planners. Priority planners still inspect the
+eligible set because they must choose a deterministic global top-k.
+
 The bridge retains one `ReplicationPlan` output slot across its normal, cadence,
 priority, and priority/cadence send paths. Transport or encoding failures return
 the slot to the bridge before the error is surfaced. Direct single-viewer loops

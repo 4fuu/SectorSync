@@ -271,6 +271,7 @@ struct Stats {
     component_updates: usize,
     viewer_plans: usize,
     selected_entities: usize,
+    unexamined_after_budget: usize,
     encoded_entities: usize,
     encoded_components: usize,
     packets_sent: usize,
@@ -724,7 +725,7 @@ fn replicate_room(
 ) {
     let viewers = room_viewers(room);
     let components = &room.components;
-    let plans = ReplicationPlanner::plan_for_viewers_eligible_into(
+    let plans = ReplicationPlanner::plan_for_viewers_work_bounded_into(
         &room.station,
         &room.index,
         policies,
@@ -737,6 +738,9 @@ fn replicate_room(
     );
     stats.viewer_plans = stats.viewer_plans.saturating_add(plans.stats.viewers);
     stats.selected_entities = stats.selected_entities.saturating_add(plans.stats.selected);
+    stats.unexamined_after_budget = stats
+        .unexamined_after_budget
+        .saturating_add(plans.stats.unexamined_after_budget);
 
     for (viewer, plan) in viewers.iter().zip(plans.plans) {
         let capacity =
@@ -919,6 +923,7 @@ fn print_report(config: Config, stats: &Stats, elapsed: Duration) {
     println!("component_updates={}", stats.component_updates);
     println!("viewer_plans={}", stats.viewer_plans);
     println!("selected_entities={}", stats.selected_entities);
+    println!("unexamined_after_budget={}", stats.unexamined_after_budget);
     println!("encoded_entities={}", stats.encoded_entities);
     println!(
         "selected_per_encoded={:.3}",

@@ -141,6 +141,8 @@ pub struct ReplicationBatchStats {
     pub considered: usize,
     /// Entities selected across all plans.
     pub selected: usize,
+    /// Spatial candidates left unexamined after a first-fit budget filled.
+    pub unexamined_after_budget: usize,
     /// Estimated payload bytes across all plans.
     pub estimated_bytes: usize,
     /// Queries that probed the regular cell grid.
@@ -169,6 +171,9 @@ impl ReplicationBatchStats {
         self.candidates = self.candidates.saturating_add(plan.stats.candidates);
         self.considered = self.considered.saturating_add(plan.stats.considered);
         self.selected = self.selected.saturating_add(plan.stats.selected);
+        self.unexamined_after_budget = self
+            .unexamined_after_budget
+            .saturating_add(plan.stats.unexamined_after_budget);
         self.estimated_bytes = self
             .estimated_bytes
             .saturating_add(plan.stats.estimated_bytes);
@@ -268,6 +273,7 @@ impl ReplicationBatchScratch {
                 candidates: 0,
                 considered: 0,
                 selected: 0,
+                unexamined_after_budget: 0,
                 estimated_bytes: 0,
                 grid_queries: 0,
                 occupied_queries: 0,
@@ -573,6 +579,8 @@ pub struct ReplicationStats {
     pub selected: usize,
     /// Entities skipped because the budget was exhausted.
     pub skipped_by_budget: usize,
+    /// Spatial candidates not examined after a work-bounded budget filled.
+    pub unexamined_after_budget: usize,
     /// Entities skipped because their cadence interval has not elapsed.
     pub skipped_by_cadence: usize,
     /// Estimated frame bytes.
@@ -811,6 +819,7 @@ impl ReplicationPlanner {
             budget,
             |_, _, _| true,
             eligible,
+            false,
             plan,
         );
     }
@@ -884,6 +893,72 @@ impl ReplicationPlanner {
         batch.prepare(viewers.len());
         for (plan, viewer) in batch.plans[..viewers.len()].iter_mut().zip(viewers) {
             Self::plan_for_viewer_eligible_with_scratch_into(
+                station, index, policies, viewer, filter, budget, &eligible, scratch, plan,
+            );
+            batch.stats.record(plan, scratch);
+        }
+        batch.view()
+    }
+
+    /// Plans one viewer using deterministic first-fit selection with a bounded scan.
+    ///
+    /// Planning stops as soon as the budget is full. This avoids exact
+    /// post-budget accounting and does not provide global priority ordering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_work_bounded_with_scratch_into<F, E>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        eligible: E,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
+    {
+        let candidates =
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        Self::plan_for_candidates_inner_into(
+            station,
+            candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            |_, _, _| true,
+            eligible,
+            true,
+            plan,
+        );
+    }
+
+    /// Plans viewers using deterministic first-fit selection with bounded scans.
+    ///
+    /// Each plan stops examining candidates as soon as its budget is full. This
+    /// avoids exact post-budget accounting and does not provide global priority
+    /// ordering; see [`ReplicationStats::unexamined_after_budget`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewers_work_bounded_into<'a, F, E>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        filter: &F,
+        budget: ReplicationBudget,
+        eligible: E,
+        scratch: &mut ReplicationScratch,
+        batch: &'a mut ReplicationBatchScratch,
+    ) -> ReplicationBatchView<'a>
+    where
+        F: VisibilityFilter,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
+    {
+        batch.prepare(viewers.len());
+        for (plan, viewer) in batch.plans[..viewers.len()].iter_mut().zip(viewers) {
+            Self::plan_for_viewer_work_bounded_with_scratch_into(
                 station, index, policies, viewer, filter, budget, &eligible, scratch, plan,
             );
             batch.stats.record(plan, scratch);
@@ -1066,6 +1141,7 @@ impl ReplicationPlanner {
                 )
             },
             |_, _, _| true,
+            false,
             plan,
         );
     }
@@ -1262,6 +1338,7 @@ impl ReplicationPlanner {
             budget,
             cadence_allows,
             |_, _, _| true,
+            false,
             &mut plan,
         );
         plan
@@ -1277,6 +1354,7 @@ impl ReplicationPlanner {
         budget: ReplicationBudget,
         cadence_allows: C,
         eligible: E,
+        stop_when_budget_full: bool,
         plan: &mut ReplicationPlan,
     ) where
         F: VisibilityFilter,
@@ -1293,7 +1371,12 @@ impl ReplicationPlanner {
             ..ReplicationStats::default()
         };
 
-        for handle in candidates {
+        if stop_when_budget_full && hard_limit == 0 {
+            plan.stats.unexamined_after_budget = candidates.len();
+            return;
+        }
+
+        for (candidate_index, handle) in candidates.iter().enumerate() {
             let Some(entity) = station.get(*handle) else {
                 continue;
             };
@@ -1324,6 +1407,11 @@ impl ReplicationPlanner {
             }
 
             plan.entities.push(*handle);
+            if stop_when_budget_full && plan.entities.len() == hard_limit {
+                plan.stats.unexamined_after_budget =
+                    candidates.len().saturating_sub(candidate_index + 1);
+                break;
+            }
         }
 
         plan.stats.selected = plan.entities.len();
@@ -1363,6 +1451,7 @@ impl ReplicationPlanner {
             budget,
             |_, _, _| true,
             |_, _, _| true,
+            false,
             plan,
         );
     }
@@ -1763,6 +1852,59 @@ mod tests {
         assert_eq!(plan.entities, vec![handles[2]]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.skipped_by_budget, 0);
+    }
+
+    #[test]
+    fn work_bounded_planner_stops_after_first_fit_budget() {
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let mut index = CellIndex::new(GridSpec::new(16.0).expect("grid is valid"));
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 128.0));
+        for id in 1_u16..=8 {
+            let position = Position3::new(f32::from(id), 0.0, 0.0);
+            let handle = station
+                .spawn_owned(
+                    EntityId::new(u64::from(id)),
+                    position,
+                    Bounds::Point,
+                    PolicyId::new(1),
+                )
+                .expect("entity id is unique");
+            index.upsert(handle, position, Bounds::Point);
+        }
+        let viewer = ViewerQuery {
+            client_id: ClientId::new(1),
+            position: Position3::new(0.0, 0.0, 0.0),
+            radius: 128.0,
+            max_entities: 2,
+        };
+        let mut scratch = ReplicationScratch::default();
+        let mut plan = ReplicationPlan::default();
+
+        ReplicationPlanner::plan_for_viewer_work_bounded_with_scratch_into(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &RangeOnlyVisibility,
+            ReplicationBudget {
+                max_entities: 2,
+                ..ReplicationBudget::default()
+            },
+            |_, _, _| true,
+            &mut scratch,
+            &mut plan,
+        );
+
+        assert_eq!(plan.stats.selected, 2);
+        assert_eq!(plan.stats.considered, 2);
+        assert_eq!(plan.stats.skipped_by_budget, 0);
+        assert_eq!(plan.stats.unexamined_after_budget, 6);
     }
 
     #[test]
