@@ -10,6 +10,10 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Guarded planner baselines now share identical phased viewer, command, event,
+  gateway, and client-bridge workloads, and benchmark acceptance verifies
+  selected update counts and deterministic work checksums against an
+  independently computed reference.
 - Documentation now uses a concise root README, a dedicated docs index, and
   layered integration, performance, adapter-boundary, and delivery-status
   guides without duplicating benchmark command inventories at the project root.

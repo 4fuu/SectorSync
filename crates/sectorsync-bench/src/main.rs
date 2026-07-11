@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 
 use sectorsync_core::prelude::{
     Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
-    CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId, EntityId,
-    EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig, GatewaySessionTable,
-    GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId, NodeId, OwnerEpoch,
-    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBatchStats,
-    ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station, StationConfig,
-    StationEvent, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
+    CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId,
+    EntityHandle, EntityId, EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig,
+    GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId,
+    NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3, RangeOnlyVisibility,
+    ReplicationBatchStats, ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station,
+    StationConfig, StationEvent, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
@@ -181,6 +181,11 @@ impl Default for BenchThresholds {
 #[derive(Clone, Debug, Default)]
 struct BenchStats {
     updates: usize,
+    expected_replication_updates: usize,
+    replication_work_checksum: u64,
+    expected_replication_work_checksum: u64,
+    replication_viewers: usize,
+    expected_replication_viewers: usize,
     estimated_payload_bytes: usize,
     encoded_packets: usize,
     encoded_bytes: usize,
@@ -246,6 +251,7 @@ struct UpdateWork {
     server_tick: Tick,
     updates: usize,
     entity_limit: usize,
+    work_checksum: u64,
 }
 
 struct EncodedUpdate {
@@ -253,6 +259,28 @@ struct EncodedUpdate {
     updates: usize,
     entity_deltas: usize,
     component_deltas: usize,
+    work_checksum: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReplicationWorkDigest {
+    viewers: usize,
+    updates: usize,
+    checksum: u64,
+}
+
+impl ReplicationWorkDigest {
+    fn record(&mut self, updates: usize, checksum: u64) {
+        self.viewers = self.viewers.saturating_add(1);
+        self.updates = self.updates.saturating_add(updates);
+        self.checksum = self.checksum.wrapping_add(checksum);
+    }
+
+    fn add(&mut self, other: Self) {
+        self.viewers = self.viewers.saturating_add(other.viewers);
+        self.updates = self.updates.saturating_add(other.updates);
+        self.checksum = self.checksum.wrapping_add(other.checksum);
+    }
 }
 
 #[cfg(feature = "parallel")]
@@ -335,6 +363,23 @@ fn main() {
     println!("ticks_completed={}", stats.tick_ms.len());
     println!("time_budget_exhausted={}", stats.time_budget_exhausted);
     println!("updates={}", stats.updates);
+    println!(
+        "expected_replication_updates={}",
+        stats.expected_replication_updates
+    );
+    println!(
+        "replication_work_checksum={}",
+        stats.replication_work_checksum
+    );
+    println!(
+        "expected_replication_work_checksum={}",
+        stats.expected_replication_work_checksum
+    );
+    println!("replication_viewers={}", stats.replication_viewers);
+    println!(
+        "expected_replication_viewers={}",
+        stats.expected_replication_viewers
+    );
     println!("estimated_payload_bytes={}", stats.estimated_payload_bytes);
     println!("encoded_packets={}", stats.encoded_packets);
     println!("encoded_bytes={}", stats.encoded_bytes);
@@ -562,6 +607,10 @@ fn main() {
         "threshold_workload_completed_ok={}",
         verdict.workload_completed_ok
     );
+    println!(
+        "threshold_replication_workload_ok={}",
+        verdict.replication_workload_ok
+    );
     println!("threshold_planner_mode_ok={}", verdict.planner_mode_ok);
     println!(
         "threshold_profile_admitted_ok={}",
@@ -599,6 +648,7 @@ struct BenchVerdict {
     client_bridge_ok: bool,
     payload_materialization_ok: bool,
     workload_completed_ok: bool,
+    replication_workload_ok: bool,
     planner_mode_ok: bool,
     profile_admitted_ok: bool,
 }
@@ -635,6 +685,10 @@ impl BenchVerdict {
                 && !stats.tick_ms.is_empty()
                 && stats.tick_ms.len() == config.ticks
                 && stats.encoded_packets > 0,
+            replication_workload_ok: stats.replication_viewers
+                == stats.expected_replication_viewers
+                && stats.updates == stats.expected_replication_updates
+                && stats.replication_work_checksum == stats.expected_replication_work_checksum,
             planner_mode_ok: config.requested_planner == config.planner,
             profile_admitted_ok: !config.heavy_profile_denied,
         }
@@ -652,6 +706,7 @@ impl BenchVerdict {
             && self.client_bridge_ok
             && self.payload_materialization_ok
             && self.workload_completed_ok
+            && self.replication_workload_ok
             && self.planner_mode_ok
             && self.profile_admitted_ok
     }
@@ -874,8 +929,15 @@ fn run(config: BenchConfig) -> BenchStats {
     let clients = create_clients(config.clients, config.workload_shape);
     let viewer_schedules =
         create_viewer_schedules(&clients, config.stations, config.replication_phase_count());
+    let expected_replication =
+        expected_replication_work(config, &stations, &indexes, &policies, &viewer_schedules);
 
-    let mut stats = BenchStats::default();
+    let mut stats = BenchStats {
+        expected_replication_updates: expected_replication.updates,
+        expected_replication_work_checksum: expected_replication.checksum,
+        expected_replication_viewers: expected_replication.viewers,
+        ..BenchStats::default()
+    };
     let load_samples = apply_hotspot_report(&mut stats, config, &stations, &indexes);
     apply_scheduler_report(&mut stats, config, &load_samples);
     let mut transport = FakeTransport::default();
@@ -1034,6 +1096,10 @@ fn run(config: BenchConfig) -> BenchStats {
                                 server_tick: stations[station_index].tick(),
                                 updates: plan.stats.selected,
                                 entity_limit: config.payload_materialization.entity_limit(),
+                                work_checksum: entity_work_checksum(
+                                    viewer.client_id,
+                                    &plan.entities,
+                                ),
                             });
                         }
                     }
@@ -1046,21 +1112,25 @@ fn run(config: BenchConfig) -> BenchStats {
             }
             baseline => {
                 let planning_start = Instant::now();
-                let updates = clients
+                let updates = viewer_batches
                     .iter()
-                    .copied()
                     .enumerate()
-                    .map(|(client_index, viewer_position)| {
-                        let station_index = client_index % stations.len();
-                        let updates = match baseline {
-                            Baseline::FullBroadcast => config.entities,
-                            Baseline::RoomBroadcast => config.entities / stations.len(),
-                            Baseline::NaiveGrid => indexes[station_index]
-                                .query_sphere(viewer_position, WorkloadShape::viewer_radius())
-                                .len(),
-                            Baseline::SectorSync => unreachable!(),
-                        };
-                        (client_index, station_index, updates)
+                    .flat_map(|(station_index, viewers)| {
+                        let station = &stations[station_index];
+                        let index = &indexes[station_index];
+                        viewers.iter().map(move |viewer| {
+                            let client_index = usize::try_from(viewer.client_id.get())
+                                .expect("benchmark client id fits usize");
+                            let updates = match baseline {
+                                Baseline::FullBroadcast => config.entities,
+                                Baseline::RoomBroadcast => station.len(),
+                                Baseline::NaiveGrid => {
+                                    index.query_sphere(viewer.position, viewer.radius).len()
+                                }
+                                Baseline::SectorSync => unreachable!(),
+                            };
+                            (client_index, station_index, updates)
+                        })
                     })
                     .collect::<Vec<_>>();
                 stats
@@ -1074,6 +1144,10 @@ fn run(config: BenchConfig) -> BenchStats {
                         server_tick: stations[station_index].tick(),
                         updates,
                         entity_limit: config.payload_materialization.entity_limit(),
+                        work_checksum: count_work_checksum(
+                            ClientId::new(client_index as u64),
+                            updates,
+                        ),
                     })
                     .collect();
                 let encoded = encode_update_batch(config.planner, work);
@@ -1116,6 +1190,127 @@ fn create_viewer_schedules(
         });
     }
     schedules
+}
+
+fn expected_replication_work(
+    config: BenchConfig,
+    stations: &[Station],
+    indexes: &[CellIndex],
+    policies: &PolicyTable,
+    viewer_schedules: &[Vec<Vec<ViewerQuery>>],
+) -> ReplicationWorkDigest {
+    let phase_digests = viewer_schedules
+        .iter()
+        .map(|viewer_batches| {
+            expected_replication_phase(
+                config.baseline,
+                config.entities,
+                stations,
+                indexes,
+                policies,
+                viewer_batches,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = ReplicationWorkDigest::default();
+    for tick_index in 0..config.ticks {
+        expected.add(phase_digests[tick_index % phase_digests.len()]);
+    }
+    expected
+}
+
+fn expected_replication_phase(
+    baseline: Baseline,
+    entities: usize,
+    stations: &[Station],
+    indexes: &[CellIndex],
+    policies: &PolicyTable,
+    viewer_batches: &[Vec<ViewerQuery>],
+) -> ReplicationWorkDigest {
+    let mut expected = ReplicationWorkDigest::default();
+    for (station_index, viewers) in viewer_batches.iter().enumerate() {
+        for viewer in viewers {
+            let (updates, checksum) = match baseline {
+                Baseline::SectorSync => reference_sector_sync_work(
+                    &stations[station_index],
+                    &indexes[station_index],
+                    policies,
+                    viewer,
+                ),
+                Baseline::FullBroadcast => {
+                    (entities, count_work_checksum(viewer.client_id, entities))
+                }
+                Baseline::RoomBroadcast => {
+                    let updates = stations[station_index].len();
+                    (updates, count_work_checksum(viewer.client_id, updates))
+                }
+                Baseline::NaiveGrid => {
+                    let updates = indexes[station_index]
+                        .query_sphere(viewer.position, viewer.radius)
+                        .len();
+                    (updates, count_work_checksum(viewer.client_id, updates))
+                }
+            };
+            expected.record(updates, checksum);
+        }
+    }
+    expected
+}
+
+fn reference_sector_sync_work(
+    station: &Station,
+    index: &CellIndex,
+    policies: &PolicyTable,
+    viewer: &ViewerQuery,
+) -> (usize, u64) {
+    let budget = ReplicationBudget::default();
+    let hard_limit = viewer
+        .max_entities
+        .min(budget.max_entities)
+        .min(budget.max_bytes / budget.estimated_entity_bytes.max(1));
+    let mut selected = Vec::with_capacity(hard_limit);
+    for handle in index.query_sphere(viewer.position, viewer.radius) {
+        let Some(entity) = station.get(handle) else {
+            continue;
+        };
+        let Some(policy) = policies.get(entity.policy_id) else {
+            continue;
+        };
+        let distance_squared = entity.position.distance_squared(viewer.position);
+        if distance_squared > policy.interest_radius * policy.interest_radius
+            || distance_squared > viewer.radius_squared()
+        {
+            continue;
+        }
+        if selected.len() == hard_limit {
+            break;
+        }
+        selected.push(handle);
+    }
+    (
+        selected.len(),
+        entity_work_checksum(viewer.client_id, &selected),
+    )
+}
+
+fn count_work_checksum(client_id: ClientId, updates: usize) -> u64 {
+    checksum_word(
+        checksum_word(0xcbf2_9ce4_8422_2325, client_id.get()),
+        u64::try_from(updates).unwrap_or(u64::MAX),
+    )
+}
+
+fn entity_work_checksum(client_id: ClientId, entities: &[EntityHandle]) -> u64 {
+    let mut checksum = count_work_checksum(client_id, entities.len());
+    for entity in entities {
+        checksum = checksum_word(checksum, u64::from(entity.index()));
+        checksum = checksum_word(checksum, u64::from(entity.generation()));
+    }
+    checksum
+}
+
+const fn checksum_word(checksum: u64, value: u64) -> u64 {
+    checksum.wrapping_mul(0x0000_0100_0000_01b3) ^ value
 }
 
 fn record_replication_batch_stats(stats: &mut BenchStats, batch: ReplicationBatchStats) {
@@ -1201,6 +1396,7 @@ fn run_parallel_station_pipeline(
                     server_tick: work.station.tick(),
                     updates: plan.stats.selected,
                     entity_limit,
+                    work_checksum: entity_work_checksum(viewer.client_id, &plan.entities),
                 })
             })
             .collect();
@@ -1248,6 +1444,7 @@ fn encode_update(work: UpdateWork) -> EncodedUpdate {
         updates: work.updates,
         entity_deltas: entity_delta_count,
         component_deltas: component_delta_count,
+        work_checksum: work.work_checksum,
     }
 }
 
@@ -1258,6 +1455,10 @@ fn submit_encoded_updates(
 ) {
     let mut batch = PacketBatch::new();
     for update in encoded {
+        stats.replication_viewers = stats.replication_viewers.saturating_add(1);
+        stats.replication_work_checksum = stats
+            .replication_work_checksum
+            .wrapping_add(update.work_checksum);
         stats.updates = stats.updates.saturating_add(update.updates);
         stats.replication_candidates_selected = stats
             .replication_candidates_selected
@@ -1728,10 +1929,7 @@ fn enqueue_commands(
     next_command_id: &mut u64,
     stats: &mut BenchStats,
 ) {
-    let stride = match config.baseline {
-        Baseline::FullBroadcast => 4,
-        Baseline::RoomBroadcast | Baseline::NaiveGrid | Baseline::SectorSync => 2,
-    };
+    let stride = 2;
     let command_tick = Tick::new(tick_index as u64);
 
     for client_index in (0..clients.len()).step_by(stride) {
@@ -2168,6 +2366,60 @@ mod tests {
         assert!(!verdict.command_queue_drops_ok);
         assert!(!verdict.router_event_drops_ok);
         assert!(!verdict.is_ok());
+    }
+
+    #[test]
+    fn replication_workload_mismatch_fails_the_benchmark_verdict() {
+        let config = BenchConfig {
+            ticks: 1,
+            ..BenchConfig::default()
+        };
+        let mut stats = run(config);
+        assert_eq!(stats.updates, stats.expected_replication_updates);
+        assert_eq!(
+            stats.replication_work_checksum,
+            stats.expected_replication_work_checksum
+        );
+
+        stats.updates = stats.updates.saturating_sub(1);
+        let verdict = BenchVerdict::evaluate(config, &stats, percentile_ms(&stats.tick_ms, 0.99));
+
+        assert!(!verdict.replication_workload_ok);
+        assert!(!verdict.is_ok());
+    }
+
+    #[test]
+    fn baselines_keep_auxiliary_and_viewer_workloads_equal() {
+        let mut results = Vec::new();
+        for baseline in [
+            Baseline::SectorSync,
+            Baseline::FullBroadcast,
+            Baseline::RoomBroadcast,
+            Baseline::NaiveGrid,
+        ] {
+            let config = BenchConfig {
+                entities: 64,
+                clients: 8,
+                stations: 2,
+                ticks: 2,
+                baseline,
+                ..BenchConfig::default()
+            };
+            let stats = run(config);
+            assert_eq!(stats.updates, stats.expected_replication_updates);
+            assert_eq!(
+                stats.replication_work_checksum,
+                stats.expected_replication_work_checksum
+            );
+            results.push((
+                stats.replication_viewers,
+                stats.commands_enqueued,
+                stats.router_events_routed,
+                stats.client_bridge_commands_sent,
+            ));
+        }
+
+        assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]

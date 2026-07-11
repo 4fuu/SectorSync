@@ -57,6 +57,7 @@ collect OS metrics or change the middleware execution model.
 | Client/gateway bridge roundtrip | command/ACK/replication bridge counters | all sampled commands ACK and all sampled frames arrive | `threshold_client_bridge_ok` |
 | Complete payload materialization | selected/materialized delta counters | full profiles materialize every selected delta | `threshold_payload_materialization_ok` |
 | Complete non-empty workload | completed ticks, packets, time budget | all requested ticks and encoded packets complete within budget | `threshold_workload_completed_ok` |
+| Exact replication workload | selected update count, viewer count, deterministic work checksum | measured values equal the independently computed reference workload | `threshold_replication_workload_ok` |
 | Requested planner available | requested/applied planner mode | requested mode is compiled and applied | `threshold_planner_mode_ok` |
 | Requested profile admitted | requested/applied profile and heavy guard | guarded profiles require `--allow-heavy` | `threshold_profile_admitted_ok` |
 
@@ -81,7 +82,7 @@ Every acceptance run records these field groups:
 | --- | --- |
 | Workload/guard | profile/guard fields, planner request/applied mode, SIMD/parallel availability, thread count, tick/replication rates and phases, entity/client/station/tick counts, completed ticks, time budget |
 | Tick latency | `tick_ms_p50`, `tick_ms_p95`, `tick_ms_p99`, `tick_ms_max`, planning/encoding phase percentiles, 128 Hz budget/headroom/verdict, `elapsed_ms` |
-| Replication selection | `replication_scratch_queries`, grid/occupied strategy query counts, probed/scanned/matched cell counts, `replication_scratch_candidates`, `replication_candidates_selected` |
+| Replication selection | expected/measured viewer and update counts, expected/measured deterministic work checksum, `replication_scratch_queries`, grid/occupied strategy query counts, probed/scanned/matched cell counts, `replication_scratch_candidates`, `replication_candidates_selected` |
 | Replication scratch capacity | `replication_scratch_candidate_capacity_max`, `replication_scratch_dedup_capacity_max`, `replication_scratch_matching_cell_capacity_max`, `replication_scratch_priority_capacity_max` |
 | Encoded payload | per-frame materialization limit and requirement, `encoded_packets`, `encoded_bytes`, `payload_entity_deltas`, `payload_component_deltas`, `estimated_payload_bytes`, materialization verdict |
 | Direct commands | `commands_enqueued`, `commands_applied`, `command_latency_ticks_avg`, `command_latency_ticks_max`, `command_queue_max`, `command_queue_drops` |
@@ -114,6 +115,12 @@ Interpretation:
 - `naive-grid` uses a direct spatial sphere query without compiled policy,
   visibility, cadence, priority, or replication budget logic.
 - `sectorsync` uses the policy-driven planner with reusable scratch storage.
+
+All four modes now use the same phased viewer schedule and identical command,
+gateway, client-bridge, and event workloads. Only replication selection changes.
+Each mode computes its expected viewer count, selected update count, and
+deterministic work checksum outside the timed loop; a faster run that silently
+drops selection work fails `threshold_replication_workload_ok`.
 
 The scratch-backed spatial query chooses deterministically between probing the
 full query cell volume and scanning the index's non-empty cells. Large sparse
