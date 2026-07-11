@@ -11,6 +11,100 @@ use std::sync::{Arc, Mutex};
 use sectorsync_core::prelude::{ClientId, StationId, Tick};
 
 const HASHED_BOUNDED_SET_MIN_CAPACITY: usize = 256;
+const HASHED_ENDPOINT_MAP_MIN_ENTRIES: usize = 2_048;
+
+#[derive(Clone, Debug)]
+enum AdaptiveEndpointMap<K, V> {
+    Ordered(BTreeMap<K, V>),
+    Hashed(HashMap<K, V>),
+}
+
+impl<K: Copy + Eq + Hash + Ord, V> AdaptiveEndpointMap<K, V> {
+    fn new() -> Self {
+        Self::Ordered(BTreeMap::new())
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let promote = match self {
+            Self::Ordered(entries) => {
+                entries.len() >= HASHED_ENDPOINT_MAP_MIN_ENTRIES.saturating_sub(1)
+                    && !entries.contains_key(&key)
+            }
+            Self::Hashed(_) => false,
+        };
+        if promote {
+            let Self::Ordered(ordered) = std::mem::replace(self, Self::Hashed(HashMap::new()))
+            else {
+                unreachable!("promotion starts from ordered endpoint storage");
+            };
+            let mut hashed = HashMap::with_capacity(ordered.len().saturating_add(1));
+            hashed.extend(ordered);
+            *self = Self::Hashed(hashed);
+        }
+        match self {
+            Self::Ordered(entries) => entries.insert(key, value),
+            Self::Hashed(entries) => entries.insert(key, value),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self {
+            Self::Ordered(entries) => entries.get(key),
+            Self::Hashed(entries) => entries.get(key),
+        }
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        match self {
+            Self::Ordered(entries) => entries.get_mut(key),
+            Self::Hashed(entries) => entries.get_mut(key),
+        }
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        match self {
+            Self::Ordered(entries) => entries.remove(key),
+            Self::Hashed(entries) => entries.remove(key),
+        }
+    }
+
+    fn values(&self) -> AdaptiveEndpointValues<'_, K, V> {
+        match self {
+            Self::Ordered(entries) => AdaptiveEndpointValues::Ordered(entries.values()),
+            Self::Hashed(entries) => AdaptiveEndpointValues::Hashed(entries.values()),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_hashed(&self) -> bool {
+        matches!(self, Self::Hashed(_))
+    }
+}
+
+enum AdaptiveEndpointValues<'a, K, V> {
+    Ordered(std::collections::btree_map::Values<'a, K, V>),
+    Hashed(std::collections::hash_map::Values<'a, K, V>),
+}
+
+impl<'a, K, V> Iterator for AdaptiveEndpointValues<'a, K, V> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Ordered(values) => values.next(),
+            Self::Hashed(values) => values.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Ordered(values) => values.size_hint(),
+            Self::Hashed(values) => values.size_hint(),
+        }
+    }
+}
+
+impl<K, V> ExactSizeIterator for AdaptiveEndpointValues<'_, K, V> {}
 
 #[derive(Clone, Debug)]
 enum BoundedLookupSet<K> {
@@ -1633,7 +1727,7 @@ struct InMemoryTransportClient {
 #[derive(Debug)]
 struct InMemoryTransportInner {
     limits: ClientTransportLimits,
-    clients: BTreeMap<ClientId, InMemoryTransportClient>,
+    clients: AdaptiveEndpointMap<ClientId, InMemoryTransportClient>,
     addr_to_client: HashMap<SocketAddr, ClientId>,
     stats: InMemoryTransportStats,
 }
@@ -1650,7 +1744,7 @@ impl InMemoryTransportHub {
         Self {
             inner: Arc::new(Mutex::new(InMemoryTransportInner {
                 limits,
-                clients: BTreeMap::new(),
+                clients: AdaptiveEndpointMap::new(),
                 addr_to_client: HashMap::new(),
                 stats: InMemoryTransportStats::default(),
             })),
@@ -3575,7 +3669,7 @@ impl std::error::Error for StationTransportError {}
 #[derive(Clone, Debug)]
 pub struct InMemoryStationTransport {
     limits: StationTransportLimits,
-    queues: BTreeMap<StationId, VecDeque<StationInboundPacket>>,
+    queues: AdaptiveEndpointMap<StationId, VecDeque<StationInboundPacket>>,
     stats: InMemoryStationTransportStats,
 }
 
@@ -3584,14 +3678,16 @@ impl InMemoryStationTransport {
     pub fn new(limits: StationTransportLimits) -> Self {
         Self {
             limits,
-            queues: BTreeMap::new(),
+            queues: AdaptiveEndpointMap::new(),
             stats: InMemoryStationTransportStats::default(),
         }
     }
 
     /// Registers a target station queue.
     pub fn register_station(&mut self, station_id: StationId) {
-        self.queues.entry(station_id).or_default();
+        if self.queues.get(&station_id).is_none() {
+            self.queues.insert(station_id, VecDeque::new());
+        }
     }
 
     /// Returns queued packet count for a station.
@@ -4857,6 +4953,97 @@ mod tests {
         });
         assert!(client.delivered.is_hashed());
         assert!(station.delivered.is_hashed());
+    }
+
+    #[test]
+    fn endpoint_map_promotes_once_without_changing_entries() {
+        let mut endpoints = AdaptiveEndpointMap::new();
+        for key in 0..HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1 {
+            assert_eq!(endpoints.insert(key, key), None);
+        }
+        assert!(!endpoints.is_hashed());
+        assert_eq!(endpoints.insert(0, usize::MAX), Some(0));
+        assert!(!endpoints.is_hashed());
+
+        let final_key = HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1;
+        assert_eq!(endpoints.insert(final_key, final_key), None);
+        assert!(endpoints.is_hashed());
+        assert_eq!(endpoints.get(&0), Some(&usize::MAX));
+        *endpoints.get_mut(&1).expect("migrated entry should exist") = 17;
+        assert_eq!(endpoints.remove(&2), Some(2));
+        assert_eq!(
+            endpoints.values().len(),
+            HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1
+        );
+        assert_eq!(endpoints.get(&1), Some(&17));
+        assert_eq!(endpoints.get(&2), None);
+    }
+
+    #[test]
+    fn in_memory_transports_preserve_queued_packets_during_map_promotion() {
+        let hub = InMemoryTransportHub::default();
+        for key in 0..HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1 {
+            let client_id = ClientId::new(u64::try_from(key).expect("test id fits u64"));
+            hub.register_client(
+                client_id,
+                memory_addr(10_000 + u16::try_from(key).expect("test port fits u16")),
+            )
+            .expect("client should register");
+        }
+        let mut source = hub.endpoint_for_registered(ClientId::new(0));
+        source
+            .send(OutboundPacket {
+                client_id: ClientId::new(1),
+                bytes: vec![7],
+            })
+            .expect("packet should queue before promotion");
+        let final_client = HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1;
+        hub.register_client(
+            ClientId::new(u64::try_from(final_client).expect("test id fits u64")),
+            memory_addr(10_000 + u16::try_from(final_client).expect("test port fits u16")),
+        )
+        .expect("threshold client should register");
+        assert!(
+            hub.lock_inner()
+                .expect("hub should lock")
+                .clients
+                .is_hashed()
+        );
+        let mut target = hub.endpoint_for_registered(ClientId::new(1));
+        assert_eq!(
+            target
+                .try_recv()
+                .expect("receive should work")
+                .expect("queued packet should survive")
+                .bytes,
+            vec![7]
+        );
+
+        let mut stations = InMemoryStationTransport::default();
+        for key in 0..HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1 {
+            stations.register_station(StationId::new(
+                u32::try_from(key).expect("test station id fits u32"),
+            ));
+        }
+        stations
+            .send_station(StationOutboundPacket {
+                source_station: StationId::new(0),
+                target_station: StationId::new(1),
+                bytes: vec![9],
+            })
+            .expect("station packet should queue before promotion");
+        stations.register_station(StationId::new(
+            u32::try_from(HASHED_ENDPOINT_MAP_MIN_ENTRIES - 1).expect("test station id fits u32"),
+        ));
+        assert!(stations.queues.is_hashed());
+        assert_eq!(
+            stations
+                .try_recv_station(StationId::new(1))
+                .expect("receive should work")
+                .expect("queued station packet should survive")
+                .bytes,
+            vec![9]
+        );
     }
 
     #[test]

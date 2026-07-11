@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- In-memory Client and Station endpoint maps now retain ordered lookup for
+  small registries and promote once to hash lookup at 2,048 entries, improving
+  large single-process registries without penalizing normal small rooms.
 - In-memory Client and Station transport queues now allocate packet slots on
   demand instead of reserving each configured queue maximum at registration;
   retained per-queue and aggregate capacities are observable for host metrics.

@@ -928,6 +928,32 @@ limits, and bursts unless `--allow-heavy` is present; output includes room
 latency percentiles, exact queue/packet conservation, guard metadata,
 capacity/workload/lazy/time verdicts, and `benchmark_ok=true`.
 
+## In-Memory Endpoint Lookup Measurement
+
+Client and Station in-memory transport registries use ordered maps below 2,048
+entries and promote once to hash maps when adding the 2,048th distinct key.
+This keeps the lower constant cost of ordered lookup for normal small rooms and
+removes logarithmic lookup growth when one process aggregates thousands of
+endpoints. Replacement does not promote early, and migration preserves every
+key, queue, and retained capacity. Promotion is intentionally one-way so
+registration churn around the threshold cannot repeatedly migrate storage.
+
+Compare identical mixed immutable/mutable lookup streams with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example endpoint_map_lookup
+cargo run --release -q -p sectorsync-bench --example endpoint_map_lookup -- --btree
+```
+
+Seven release runs at 1,024 endpoints produced median p50 values of 0.914 ms
+for ordered lookup and 0.953 ms for hash lookup. At 2,048 endpoints hash lookup
+measured 0.930 ms versus 1.103 ms ordered; at the default 4,096 endpoints it
+measured 0.936 ms versus 2.904 ms, about a 68% reduction. Each run performs one
+million identical lookups with one mutation per eight operations. Guards cap
+endpoint count, lookups/tick, ticks, and total lookups unless `--allow-heavy`
+is present; output retains checksum/workload verdicts, latency percentiles,
+guard metadata, time-budget state, and `benchmark_ok=true`.
+
 ## Replication Receive Visitor Measurement
 
 `ReplicationReceiveBridge::pump_visit` consumes transport packets, validates

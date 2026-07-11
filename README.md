@@ -228,6 +228,8 @@ cargo run -p sectorsync-bench --release --example deployment_stale_scan
 cargo run -p sectorsync-bench --release --example deployment_stale_scan -- --collect-mark
 cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --release --example in_memory_queue_capacity
+cargo run -p sectorsync-bench --release --example endpoint_map_lookup
+cargo run -p sectorsync-bench --release --example endpoint_map_lookup -- --btree
 cargo run -p sectorsync-bench --release --example udp_receive_borrowed
 cargo run -p sectorsync-bench --release --example udp_receive_borrowed -- --owned
 cargo run -p sectorsync-bench --release --example reliable_frame_encode

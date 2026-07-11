@@ -62,6 +62,14 @@ the configured queue maximum remains a backpressure boundary, not an eager
 per-endpoint allocation. Applications should still choose limits from their
 worst acceptable backlog and payload budget.
 
+Endpoint lookup also adapts without configuration. Registries below 2,048
+entries retain ordered maps, which have lower constant cost for ordinary small
+rooms. Adding the 2,048th distinct Client or Station promotes that registry
+once to hash lookup for aggregated single-process deployments. Replacement of
+an existing endpoint does not trigger promotion, and queue contents survive the
+transition unchanged. Promoted registries stay hashed after removals to avoid
+allocation and migration churn around the threshold.
+
 ## Per-Tick Order
 
 ### 1. Validate Before SectorSync
