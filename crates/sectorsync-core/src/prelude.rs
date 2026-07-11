@@ -24,8 +24,8 @@ pub use crate::gateway::{
 };
 pub use crate::handoff::{HandoffCommitHandles, HandoffTransfer};
 pub use crate::hotspot::{
-    CellLoadSample, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotThresholds,
-    SplitProposal, StationLoadSample,
+    CellLoadSample, HotspotDecision, HotspotPlanner, HotspotSeverity, HotspotSplitScratch,
+    HotspotThresholds, SplitProposal, StationLoadSample,
 };
 pub use crate::ids::{
     BarrierId, ClientId, CommandId, ComponentId, EntityHandle, EntityId, EventId, InstanceId,

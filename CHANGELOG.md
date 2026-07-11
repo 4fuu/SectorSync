@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Hotspot cell split planning now offers reusable candidate/proposal storage and
+  deterministic budgeted top-k selection; SplitScheduler exposes explicit
+  scratch entry points without weakening conservative migration guards.
 - Load-aware Station scheduling now offers caller-owned score/candidate scratch
   and deterministic budgeted top-k selection, while high budgets retain the
   existing full-sort path and owned APIs remain compatible.

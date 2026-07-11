@@ -13,10 +13,11 @@ use sectorsync_core::prelude::{
     CommandEnvelope, CommandId, CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues,
     ComponentStore, EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues,
     GatewayError, GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner,
-    HotspotSeverity, HotspotThresholds, NodeId, OwnerEpoch, PolicyTable, PushOutcome,
-    ReplicationBudget, ReplicationPlan, ReplicationPlanner, ReplicationScratch, RuntimeBarrier,
-    RuntimeUpgradeHook, SnapshotVersion, SplitProposal, Station, StationError, StationEvent,
-    StationId, StationLoadSample, StationSnapshot, Tick, ViewerQuery, VisibilityFilter,
+    HotspotSeverity, HotspotSplitScratch, HotspotThresholds, NodeId, OwnerEpoch, PolicyTable,
+    PushOutcome, ReplicationBudget, ReplicationPlan, ReplicationPlanner, ReplicationScratch,
+    RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion, SplitProposal, Station, StationError,
+    StationEvent, StationId, StationLoadSample, StationSnapshot, Tick, ViewerQuery,
+    VisibilityFilter,
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
@@ -2915,7 +2916,17 @@ impl SplitScheduler {
 
     /// Plans split actions from station load samples.
     pub fn plan(&self, samples: &[StationLoadSample]) -> SplitSchedule {
-        self.plan_with_state(samples, None, Tick::new(0))
+        let mut scratch = HotspotSplitScratch::new();
+        self.plan_with_state_and_scratch(samples, None, Tick::new(0), &mut scratch)
+    }
+
+    /// Plans split actions using reusable hotspot cell candidate storage.
+    pub fn plan_with_scratch(
+        &self,
+        samples: &[StationLoadSample],
+        scratch: &mut HotspotSplitScratch,
+    ) -> SplitSchedule {
+        self.plan_with_state_and_scratch(samples, None, Tick::new(0), scratch)
     }
 
     /// Plans split actions using optional cooldown state.
@@ -2924,6 +2935,18 @@ impl SplitScheduler {
         samples: &[StationLoadSample],
         state: Option<&SplitSchedulerState>,
         current_tick: Tick,
+    ) -> SplitSchedule {
+        let mut scratch = HotspotSplitScratch::new();
+        self.plan_with_state_and_scratch(samples, state, current_tick, &mut scratch)
+    }
+
+    /// Plans with optional cooldown state and reusable hotspot candidate storage.
+    pub fn plan_with_state_and_scratch(
+        &self,
+        samples: &[StationLoadSample],
+        state: Option<&SplitSchedulerState>,
+        current_tick: Tick,
+        scratch: &mut HotspotSplitScratch,
     ) -> SplitSchedule {
         let decisions = samples
             .iter()
@@ -2959,8 +2982,11 @@ impl SplitScheduler {
                 continue;
             }
 
-            let proposal =
-                HotspotPlanner::propose_cell_split(source, self.config.max_cells_per_action);
+            let proposal = HotspotPlanner::propose_cell_split_with_scratch(
+                source,
+                self.config.max_cells_per_action,
+                scratch,
+            );
             if proposal.cells_to_move.is_empty() {
                 schedule.skipped_no_cells += 1;
                 continue;

@@ -1,8 +1,8 @@
 //! Deterministic split scheduler calibration scenarios.
 
 use sectorsync_core::prelude::{
-    CellCoord3, CellLoadSample, HotspotSeverity, HotspotThresholds, StationId, StationLoadSample,
-    Tick,
+    CellCoord3, CellLoadSample, HotspotSeverity, HotspotSplitScratch, HotspotThresholds, StationId,
+    StationLoadSample, Tick,
 };
 use sectorsync_runtime::{SplitScheduler, SplitSchedulerConfig, SplitSchedulerState};
 
@@ -69,8 +69,14 @@ pub fn run() -> SplitTuningReport {
         ..SplitSchedulerConfig::default()
     });
     let mut state = SplitSchedulerState::default();
+    let mut split_scratch = HotspotSplitScratch::new();
 
-    let first = scheduler.plan_with_state(&samples, Some(&state), Tick::new(100));
+    let first = scheduler.plan_with_state_and_scratch(
+        &samples,
+        Some(&state),
+        Tick::new(100),
+        &mut split_scratch,
+    );
     assert_eq!(first.actions.len(), 1);
     let normal_stations = count_severity(&first, HotspotSeverity::Normal);
     let warm_stations = count_severity(&first, HotspotSeverity::Warm);
@@ -78,7 +84,12 @@ pub fn run() -> SplitTuningReport {
     assert_eq!((normal_stations, warm_stations, hot_stations), (1, 1, 1));
     state.record_schedule(&first, Tick::new(100));
 
-    let cooldown = scheduler.plan_with_state(&samples, Some(&state), Tick::new(105));
+    let cooldown = scheduler.plan_with_state_and_scratch(
+        &samples,
+        Some(&state),
+        Tick::new(105),
+        &mut split_scratch,
+    );
     assert!(cooldown.actions.is_empty());
     assert_eq!(cooldown.skipped_cooldown, 1);
 

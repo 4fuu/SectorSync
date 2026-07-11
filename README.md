@@ -42,6 +42,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   deterministic station scheduling.
 - Load-aware Station scheduling supports caller-owned score/candidate scratch
   and deterministic top-k selection when the advancement budget is small.
+- Hotspot split planning supports reusable cell/proposal storage and selects a
+  deterministic top-k when only a bounded number of cells may move.
 - Guarded smoke benchmarks with machine-readable latency, bandwidth, queue,
   scheduler, and scratch-capacity fields.
 
@@ -159,6 +161,8 @@ cargo run -p sectorsync-bench --example load_scheduler
 cargo run -p sectorsync-bench --release --example station_schedule_reuse
 cargo run -p sectorsync-bench --release --example station_schedule_reuse -- --fresh-output
 cargo run -p sectorsync-bench --example split_migration
+cargo run -p sectorsync-bench --release --example hotspot_split_reuse
+cargo run -p sectorsync-bench --release --example hotspot_split_reuse -- --fresh-output
 cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress
 cargo run -p sectorsync-bench --example station_event_transport

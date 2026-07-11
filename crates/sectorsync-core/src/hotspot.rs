@@ -144,6 +144,24 @@ pub struct SplitProposal {
     pub moved_pressure_score: u64,
 }
 
+/// Caller-owned reusable candidate storage for hotspot cell split planning.
+#[derive(Clone, Debug, Default)]
+pub struct HotspotSplitScratch {
+    cells: Vec<CellLoadSample>,
+}
+
+impl HotspotSplitScratch {
+    /// Creates empty split-planning scratch.
+    pub const fn new() -> Self {
+        Self { cells: Vec::new() }
+    }
+
+    /// Cell candidate capacity retained across calls.
+    pub fn candidate_capacity(&self) -> usize {
+        self.cells.capacity()
+    }
+}
+
 /// Hotspot evaluator and split planner.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HotspotPlanner;
@@ -198,28 +216,64 @@ impl HotspotPlanner {
         sample: &StationLoadSample,
         max_cells_to_move: usize,
     ) -> SplitProposal {
-        let mut cells = sample.cells.clone();
-        cells.sort_by(|left, right| {
-            right
-                .pressure_score()
-                .cmp(&left.pressure_score())
-                .then_with(|| left.cell.cmp(&right.cell))
-        });
+        let mut scratch = HotspotSplitScratch::new();
+        let mut proposal = SplitProposal::default();
+        Self::propose_cell_split_into(sample, max_cells_to_move, &mut scratch, &mut proposal);
+        proposal
+    }
 
-        let mut proposal = SplitProposal {
-            source_station: sample.station_id,
-            cells_to_move: Vec::with_capacity(max_cells_to_move.min(cells.len())),
-            moved_pressure_score: 0,
-        };
+    /// Proposes cells using caller-owned candidate scratch.
+    pub fn propose_cell_split_with_scratch(
+        sample: &StationLoadSample,
+        max_cells_to_move: usize,
+        scratch: &mut HotspotSplitScratch,
+    ) -> SplitProposal {
+        let mut proposal = SplitProposal::default();
+        Self::propose_cell_split_into(sample, max_cells_to_move, scratch, &mut proposal);
+        proposal
+    }
 
-        for cell in cells.into_iter().take(max_cells_to_move) {
+    /// Writes a deterministic split proposal into fully reusable caller-owned storage.
+    pub fn propose_cell_split_into(
+        sample: &StationLoadSample,
+        max_cells_to_move: usize,
+        scratch: &mut HotspotSplitScratch,
+        proposal: &mut SplitProposal,
+    ) {
+        let selected = max_cells_to_move.min(sample.cells.len());
+        scratch.cells.clear();
+        scratch.cells.extend_from_slice(&sample.cells);
+        prioritize_cell_samples(&mut scratch.cells, selected);
+
+        proposal.source_station = sample.station_id;
+        proposal.cells_to_move.clear();
+        proposal.cells_to_move.reserve(selected);
+        proposal.moved_pressure_score = 0;
+        for cell in &scratch.cells[..selected] {
             proposal.moved_pressure_score = proposal
                 .moved_pressure_score
                 .saturating_add(cell.pressure_score());
             proposal.cells_to_move.push(cell.cell);
         }
+    }
+}
 
-        proposal
+fn compare_cell_samples(left: &CellLoadSample, right: &CellLoadSample) -> core::cmp::Ordering {
+    right
+        .pressure_score()
+        .cmp(&left.pressure_score())
+        .then_with(|| left.cell.cmp(&right.cell))
+}
+
+fn prioritize_cell_samples(cells: &mut [CellLoadSample], selected: usize) {
+    if selected == 0 {
+        return;
+    }
+    if selected.saturating_mul(2) < cells.len() {
+        cells.select_nth_unstable_by(selected, compare_cell_samples);
+        cells[..selected].sort_by(compare_cell_samples);
+    } else {
+        cells.sort_by(compare_cell_samples);
     }
 }
 
@@ -259,5 +313,63 @@ mod tests {
 
         let proposal = HotspotPlanner::propose_cell_split(&sample, 1);
         assert_eq!(proposal.cells_to_move, vec![CellCoord3::new(1, 0, 0)]);
+    }
+
+    #[test]
+    fn split_top_k_matches_full_sort_and_reuses_capacity_at_budget_edges() {
+        let cells = (0_i32..257)
+            .map(|index| CellLoadSample {
+                cell: CellCoord3::new(index, index % 5, index % 7),
+                owned_entities: usize::try_from(index * 37 % 23).expect("non-negative"),
+                event_pressure: usize::try_from(index * 19 % 11).expect("non-negative"),
+                ..CellLoadSample::default()
+            })
+            .collect::<Vec<_>>();
+        let sample = StationLoadSample {
+            station_id: StationId::new(9),
+            cells: cells.clone(),
+            ..StationLoadSample::default()
+        };
+        let mut scratch = HotspotSplitScratch::new();
+        let mut proposal = SplitProposal::default();
+
+        for requested in [0, 1, 7, 64, 128, 129, 256, 257, 300] {
+            let selected = requested.min(cells.len());
+            let mut expected = cells.clone();
+            expected.sort_by(compare_cell_samples);
+            expected.truncate(selected);
+            HotspotPlanner::propose_cell_split_into(
+                &sample,
+                requested,
+                &mut scratch,
+                &mut proposal,
+            );
+
+            assert_eq!(
+                proposal.cells_to_move,
+                expected.iter().map(|cell| cell.cell).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                proposal.moved_pressure_score,
+                expected.iter().fold(0_u64, |score, cell| {
+                    score.saturating_add(cell.pressure_score())
+                })
+            );
+        }
+        let candidate_capacity = scratch.candidate_capacity();
+        let output_capacity = proposal.cells_to_move.capacity();
+        HotspotPlanner::propose_cell_split_into(
+            &StationLoadSample {
+                station_id: StationId::new(10),
+                cells: cells[..8].to_vec(),
+                ..StationLoadSample::default()
+            },
+            2,
+            &mut scratch,
+            &mut proposal,
+        );
+        assert_eq!(proposal.source_station, StationId::new(10));
+        assert_eq!(scratch.candidate_capacity(), candidate_capacity);
+        assert_eq!(proposal.cells_to_move.capacity(), output_capacity);
     }
 }

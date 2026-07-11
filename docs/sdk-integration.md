@@ -183,6 +183,13 @@ last-value-wins behavior. When the advancement budget is less than half the
 Station count, the scheduler partitions and sorts only the deterministic top-k;
 larger budgets use full sorting.
 
+For repeated hotspot and split passes, retain `HotspotSplitScratch` and use
+`HotspotPlanner::propose_cell_split_into`, `SplitScheduler::plan_with_scratch`,
+or `plan_with_state_and_scratch`. Candidate and proposal buffers grow on demand;
+the planner partitions deterministic top-k cells only when the move budget is
+less than half the sample. Scratch does not retain cooldown or ownership state,
+and it does not bypass target-capacity, improvement, action, or migration guards.
+
 Execute ownership changes through `CellMigrationExecutor` or
 `EntityMigrationExecutor` so target ghosts are prewarmed, owner commit is
 single-authority, source ghosts survive the handoff window, and both spatial

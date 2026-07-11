@@ -481,6 +481,35 @@ zero, small, half, full, and oversized budget edges. A `limit=400` run reports
 `top_k_partition_applied=false` and the same `5,255,150` checksum for both output
 modes, confirming the high-budget fallback.
 
+## Hotspot Split Scratch Measurement
+
+`HotspotSplitScratch` retains copied `CellLoadSample` candidates across hotspot
+passes, while `propose_cell_split_into` also retains the proposal's coordinate
+buffer. A move budget below half the sampled cells partitions the deterministic
+top-k pressure set and sorts only that prefix; larger budgets use full sorting.
+`SplitScheduler` exposes the same candidate reuse through explicit scratch APIs:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example hotspot_split_reuse
+cargo run --release -q -p sectorsync-bench --example hotspot_split_reuse -- --fresh-output
+```
+
+The default workload contains 2,000 cells, a move limit of eight, 100 calls per
+tick, and 20 ticks. Without `--allow-heavy`, guards cap 10,000 cells, 200 calls
+per tick, and 30 ticks; the limit is clamped to the sampled cell count and the
+run has a 10-second budget. Output includes partition-path state, exact moved-
+pressure checksum, fresh-output count, retained candidate/proposal capacity,
+latency percentiles, guard metadata, path/workload verdicts, and `benchmark_ok`.
+
+Five alternating release A/B runs produced the same `823,782,000` checksum. The
+reusable path created zero fresh results and retained 2,000 candidate plus eight
+proposal slots; the comparison created 2,000 fresh results. Median tick p99 was
+3.755 ms with reuse versus 4.022 ms with fresh storage, about a 7% reduction on
+this development host. Core tests compare selected coordinates and moved score
+with full sorting across zero, small, half, full, and oversized budgets. A
+`limit=1500` run reports `top_k_partition_applied=false` and the same
+`2,601,231,850` checksum in both modes, confirming high-budget fallback.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
