@@ -252,8 +252,12 @@ sub-cell offset on every sweep. The default SDK path detects unchanged cell
 membership before allocating or mutating index storage. The benchmark reports
 `index_updates_inserted`, `index_updates_unchanged`,
 `index_updates_relocated`, `movement_ms_p99`, and
-`threshold_same_cell_movement_ok`. `--force-index-reinsert` is a benchmark-only
-A/B mode that removes and reinserts each moving handle.
+`threshold_movement_updates_ok`. The legacy
+`threshold_same_cell_movement_ok` field is retained for output compatibility.
+`point_relocation_in_place` identifies the optimized cross-cell path.
+`--cross-cell-movement` moves entities between adjacent cells, while
+`--force-index-reinsert` is a benchmark-only A/B mode that removes and
+reinserts each moving handle.
 
 For the 500-room, 4-10 player, 16-entities-per-player shape with 100% movement,
 447,232 same-cell index updates completed without reinsertion. Three alternating
@@ -261,6 +265,13 @@ release A/B runs reported median movement p99 of 4.481 ms versus 17.534 ms with
 forced reinsertion, median sweep p99 of 21.697 ms versus 40.503 ms, and median
 total time of 160.631 ms versus 270.190 ms. These figures are local regression
 evidence; the counters and verdict establish which path actually ran.
+
+With `--cross-cell-movement`, point entities retain and rewrite their existing
+one-cell membership list rather than removing and rebuilding the entity index
+entry. The same 447,232-update workload reported median movement p99 of
+11.313 ms versus 16.992 ms with forced reinsertion, median sweep p99 of
+29.919 ms versus 36.810 ms, and median total time of 208.854 ms versus
+261.278 ms across three alternating release A/B runs.
 
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or

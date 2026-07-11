@@ -27,6 +27,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Cell-index updates now skip allocation and index mutation when point entities
   remain in the same cell, with an observable update result and guarded
   many-room movement A/B coverage.
+- Point entities crossing cells now retain their entity-cell membership storage
+  and update it in place instead of removing and rebuilding the entity index
+  mapping.
 
 ## [2026.7.10] - 2026-07-10
 

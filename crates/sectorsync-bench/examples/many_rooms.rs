@@ -39,6 +39,13 @@ enum IndexUpdateMode {
     ForceReinsert,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MovementPattern {
+    #[default]
+    SameCell,
+    CrossCell,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Config {
     rooms: usize,
@@ -51,6 +58,7 @@ struct Config {
     component_bytes: usize,
     dirty_percent: usize,
     moving_percent: usize,
+    movement_pattern: MovementPattern,
     index_update_mode: IndexUpdateMode,
     preallocate: bool,
     ticks: usize,
@@ -73,6 +81,7 @@ impl Default for Config {
             component_bytes: DEFAULT_COMPONENT_BYTES,
             dirty_percent: DEFAULT_DIRTY_PERCENT,
             moving_percent: 0,
+            movement_pattern: MovementPattern::SameCell,
             index_update_mode: IndexUpdateMode::SameCellFastPath,
             preallocate: true,
             ticks: DEFAULT_TICKS,
@@ -94,6 +103,11 @@ impl Config {
                 IndexUpdateMode::ForceReinsert
             } else {
                 IndexUpdateMode::SameCellFastPath
+            },
+            movement_pattern: if args.iter().any(|arg| arg == "--cross-cell-movement") {
+                MovementPattern::CrossCell
+            } else {
+                MovementPattern::SameCell
             },
             ..Self::default()
         };
@@ -271,7 +285,7 @@ fn main() {
     let sweep_p99 = percentile_ms(&stats.sweep_ms, 0.99);
     let workload_ok = workload_completed(config, inventory, &stats);
     let retained_capacity_ok = retained_capacity_sufficient(inventory, retained);
-    let movement_ok = same_cell_movement_succeeded(config, &stats);
+    let movement_ok = movement_updates_succeeded(config, &stats);
     let benchmark_ok = workload_ok
         && retained_capacity_ok
         && movement_ok
@@ -311,8 +325,7 @@ fn main() {
     println!("component_bytes={}", config.component_bytes);
     println!("dirty_percent={}", config.dirty_percent);
     println!("dirty_distribution=per-room-scaled");
-    println!("moving_percent={}", config.moving_percent);
-    print_index_update_mode(config.index_update_mode);
+    print_movement_config(config);
     println!("preallocate={}", config.preallocate);
     println!("ticks={}", config.ticks);
     println!("ticks_completed={}", stats.ticks_completed);
@@ -362,11 +375,22 @@ fn main() {
     }
 }
 
-fn print_index_update_mode(mode: IndexUpdateMode) {
+fn print_movement_config(config: Config) {
+    println!("moving_percent={}", config.moving_percent);
     println!(
-        "same_cell_fast_path={}",
-        mode == IndexUpdateMode::SameCellFastPath
+        "movement_pattern={}",
+        match config.movement_pattern {
+            MovementPattern::SameCell => "same-cell",
+            MovementPattern::CrossCell => "cross-cell",
+        }
     );
+    print_index_update_mode(config.index_update_mode);
+}
+
+fn print_index_update_mode(mode: IndexUpdateMode) {
+    let optimized = mode == IndexUpdateMode::SameCellFastPath;
+    println!("same_cell_fast_path={optimized}");
+    println!("point_relocation_in_place={optimized}");
 }
 
 fn retained_capacity_sufficient(inventory: Inventory, retained: RetainedCapacity) -> bool {
@@ -377,19 +401,25 @@ fn retained_capacity_sufficient(inventory: Inventory, retained: RetainedCapacity
         && retained.component_entities >= inventory.entities
 }
 
-fn same_cell_movement_succeeded(config: Config, stats: &Stats) -> bool {
+fn movement_updates_succeeded(config: Config, stats: &Stats) -> bool {
     if config.moving_percent == 0 {
         stats.index_updates == 0
     } else {
-        let expected_updates = if config.index_update_mode == IndexUpdateMode::SameCellFastPath {
-            stats.index_updates_unchanged
-        } else {
-            stats.index_updates_inserted
+        let expected_updates = match (config.index_update_mode, config.movement_pattern) {
+            (IndexUpdateMode::ForceReinsert, _) => stats.index_updates_inserted,
+            (IndexUpdateMode::SameCellFastPath, MovementPattern::SameCell) => {
+                stats.index_updates_unchanged
+            }
+            (IndexUpdateMode::SameCellFastPath, MovementPattern::CrossCell) => {
+                stats.index_updates_relocated
+            }
         };
         stats.index_updates > 0
             && expected_updates == stats.index_updates
-            && stats.index_updates_inserted + stats.index_updates_unchanged == stats.index_updates
-            && stats.index_updates_relocated == 0
+            && stats.index_updates_inserted
+                + stats.index_updates_unchanged
+                + stats.index_updates_relocated
+                == stats.index_updates
     }
 }
 
@@ -403,6 +433,7 @@ fn print_movement_stats(stats: &Stats) {
 fn print_verdicts(workload_ok: bool, retained_capacity_ok: bool, movement_ok: bool) {
     println!("threshold_workload_completed_ok={workload_ok}");
     println!("threshold_retained_capacity_ok={retained_capacity_ok}");
+    println!("threshold_movement_updates_ok={movement_ok}");
     println!("threshold_same_cell_movement_ok={movement_ok}");
 }
 
@@ -667,8 +698,7 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
         for room in &mut *rooms {
             for work in &mut room.stations {
                 work.station.advance_tick();
-                movement_elapsed +=
-                    move_indexed_entities(work, &mut stats, config.index_update_mode);
+                movement_elapsed += move_indexed_entities(work, &mut stats, config);
                 let planning_start = Instant::now();
                 let batch = ReplicationPlanner::plan_for_viewers_range_into(
                     &work.station,
@@ -738,16 +768,16 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
     stats
 }
 
-fn move_indexed_entities(
-    work: &mut StationWork,
-    stats: &mut Stats,
-    index_update_mode: IndexUpdateMode,
-) -> Duration {
+fn move_indexed_entities(work: &mut StationWork, stats: &mut Stats, config: Config) -> Duration {
     let started = Instant::now();
+    let movement_distance = match config.movement_pattern {
+        MovementPattern::SameCell => 0.25,
+        MovementPattern::CrossCell => work.index.grid().cell_size() + 0.25,
+    };
     let offset = if work.station.tick().get().is_multiple_of(2) {
         0.0
     } else {
-        0.25
+        movement_distance
     };
     for &(handle, base_position) in &work.moving_entities {
         let position = Position3::new(base_position.x + offset, base_position.y, base_position.z);
@@ -755,7 +785,7 @@ fn move_indexed_entities(
             .move_owned(handle, position)
             .expect("benchmark moving entity should remain owned");
         stats.index_updates = stats.index_updates.saturating_add(1);
-        let update = if index_update_mode == IndexUpdateMode::SameCellFastPath {
+        let update = if config.index_update_mode == IndexUpdateMode::SameCellFastPath {
             work.index.upsert_tracked(handle, position, Bounds::Point)
         } else {
             assert!(work.index.remove(handle));
@@ -827,6 +857,16 @@ mod tests {
     }
 
     #[test]
+    fn cross_cell_movement_is_explicit() {
+        assert_eq!(
+            Config::default().movement_pattern,
+            MovementPattern::SameCell
+        );
+        let config = Config::from_args(["--cross-cell-movement".to_owned()].into_iter());
+        assert_eq!(config.movement_pattern, MovementPattern::CrossCell);
+    }
+
+    #[test]
     fn forced_reinsert_comparison_records_inserted_updates() {
         let config = Config {
             rooms: 1,
@@ -847,7 +887,31 @@ mod tests {
         assert_eq!(stats.index_updates_inserted, 2);
         assert_eq!(stats.index_updates_unchanged, 0);
         assert_eq!(stats.index_updates_relocated, 0);
-        assert!(same_cell_movement_succeeded(config, &stats));
+        assert!(movement_updates_succeeded(config, &stats));
+    }
+
+    #[test]
+    fn cross_cell_movement_records_relocated_updates() {
+        let config = Config {
+            rooms: 1,
+            min_players: 1,
+            max_players: 1,
+            players_per_station: 1,
+            entities_per_player: 2,
+            moving_percent: 100,
+            movement_pattern: MovementPattern::CrossCell,
+            ticks: 2,
+            sweep_p99_budget_ms: f64::MAX,
+            ..Config::default()
+        };
+        let mut rooms = create_rooms(config);
+        let stats = run(&mut rooms, config);
+
+        assert_eq!(stats.index_updates, 4);
+        assert_eq!(stats.index_updates_inserted, 0);
+        assert_eq!(stats.index_updates_unchanged, 0);
+        assert_eq!(stats.index_updates_relocated, 4);
+        assert!(movement_updates_succeeded(config, &stats));
     }
 
     #[test]

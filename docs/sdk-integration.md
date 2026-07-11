@@ -89,8 +89,9 @@ result back through controlled APIs such as:
 - `Station::move_owned` and `Station::set_tags` for authoritative built-ins.
 - `ComponentStore::set` or `set_typed` for external component data.
 - `CellIndex::upsert` after transform/bounds changes. Point updates that remain
-  in the same cell avoid index mutation and allocation automatically; use
-  `upsert_tracked` only when the application needs the update outcome.
+  in the same cell avoid index mutation and allocation automatically; point
+  updates that cross cells retain their entity-cell list and update the mapping
+  in place. Use `upsert_tracked` only when the application needs the outcome.
 - `EventRouter` or station event transport for ordered cross-station effects.
 
 Ghost records are read-only and must never finalize business state.

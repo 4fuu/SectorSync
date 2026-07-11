@@ -215,12 +215,20 @@ impl CellIndex {
     ) -> CellIndexUpdate {
         let cells = if bounds == Bounds::Point {
             let cell = self.grid.cell_at(position);
-            if self
+            if let Some(old_cell) = self
                 .entity_cells
                 .get(&handle)
-                .is_some_and(|current| current.as_slice() == [cell])
+                .and_then(|current| (current.len() == 1).then(|| current[0]))
             {
-                return CellIndexUpdate::Unchanged;
+                if old_cell == cell {
+                    return CellIndexUpdate::Unchanged;
+                }
+                self.remove_handle_from_cell(old_cell, handle);
+                self.cells.entry(cell).or_default().push(handle);
+                self.entity_cells
+                    .get_mut(&handle)
+                    .expect("indexed point entity retains its cell list")[0] = cell;
+                return CellIndexUpdate::Relocated;
             }
             vec![cell]
         } else {
@@ -253,18 +261,24 @@ impl CellIndex {
         };
 
         for cell in cells {
-            let remove_cell = if let Some(handles) = self.cells.get_mut(&cell) {
-                handles.retain(|candidate| *candidate != handle);
-                handles.is_empty()
-            } else {
-                false
-            };
-            if remove_cell {
-                self.cells.remove(&cell);
-            }
+            self.remove_handle_from_cell(cell, handle);
         }
 
         true
+    }
+
+    fn remove_handle_from_cell(&mut self, cell: CellCoord3, handle: EntityHandle) {
+        let remove_cell = if let Some(handles) = self.cells.get_mut(&cell) {
+            if let Some(index) = handles.iter().position(|candidate| *candidate == handle) {
+                handles.remove(index);
+            }
+            handles.is_empty()
+        } else {
+            false
+        };
+        if remove_cell {
+            self.cells.remove(&cell);
+        }
     }
 
     /// Queries candidate handles overlapping an AABB.
@@ -448,9 +462,22 @@ mod tests {
         assert_eq!(index.entity_capacity(), entity_capacity);
         assert_eq!(index.occupied_cell_capacity(), cell_capacity);
 
+        let retained_cell_list = index
+            .entity_cells
+            .get(&handle)
+            .expect("point entity has one cell list")
+            .as_ptr();
         assert_eq!(
             index.upsert_tracked(handle, Position3::new(11.0, 2.0, 3.0), Bounds::Point),
             CellIndexUpdate::Relocated
+        );
+        assert_eq!(
+            index
+                .entity_cells
+                .get(&handle)
+                .expect("relocated point entity retains its cell list")
+                .as_ptr(),
+            retained_cell_list
         );
         assert!(index.handles_in_cell_slice(first_cell).is_empty());
         assert_eq!(index.handles_in_cell_slice(second_cell), &[handle]);
