@@ -42,6 +42,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Single-viewer replication planning now offers reusable output variants for
   normal, cadence, priority, and priority/cadence paths; the transport bridge
   retains one plan slot and bounds reservation by actual candidate count.
+- Budgeted priority planning now partitions and sorts only the deterministic
+  top-k prefix when k is below half of eligible candidates, retaining full sort
+  for large budgets.
 
 ## [2026.7.10] - 2026-07-10
 

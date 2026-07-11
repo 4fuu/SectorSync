@@ -1,5 +1,6 @@
 //! Replication planning helpers.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::ids::{ClientId, EntityHandle, Tick};
@@ -1368,24 +1369,43 @@ impl ReplicationPlanner {
             });
         }
 
-        eligible.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.distance_squared.total_cmp(&right.distance_squared))
-                .then_with(|| left.handle.cmp(&right.handle))
-        });
+        let selected = prioritize_candidates(eligible, hard_limit);
 
-        plan.stats.skipped_by_budget = eligible.len().saturating_sub(hard_limit);
+        plan.stats.skipped_by_budget = eligible.len().saturating_sub(selected);
         plan.entities.extend(
             eligible
                 .iter()
-                .take(hard_limit)
+                .take(selected)
                 .map(|candidate| candidate.handle),
         );
         plan.stats.selected = plan.entities.len();
         plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
     }
+}
+
+fn compare_prioritized_candidates(
+    left: &PrioritizedReplicationCandidate,
+    right: &PrioritizedReplicationCandidate,
+) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.distance_squared.total_cmp(&right.distance_squared))
+        .then_with(|| left.handle.cmp(&right.handle))
+}
+
+fn prioritize_candidates(eligible: &mut [PrioritizedReplicationCandidate], limit: usize) -> usize {
+    let selected = eligible.len().min(limit);
+    if selected == 0 {
+        return 0;
+    }
+    if selected.saturating_mul(2) < eligible.len() {
+        eligible.select_nth_unstable_by(selected, compare_prioritized_candidates);
+        eligible[..selected].sort_by(compare_prioritized_candidates);
+    } else {
+        eligible.sort_by(compare_prioritized_candidates);
+    }
+    selected
 }
 
 #[cfg(test)]
@@ -1725,6 +1745,30 @@ mod tests {
         assert!(
             ReplicationPriority::score(&low, 0.0) > ReplicationPriority::score(&low, 90.0 * 90.0)
         );
+    }
+
+    #[test]
+    fn top_k_priority_selection_matches_full_sort_for_all_budget_edges() {
+        let candidates = (0_u32..257)
+            .map(|index| PrioritizedReplicationCandidate {
+                handle: EntityHandle::new(index, index % 3),
+                score: u64::from(index.wrapping_mul(37) % 23),
+                distance_squared: f32::from(
+                    u16::try_from(index.wrapping_mul(19) % 41).expect("distance fits u16"),
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        for limit in [0, 1, 7, 64, 256, 257, 300] {
+            let mut expected = candidates.clone();
+            expected.sort_by(compare_prioritized_candidates);
+            expected.truncate(limit.min(expected.len()));
+            let mut actual = candidates.clone();
+            let selected = prioritize_candidates(&mut actual, limit);
+
+            assert_eq!(selected, expected.len());
+            assert_eq!(&actual[..selected], expected.as_slice());
+        }
     }
 
     #[test]

@@ -120,6 +120,11 @@ the slot to the bridge before the error is surfaced. Direct single-viewer loops
 can use the corresponding `*_into` planner methods. Output reservation is capped
 by both the budget hard limit and actual candidate count.
 
+Priority planning uses deterministic top-k partitioning when the budget selects
+less than half of eligible candidates, then sorts only that prefix by score,
+distance, and handle. At or above half, it conservatively uses the existing full
+sort. Output ordering and skipped-by-budget statistics are unchanged.
+
 `ReplicationTransportBridge` also requests a bounded initial packet capacity
 when up to four uniformly sampled entities all contain encodable dirty data.
 Sparse or empty samples return a zero hint and retain normal `Vec` growth. Direct

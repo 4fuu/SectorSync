@@ -22,6 +22,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   cell-list allocation.
 - Exactly one authoritative owner per entity and read-only ghost semantics.
 - Range, frustum, tag, cadence, priority, and byte-budget replication filters.
+- Budgeted priority planning partitions deterministic top-k candidates instead
+  of sorting the full eligible set when the send budget is small.
 - Reusable caller-owned query and replication scratch buffers.
 - Reusable single-viewer plan output across normal, cadence, and priority paths.
 - Explicit Station, spatial-index, and component-column capacity reservation.
@@ -259,6 +261,13 @@ cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
   --entities=32 --calls-per-tick=500 --ticks=30
 cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
   --entities=32 --calls-per-tick=500 --ticks=30 --fresh-plan-output
+```
+
+Budgeted priority selection has an allocation-neutral algorithm comparison:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example priority_top_k
+cargo run --release -q -p sectorsync-bench --example priority_top_k -- --full-sort
 ```
 
 For explicit parallel planning, `ParallelReplicationScratch` retains at most one

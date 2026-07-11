@@ -365,6 +365,29 @@ candidates and 4,000 calls, median p99 was effectively neutral (3.974 ms versus
 3.994 ms) because query/filter work dominated, while output allocations were
 still eliminated.
 
+## Budgeted Priority Top-K Measurement
+
+Priority planning uses the same total comparator as before: score descending,
+distance ascending, then handle ascending. When the selected budget is less
+than half of eligible candidates, it partitions the deterministic top-k set and
+sorts only that prefix. At or above half it uses full sorting directly. The
+guarded benchmark reuses one candidate buffer so the comparison contains no
+allocation difference:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example priority_top_k
+cargo run --release -q -p sectorsync-bench --example priority_top_k -- --full-sort
+```
+
+The default guard caps 10,000 candidates, 200 calls per tick, and 30 ticks, with
+a 10-second execution budget. For 2,000 candidates, a limit of 32, and 2,000
+selection calls, five alternating release runs produced identical selected
+counts and checksums. Median tick p99 was 0.781 ms for top-k versus 4.691 ms for
+full sorting, an 83% reduction in the isolated selection phase. Core tests
+compare top-k output against full sorting across zero, small, boundary, equal,
+and oversized limits. A `limit=1800` check reports `partition_applied=false`,
+confirming the high-budget fallback.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
