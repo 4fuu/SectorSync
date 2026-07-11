@@ -39,6 +39,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Replication packet encoding now uses a builder-limited, four-entity dirty-data
   sample to pre-size dense frames while conservatively falling back to normal
   buffer growth for sparse or empty frames.
+- Single-viewer replication planning now offers reusable output variants for
+  normal, cadence, priority, and priority/cadence paths; the transport bridge
+  retains one plan slot and bounds reservation by actual candidate count.
 
 ## [2026.7.10] - 2026-07-10
 

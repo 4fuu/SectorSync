@@ -338,6 +338,33 @@ membership. Three alternating release runs reported median update p99 of
 temporary cell coordinates. This isolates the removed list-construction work;
 real boundary crossings still rebuild persistent membership as required.
 
+## Single-Viewer Plan Output Measurement
+
+`ReplicationTransportBridge` retains one `ReplicationPlan` output across
+normal, cadence, priority, and priority/cadence sends. The guarded
+`single_viewer_planning` benchmark isolates that output from the already reused
+spatial scratch. `--fresh-plan-output` recreates the previous owned-plan path:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
+  --entities=32 --calls-per-tick=500 --ticks=30
+cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
+  --entities=32 --calls-per-tick=500 --ticks=30 --fresh-plan-output
+```
+
+The default guard caps 4,000 entities, 500 calls per tick, and 30 ticks, with a
+10-second execution budget. Output includes call/selection counts, fresh output
+count, retained plan capacity, latency percentiles, path/workload verdicts, and
+`benchmark_ok`.
+
+For 32 candidates and 15,000 planning calls, five alternating release A/B runs
+reported median tick p99 of 0.287 ms with retained output versus 0.364 ms with
+fresh output. The retained path performed no fresh plan-output allocations and
+held capacity for 32 handles; the comparison created 15,000 outputs. At 2,000
+candidates and 4,000 calls, median p99 was effectively neutral (3.974 ms versus
+3.994 ms) because query/filter work dominated, while output allocations were
+still eliminated.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

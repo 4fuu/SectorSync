@@ -23,6 +23,7 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Exactly one authoritative owner per entity and read-only ghost semantics.
 - Range, frustum, tag, cadence, priority, and byte-budget replication filters.
 - Reusable caller-owned query and replication scratch buffers.
+- Reusable single-viewer plan output across normal, cadence, and priority paths.
 - Explicit Station, spatial-index, and component-column capacity reservation.
 - Reusable typed-component encoding scratch and in-place blob byte updates.
 - Dense replication frames use bounded dirty-data sampling to reduce output
@@ -249,6 +250,16 @@ cargo run --release -q -p sectorsync-bench --example multi_cell_bounds -- `
 
 The second command materializes the temporary cell list removed by the
 optimized path for an explicit A/B comparison.
+
+Single-viewer plan output reuse has a separate guarded comparison for bridge-
+style repeated sends:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
+  --entities=32 --calls-per-tick=500 --ticks=30
+cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
+  --entities=32 --calls-per-tick=500 --ticks=30 --fresh-plan-output
+```
 
 For explicit parallel planning, `ParallelReplicationScratch` retains at most one
 planning scratch lane per configured worker, not per Station batch. The

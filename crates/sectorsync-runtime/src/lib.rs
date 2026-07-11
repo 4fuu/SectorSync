@@ -62,6 +62,8 @@ pub struct ReplicationTransportStats {
     pub bytes_sent: usize,
     /// Initial packet byte capacity requested from bounded wire hints.
     pub packet_capacity_hint_bytes: usize,
+    /// Largest entity capacity retained by the reusable single-viewer plan.
+    pub planning_entity_capacity_max: usize,
     /// Entities selected by AOI planning.
     pub entities_selected: usize,
     /// Entities skipped by replication planner budget.
@@ -139,6 +141,7 @@ pub struct ReplicationTransportBridge {
     config: ReplicationTransportConfig,
     builder: ReplicationFrameBuilder,
     planning_scratch: Option<ReplicationScratch>,
+    planning_output: ReplicationPlan,
     stats: ReplicationTransportStats,
 }
 
@@ -149,12 +152,24 @@ impl ReplicationTransportBridge {
             config,
             builder,
             planning_scratch: None,
+            planning_output: ReplicationPlan {
+                entities: Vec::new(),
+                stats: sectorsync_core::prelude::ReplicationStats {
+                    candidates: 0,
+                    considered: 0,
+                    selected: 0,
+                    skipped_by_budget: 0,
+                    skipped_by_cadence: 0,
+                    estimated_bytes: 0,
+                },
+            },
             stats: ReplicationTransportStats {
                 viewers_planned: 0,
                 frames_skipped_empty: 0,
                 frames_sent: 0,
                 bytes_sent: 0,
                 packet_capacity_hint_bytes: 0,
+                planning_entity_capacity_max: 0,
                 entities_selected: 0,
                 entities_skipped_by_budget: 0,
                 entities_skipped_by_cadence: 0,
@@ -196,7 +211,8 @@ impl ReplicationTransportBridge {
         T: TransportSink,
         F: VisibilityFilter,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
+        let mut plan = core::mem::take(&mut self.planning_output);
+        ReplicationPlanner::plan_for_viewer_with_scratch_into(
             station,
             index,
             policies,
@@ -204,8 +220,10 @@ impl ReplicationTransportBridge {
             filter,
             self.config.budget,
             self.planning_scratch.get_or_insert_default(),
+            &mut plan,
         );
-        self.send_plan(
+        self.record_planning_capacity(&plan);
+        let result = self.send_plan(
             transport,
             viewer.client_id,
             station.tick(),
@@ -213,7 +231,9 @@ impl ReplicationTransportBridge {
             components,
             selection,
             &plan,
-        )
+        );
+        self.planning_output = plan;
+        result
     }
 
     /// Plans with cadence, builds, encodes, and sends one viewer replication frame.
@@ -235,7 +255,8 @@ impl ReplicationTransportBridge {
         F: VisibilityFilter,
         L: Fn(EntityHandle) -> Option<Tick>,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_with_cadence_and_scratch(
+        let mut plan = core::mem::take(&mut self.planning_output);
+        ReplicationPlanner::plan_for_viewer_with_cadence_and_scratch_into(
             station,
             index,
             policies,
@@ -244,8 +265,10 @@ impl ReplicationTransportBridge {
             self.config.budget,
             last_sent,
             self.planning_scratch.get_or_insert_default(),
+            &mut plan,
         );
-        self.send_plan(
+        self.record_planning_capacity(&plan);
+        let result = self.send_plan(
             transport,
             viewer.client_id,
             station.tick(),
@@ -253,7 +276,9 @@ impl ReplicationTransportBridge {
             components,
             selection,
             &plan,
-        )
+        );
+        self.planning_output = plan;
+        result
     }
 
     /// Plans by priority, builds, encodes, and sends one viewer replication frame.
@@ -273,7 +298,8 @@ impl ReplicationTransportBridge {
         T: TransportSink,
         F: VisibilityFilter,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_prioritized_with_scratch(
+        let mut plan = core::mem::take(&mut self.planning_output);
+        ReplicationPlanner::plan_for_viewer_prioritized_with_scratch_into(
             station,
             index,
             policies,
@@ -281,8 +307,10 @@ impl ReplicationTransportBridge {
             filter,
             self.config.budget,
             self.planning_scratch.get_or_insert_default(),
+            &mut plan,
         );
-        self.send_plan(
+        self.record_planning_capacity(&plan);
+        let result = self.send_plan(
             transport,
             viewer.client_id,
             station.tick(),
@@ -290,7 +318,9 @@ impl ReplicationTransportBridge {
             components,
             selection,
             &plan,
-        )
+        );
+        self.planning_output = plan;
+        result
     }
 
     /// Plans by priority and cadence, builds, encodes, and sends one viewer replication frame.
@@ -312,7 +342,8 @@ impl ReplicationTransportBridge {
         F: VisibilityFilter,
         L: Fn(EntityHandle) -> Option<Tick>,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_prioritized_with_cadence_and_scratch(
+        let mut plan = core::mem::take(&mut self.planning_output);
+        ReplicationPlanner::plan_for_viewer_prioritized_with_cadence_and_scratch_into(
             station,
             index,
             policies,
@@ -321,8 +352,10 @@ impl ReplicationTransportBridge {
             self.config.budget,
             last_sent,
             self.planning_scratch.get_or_insert_default(),
+            &mut plan,
         );
-        self.send_plan(
+        self.record_planning_capacity(&plan);
+        let result = self.send_plan(
             transport,
             viewer.client_id,
             station.tick(),
@@ -330,7 +363,16 @@ impl ReplicationTransportBridge {
             components,
             selection,
             &plan,
-        )
+        );
+        self.planning_output = plan;
+        result
+    }
+
+    fn record_planning_capacity(&mut self, plan: &ReplicationPlan) {
+        self.stats.planning_entity_capacity_max = self
+            .stats
+            .planning_entity_capacity_max
+            .max(plan.entities.capacity());
     }
 
     /// Builds, encodes, and sends a caller-provided replication plan.
@@ -4170,9 +4212,9 @@ mod tests {
         SnapshotMeta, StationConfig, StationLoadSample, U32LeCodec,
     };
     use sectorsync_transport::{
-        ClientTransportLimits, FakeTransport, InMemoryStationTransport, InMemoryTransportHub,
-        OutboundPacket, StationOutboundPacket, StationTransportSink, TransportReceiver,
-        TransportSink,
+        BudgetedTransport, ClientTransportLimits, FakeTransport, InMemoryStationTransport,
+        InMemoryTransportHub, OutboundPacket, StationOutboundPacket, StationTransportSink,
+        TransportReceiver, TransportSink,
     };
     use sectorsync_wire::{
         BarrierFrame, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
@@ -4486,7 +4528,24 @@ mod tests {
         assert_eq!(bridge.stats().entities_selected, 1);
         assert_eq!(bridge.stats().components_encoded, 1);
         assert!(bridge.stats().packet_capacity_hint_bytes >= report.bytes_sent);
+        assert!(bridge.stats().planning_entity_capacity_max >= 1);
         assert!(bridge.planning_scratch.is_some());
+
+        let retained_entities = bridge.planning_output.entities.as_ptr();
+        let mut rejecting = BudgetedTransport::new(FakeTransport::default(), 0, 0);
+        bridge
+            .send_viewer(
+                &mut rejecting,
+                &station,
+                &index,
+                &policies,
+                &components,
+                &selection,
+                &viewer,
+                &RangeOnlyVisibility,
+            )
+            .expect_err("transport budget should reject the packet");
+        assert_eq!(bridge.planning_output.entities.as_ptr(), retained_entities);
     }
 
     #[test]

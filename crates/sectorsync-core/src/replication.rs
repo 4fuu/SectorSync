@@ -866,11 +866,34 @@ impl ReplicationPlanner {
         F: VisibilityFilter,
         L: Fn(EntityHandle) -> Option<Tick>,
     {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_viewer_with_cadence_and_scratch_into(
+            station, index, policies, viewer, filter, budget, last_sent, scratch, &mut plan,
+        );
+        plan
+    }
+
+    /// Plans a cadence-aware frame into caller-owned reusable output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_with_cadence_and_scratch_into<F, L>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        last_sent: L,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
         let tick_rate_hz = station.config().tick_rate_hz;
         let now = station.tick();
         let candidates =
             index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
-        Self::plan_for_candidates_inner(
+        Self::plan_for_candidates_inner_into(
             station,
             candidates,
             policies,
@@ -886,7 +909,8 @@ impl ReplicationPlanner {
                     last_sent(handle),
                 )
             },
-        )
+            plan,
+        );
     }
 
     /// Plans a frame and selects the highest-priority entities when budgeted.
@@ -922,9 +946,28 @@ impl ReplicationPlanner {
         budget: ReplicationBudget,
         scratch: &mut ReplicationScratch,
     ) -> ReplicationPlan {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_viewer_prioritized_with_scratch_into(
+            station, index, policies, viewer, filter, budget, scratch, &mut plan,
+        );
+        plan
+    }
+
+    /// Plans a priority frame into caller-owned reusable output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_prioritized_with_scratch_into<F: VisibilityFilter>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) {
         let candidates =
             index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
-        Self::plan_for_candidates_prioritized_inner(
+        Self::plan_for_candidates_prioritized_inner_into(
             station,
             candidates,
             policies,
@@ -933,7 +976,8 @@ impl ReplicationPlanner {
             budget,
             &mut scratch.prioritized,
             |_, _, _| true,
-        )
+            plan,
+        );
     }
 
     /// Plans a budgeted priority frame with distance-based cadence checks.
@@ -990,11 +1034,34 @@ impl ReplicationPlanner {
         F: VisibilityFilter,
         L: Fn(EntityHandle) -> Option<Tick>,
     {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_viewer_prioritized_with_cadence_and_scratch_into(
+            station, index, policies, viewer, filter, budget, last_sent, scratch, &mut plan,
+        );
+        plan
+    }
+
+    /// Plans a priority/cadence frame into caller-owned reusable output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewer_prioritized_with_cadence_and_scratch_into<F, L>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        last_sent: L,
+        scratch: &mut ReplicationScratch,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        L: Fn(EntityHandle) -> Option<Tick>,
+    {
         let tick_rate_hz = station.config().tick_rate_hz;
         let now = station.tick();
         let candidates =
             index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
-        Self::plan_for_candidates_prioritized_inner(
+        Self::plan_for_candidates_prioritized_inner_into(
             station,
             candidates,
             policies,
@@ -1011,7 +1078,8 @@ impl ReplicationPlanner {
                     last_sent(handle),
                 )
             },
-        )
+            plan,
+        );
     }
 
     fn plan_for_candidates_inner<F, C>(
@@ -1059,7 +1127,7 @@ impl ReplicationPlanner {
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
         plan.entities.clear();
-        plan.entities.reserve(hard_limit);
+        plan.entities.reserve(hard_limit.min(candidates.len()));
         plan.stats = ReplicationStats {
             candidates: candidates.len(),
             ..ReplicationStats::default()
@@ -1166,7 +1234,7 @@ impl ReplicationPlanner {
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
         plan.entities.clear();
-        plan.entities.reserve(hard_limit);
+        plan.entities.reserve(hard_limit.min(candidates.len()));
         plan.stats = ReplicationStats {
             candidates: candidates.len(),
             ..ReplicationStats::default()
@@ -1230,15 +1298,44 @@ impl ReplicationPlanner {
         F: VisibilityFilter,
         C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
     {
+        let mut plan = ReplicationPlan::default();
+        Self::plan_for_candidates_prioritized_inner_into(
+            station,
+            candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            eligible,
+            cadence_allows,
+            &mut plan,
+        );
+        plan
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_for_candidates_prioritized_inner_into<F, C>(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        eligible: &mut Vec<PrioritizedReplicationCandidate>,
+        cadence_allows: C,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        C: Fn(EntityHandle, &CompiledSyncPolicy, f32) -> bool,
+    {
         let max_entities = viewer.max_entities.min(budget.max_entities);
         let max_by_bytes = budget.max_bytes / budget.estimated_entity_bytes.max(1);
         let hard_limit = max_entities.min(max_by_bytes);
-        let mut plan = ReplicationPlan {
-            entities: Vec::with_capacity(hard_limit),
-            stats: ReplicationStats {
-                candidates: candidates.len(),
-                ..ReplicationStats::default()
-            },
+        plan.entities.clear();
+        plan.entities.reserve(hard_limit.min(candidates.len()));
+        plan.stats = ReplicationStats {
+            candidates: candidates.len(),
+            ..ReplicationStats::default()
         };
         eligible.clear();
 
@@ -1288,7 +1385,6 @@ impl ReplicationPlanner {
         );
         plan.stats.selected = plan.entities.len();
         plan.stats.estimated_bytes = plan.stats.selected * budget.estimated_entity_bytes;
-        plan
     }
 }
 
@@ -1685,6 +1781,21 @@ mod tests {
         assert_eq!(plan.entities, vec![near]);
         assert_eq!(plan.stats.selected, 1);
         assert_eq!(plan.stats.skipped_by_cadence, 1);
+
+        let mut scratch = ReplicationScratch::default();
+        let mut reusable = ReplicationPlan::default();
+        ReplicationPlanner::plan_for_viewer_with_cadence_and_scratch_into(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            &RangeOnlyVisibility,
+            ReplicationBudget::default(),
+            |_| Some(Tick::new(9)),
+            &mut scratch,
+            &mut reusable,
+        );
+        assert_eq!(reusable, plan);
     }
 
     #[test]
@@ -1768,6 +1879,57 @@ mod tests {
         assert_eq!(scratch.query_stats().candidate_handles, 2);
         assert!(scratch.candidate_capacity() >= 2);
         assert!(scratch.candidate_dedup_capacity() >= 2);
+
+        let budget = ReplicationBudget {
+            max_entities: 1,
+            max_bytes: 32,
+            estimated_entity_bytes: 32,
+        };
+        assert_prioritized_output_reuse(
+            &station,
+            &index,
+            &policies,
+            &viewer,
+            budget,
+            &plan,
+            &mut scratch,
+        );
+    }
+
+    fn assert_prioritized_output_reuse(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        budget: ReplicationBudget,
+        expected: &ReplicationPlan,
+        scratch: &mut ReplicationScratch,
+    ) {
+        let mut reusable = ReplicationPlan::default();
+        ReplicationPlanner::plan_for_viewer_prioritized_with_scratch_into(
+            station,
+            index,
+            policies,
+            viewer,
+            &RangeOnlyVisibility,
+            budget,
+            scratch,
+            &mut reusable,
+        );
+        let retained_entities = reusable.entities.as_ptr();
+        assert_eq!(&reusable, expected);
+        ReplicationPlanner::plan_for_viewer_prioritized_with_cadence_and_scratch_into(
+            station,
+            index,
+            policies,
+            viewer,
+            &RangeOnlyVisibility,
+            budget,
+            |_| None,
+            scratch,
+            &mut reusable,
+        );
+        assert_eq!(reusable.entities.as_ptr(), retained_entities);
     }
 
     #[test]

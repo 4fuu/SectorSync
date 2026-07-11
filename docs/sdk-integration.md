@@ -114,6 +114,12 @@ planned repeatedly. Explicit parallel integrations retain at most one planning
 scratch lane per configured worker. Cadence and priority state must remain
 explicit.
 
+The bridge retains one `ReplicationPlan` output slot across its normal, cadence,
+priority, and priority/cadence send paths. Transport or encoding failures return
+the slot to the bridge before the error is surfaced. Direct single-viewer loops
+can use the corresponding `*_into` planner methods. Output reservation is capped
+by both the budget hard limit and actual candidate count.
+
 `ReplicationTransportBridge` also requests a bounded initial packet capacity
 when up to four uniformly sampled entities all contain encodable dirty data.
 Sparse or empty samples return a zero hint and retain normal `Vec` growth. Direct
