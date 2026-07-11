@@ -53,10 +53,10 @@ application:
 
 ```toml
 [dependencies]
-sectorsync-core = "=2026.7.10"
-sectorsync-wire = "=2026.7.10"
-sectorsync-transport = "=2026.7.10"
-sectorsync-runtime = "=2026.7.10"
+sectorsync-core = "=2026.711.0"
+sectorsync-wire = "=2026.711.0"
+sectorsync-transport = "=2026.711.0"
+sectorsync-runtime = "=2026.711.0"
 ```
 
 `sectorsync-core` can be used by itself. The higher layers build on it without
@@ -66,8 +66,8 @@ network services.
 Performance integrations are opt-in:
 
 ```toml
-sectorsync-core = { version = "=2026.7.10", features = ["simd"] }
-sectorsync-runtime = { version = "=2026.7.10", features = ["parallel"] }
+sectorsync-core = { version = "=2026.711.0", features = ["simd"] }
+sectorsync-runtime = { version = "=2026.711.0", features = ["parallel"] }
 ```
 
 `simd` enables the safe eight-lane range-only candidate path. `parallel` exposes
