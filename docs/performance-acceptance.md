@@ -598,6 +598,35 @@ versus 0.175 ms for collect/mark, about a 61% reduction on this development host
 Runtime tests cover fresh, exact-boundary, stale, existing-offline, repeated-pass,
 route-epoch, and counter behavior; benchmark tests compare every node route.
 
+## Load Sampling Output Reuse Measurement
+
+`StationLoadSampler::sample_all_into` retains subscriber aggregation, sorted
+occupancy scratch, outer Station sample slots, and each Station's cell output.
+`CellIndex::cell_occupancy_into` supplies deterministic caller-owned occupancy
+storage. The owned `sample_all` and `cell_occupancy` APIs remain available for
+results that must outlive scratch. Compare both sampling paths with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example load_sampling_reuse
+cargo run --release -q -p sectorsync-bench --example load_sampling_reuse -- --fresh-output
+```
+
+The default workload samples 256 rooms with 16 entities and two subscriber
+records per room across 200 calls. Guards cap 1,000 rooms, 64 entities per room,
+50 calls per tick, and 20 ticks without `--allow-heavy`; execution has a
+10-second budget. Output retains machine-readable entity, cell, subscriber, and
+sample checksums, fresh-output count, all scratch capacity classes, latency
+percentiles, guard metadata, path/workload verdicts, and `benchmark_ok`.
+
+Five alternating release A/B runs produced identical `819,200` entity and cell
+checksums plus a `482,800` subscriber checksum. The reusable path created zero
+fresh outputs and retained 256 Station slots plus 4,096 cell slots; the owned
+path created 200 fresh outputs. Median tick p99 was 3.782 ms reusable versus
+6.429 ms owned, about a 41% reduction on this development host. Core/runtime
+tests verify deterministic occupancy, exact sample equivalence, duplicate
+subscriber aggregation, and retained outer and nested storage; benchmark tests
+verify guard enforcement and cross-path checksums.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

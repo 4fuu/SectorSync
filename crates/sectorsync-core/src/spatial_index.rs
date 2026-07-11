@@ -384,16 +384,19 @@ impl CellIndex {
 
     /// Returns deterministic occupancy counts for all non-empty cells.
     pub fn cell_occupancy(&self) -> Vec<CellOccupancy> {
-        let mut cells = self
-            .cells
-            .iter()
-            .map(|(cell, handles)| CellOccupancy {
-                cell: *cell,
-                entities: handles.len(),
-            })
-            .collect::<Vec<_>>();
-        cells.sort_by_key(|occupancy| occupancy.cell);
+        let mut cells = Vec::with_capacity(self.cells.len());
+        self.cell_occupancy_into(&mut cells);
         cells
+    }
+
+    /// Writes deterministic occupancy counts into caller-owned reusable storage.
+    pub fn cell_occupancy_into(&self, out: &mut Vec<CellOccupancy>) {
+        out.clear();
+        out.extend(self.cells.iter().map(|(cell, handles)| CellOccupancy {
+            cell: *cell,
+            entities: handles.len(),
+        }));
+        out.sort_by_key(|occupancy| occupancy.cell);
     }
 }
 
@@ -570,6 +573,31 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(index.cells_for_handle(handle), Some([cell].as_slice()));
+    }
+
+    #[test]
+    fn occupancy_output_is_sorted_and_reuses_capacity() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::new(grid);
+        let left = EntityHandle::new(1, 0);
+        let right = EntityHandle::new(2, 0);
+        index.upsert(right, Position3::new(21.0, 0.0, 0.0), Bounds::Point);
+        index.upsert(left, Position3::new(-11.0, 0.0, 0.0), Bounds::Point);
+
+        let expected = index.cell_occupancy();
+        let mut occupancy = Vec::new();
+        index.cell_occupancy_into(&mut occupancy);
+        assert_eq!(occupancy, expected);
+        assert!(
+            occupancy
+                .windows(2)
+                .all(|cells| cells[0].cell < cells[1].cell)
+        );
+
+        let retained = occupancy.as_ptr();
+        index.cell_occupancy_into(&mut occupancy);
+        assert_eq!(occupancy, expected);
+        assert_eq!(occupancy.as_ptr(), retained);
     }
 
     #[test]

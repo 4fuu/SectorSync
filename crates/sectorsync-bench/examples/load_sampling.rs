@@ -5,8 +5,8 @@ use sectorsync_core::prelude::{
     OwnerEpoch, PolicyId, Position3, Station, StationConfig, StationEvent, StationId, Tick,
 };
 use sectorsync_runtime::{
-    EventRouter, StationIndexSet, StationLoadSampler, StationScheduleConfig, StationScheduler,
-    StationSet,
+    EventRouter, StationIndexSet, StationLoadSampler, StationLoadSamplerScratch,
+    StationScheduleConfig, StationScheduler, StationSet,
 };
 
 fn main() {
@@ -36,7 +36,8 @@ fn main() {
     }
 
     let load_sampler = StationLoadSampler::default();
-    let samples = load_sampler.sample_all(
+    let mut load_scratch = StationLoadSamplerScratch::new();
+    let samples = load_sampler.sample_all_into(
         &stations,
         &indexes,
         &router,
@@ -45,6 +46,7 @@ fn main() {
             (busy_station, 16),
             (StationId::new(3), 4),
         ],
+        &mut load_scratch,
     );
     let busy_sample = samples
         .iter()
@@ -59,7 +61,7 @@ fn main() {
     let mut scheduler = StationScheduler::default();
     let plan = scheduler.advance_loaded(
         &mut stations,
-        &samples,
+        samples,
         StationScheduleConfig {
             max_station_advances_per_step: 1,
         },

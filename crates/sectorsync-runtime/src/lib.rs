@@ -9,15 +9,15 @@ mod parallel;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sectorsync_core::prelude::{
-    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CellLoadSample, ClientId,
-    CommandEnvelope, CommandId, CommandIngress, CommandQueueError, CommandQueueMode, CommandQueues,
-    ComponentStore, EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues,
-    GatewayError, GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner,
-    HotspotSeverity, HotspotSplitScratch, HotspotThresholds, NodeId, OwnerEpoch, PolicyTable,
-    PushOutcome, ReplicationBudget, ReplicationPlan, ReplicationPlanner, ReplicationScratch,
-    RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion, SplitProposal, Station, StationError,
-    StationEvent, StationId, StationLoadSample, StationSnapshot, Tick, ViewerQuery,
-    VisibilityFilter,
+    BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CellLoadSample, CellOccupancy,
+    ClientId, CommandEnvelope, CommandId, CommandIngress, CommandQueueError, CommandQueueMode,
+    CommandQueues, ComponentStore, EntityHandle, EntityId, EventQueueError, EventQueueLimits,
+    EventQueues, GatewayError, GatewaySessionTable, HandoffTransfer, HotspotDecision,
+    HotspotPlanner, HotspotSeverity, HotspotSplitScratch, HotspotThresholds, NodeId, OwnerEpoch,
+    PolicyTable, PushOutcome, ReplicationBudget, ReplicationPlan, ReplicationPlanner,
+    ReplicationScratch, RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion, SplitProposal,
+    Station, StationError, StationEvent, StationId, StationLoadSample, StationSnapshot, Tick,
+    ViewerQuery, VisibilityFilter,
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
@@ -2271,6 +2271,44 @@ pub struct StationLoadSampler {
     config: StationLoadSamplerConfig,
 }
 
+/// Caller-owned reusable storage for periodic station load sampling.
+#[derive(Clone, Debug, Default)]
+pub struct StationLoadSamplerScratch {
+    subscribers_by_station: HashMap<StationId, usize>,
+    occupancy: Vec<CellOccupancy>,
+    samples: Vec<StationLoadSample>,
+}
+
+impl StationLoadSamplerScratch {
+    /// Creates empty sampling storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hash-table capacity retained for subscriber aggregation.
+    pub fn retained_subscriber_capacity(&self) -> usize {
+        self.subscribers_by_station.capacity()
+    }
+
+    /// Temporary occupancy capacity retained across station scans.
+    pub fn retained_occupancy_capacity(&self) -> usize {
+        self.occupancy.capacity()
+    }
+
+    /// Station output slots retained across sampling passes.
+    pub fn retained_sample_slots(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Total cell output capacity retained across station slots.
+    pub fn retained_cell_capacity(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|sample| sample.cells.capacity())
+            .sum()
+    }
+}
+
 impl StationLoadSampler {
     /// Creates a station load sampler.
     pub const fn new(config: StationLoadSamplerConfig) -> Self {
@@ -2291,30 +2329,17 @@ impl StationLoadSampler {
         queued_events: usize,
         subscribers: usize,
     ) -> StationLoadSample {
-        let (owned_entities, ghost_entities) = count_station_roles(station);
-        let cells = index
-            .map(|index| self.sample_cells(station, index))
-            .unwrap_or_default();
-        StationLoadSample {
-            station_id: station.config().station_id,
-            owned_entities,
-            ghost_entities,
-            subscribers,
+        let mut sample = StationLoadSample::default();
+        let mut occupancy = Vec::new();
+        self.sample_station_into(
+            station,
+            index,
             queued_events,
-            estimated_bytes: self.estimate_station_bytes(
-                owned_entities,
-                ghost_entities,
-                subscribers,
-                queued_events,
-            ),
-            tick_cost_units: self.estimate_tick_cost(
-                owned_entities,
-                ghost_entities,
-                cells.len(),
-                queued_events,
-            ),
-            cells,
-        }
+            subscribers,
+            &mut occupancy,
+            &mut sample,
+        );
+        sample
     }
 
     /// Samples every station in deterministic station-set order.
@@ -2349,36 +2374,113 @@ impl StationLoadSampler {
             .collect()
     }
 
-    fn sample_cells(&self, station: &Station, index: &CellIndex) -> Vec<CellLoadSample> {
-        index
-            .cell_occupancy()
-            .into_iter()
-            .map(|occupancy| {
-                let mut owned_entities = 0usize;
-                let mut ghost_entities = 0usize;
+    /// Samples every station into caller-owned storage and returns its active prefix.
+    ///
+    /// Station order and aggregation semantics match [`Self::sample_all`]. Reusing
+    /// the same scratch retains subscriber, occupancy, station, and per-cell storage.
+    pub fn sample_all_into<'a>(
+        &self,
+        stations: &StationSet,
+        indexes: &StationIndexSet,
+        router: &EventRouter,
+        subscriber_counts: &[(StationId, usize)],
+        scratch: &'a mut StationLoadSamplerScratch,
+    ) -> &'a [StationLoadSample] {
+        scratch.subscribers_by_station.clear();
+        for (station_id, count) in subscriber_counts {
+            let entry = scratch
+                .subscribers_by_station
+                .entry(*station_id)
+                .or_insert(0);
+            *entry = entry.saturating_add(*count);
+        }
+
+        let station_count = stations.len();
+        if scratch.samples.len() < station_count {
+            scratch
+                .samples
+                .resize_with(station_count, StationLoadSample::default);
+        }
+        for (station, sample) in stations
+            .iter()
+            .zip(scratch.samples[..station_count].iter_mut())
+        {
+            let station_id = station.config().station_id;
+            self.sample_station_into(
+                station,
+                indexes.get(station_id),
+                router.queued_len(station_id).unwrap_or(0),
+                scratch
+                    .subscribers_by_station
+                    .get(&station_id)
+                    .copied()
+                    .unwrap_or(0),
+                &mut scratch.occupancy,
+                sample,
+            );
+        }
+        &scratch.samples[..station_count]
+    }
+
+    fn sample_station_into(
+        &self,
+        station: &Station,
+        index: Option<&CellIndex>,
+        queued_events: usize,
+        subscribers: usize,
+        occupancy: &mut Vec<CellOccupancy>,
+        sample: &mut StationLoadSample,
+    ) {
+        let (owned_entities, ghost_entities) = count_station_roles(station);
+        sample.cells.clear();
+        if let Some(index) = index {
+            index.cell_occupancy_into(occupancy);
+            for occupancy in occupancy.iter() {
+                let mut cell_owned_entities = 0usize;
+                let mut cell_ghost_entities = 0usize;
                 for handle in index.handles_in_cell_slice(occupancy.cell) {
                     if let Some(record) = station.get(*handle) {
                         if record.is_owned() {
-                            owned_entities = owned_entities.saturating_add(1);
+                            cell_owned_entities = cell_owned_entities.saturating_add(1);
                         } else {
-                            ghost_entities = ghost_entities.saturating_add(1);
+                            cell_ghost_entities = cell_ghost_entities.saturating_add(1);
                         }
                     }
                 }
-                let entities = owned_entities.saturating_add(ghost_entities);
-                CellLoadSample {
+                let entities = cell_owned_entities.saturating_add(cell_ghost_entities);
+                sample.cells.push(CellLoadSample {
                     cell: occupancy.cell,
-                    owned_entities,
-                    ghost_entities,
+                    owned_entities: cell_owned_entities,
+                    ghost_entities: cell_ghost_entities,
                     subscribers: 0,
                     estimated_updates: entities,
                     estimated_bytes: entities
                         .saturating_mul(self.config.estimated_bytes_per_entity),
-                    tick_cost_units: self.estimate_tick_cost(owned_entities, ghost_entities, 1, 0),
+                    tick_cost_units: self.estimate_tick_cost(
+                        cell_owned_entities,
+                        cell_ghost_entities,
+                        1,
+                        0,
+                    ),
                     event_pressure: 0,
-                }
-            })
-            .collect()
+                });
+            }
+        } else {
+            occupancy.clear();
+        }
+        sample.station_id = station.config().station_id;
+        sample.owned_entities = owned_entities;
+        sample.ghost_entities = ghost_entities;
+        sample.subscribers = subscribers;
+        sample.queued_events = queued_events;
+        sample.estimated_bytes =
+            self.estimate_station_bytes(owned_entities, ghost_entities, subscribers, queued_events);
+        sample.tick_cost_units = self.estimate_tick_cost(
+            owned_entities,
+            ghost_entities,
+            sample.cells.len(),
+            queued_events,
+        );
     }
 
     fn estimate_station_bytes(
@@ -6056,6 +6158,55 @@ mod tests {
                 },
             ]
         );
+
+        assert_load_sampler_scratch_reuse(
+            &load_sampler,
+            &stations,
+            &indexes,
+            &router,
+            station_id,
+            &samples,
+        );
+    }
+
+    fn assert_load_sampler_scratch_reuse(
+        load_sampler: &StationLoadSampler,
+        stations: &StationSet,
+        indexes: &StationIndexSet,
+        router: &EventRouter,
+        station_id: StationId,
+        samples: &[StationLoadSample],
+    ) {
+        let mut scratch = StationLoadSamplerScratch::new();
+        let (sample_ptr, cell_ptr) = {
+            let reused = load_sampler.sample_all_into(
+                stations,
+                indexes,
+                router,
+                &[(station_id, 2), (station_id, 3)],
+                &mut scratch,
+            );
+            assert_eq!(reused, samples);
+            (reused.as_ptr(), reused[0].cells.as_ptr())
+        };
+        let subscriber_capacity = scratch.retained_subscriber_capacity();
+        let occupancy_capacity = scratch.retained_occupancy_capacity();
+        let cell_capacity = scratch.retained_cell_capacity();
+
+        let reused = load_sampler.sample_all_into(
+            stations,
+            indexes,
+            router,
+            &[(station_id, 2), (station_id, 3)],
+            &mut scratch,
+        );
+        assert_eq!(reused, samples);
+        assert_eq!(reused.as_ptr(), sample_ptr);
+        assert_eq!(reused[0].cells.as_ptr(), cell_ptr);
+        assert_eq!(scratch.retained_sample_slots(), 1);
+        assert_eq!(scratch.retained_subscriber_capacity(), subscriber_capacity);
+        assert_eq!(scratch.retained_occupancy_capacity(), occupancy_capacity);
+        assert_eq!(scratch.retained_cell_capacity(), cell_capacity);
     }
 
     #[test]

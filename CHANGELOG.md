@@ -10,6 +10,10 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Periodic load sampling now offers caller-owned subscriber aggregation,
+  occupancy, Station sample, and per-cell output storage; the spatial index also
+  supports reusable deterministic occupancy output while owned APIs remain
+  compatible.
 - Deployment stale-node marking now mutates node state and route epochs in one
   allocation-free ordered-map scan; the ordered stale-id query remains available
   for external control planes that need it.

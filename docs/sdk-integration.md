@@ -187,6 +187,14 @@ runtime structures plus caller subscriber counts. Feed samples into
 `SplitScheduler` or `StationScheduler`. Keep target capacity, cooldown, action,
 and moved-cell limits explicit.
 
+For periodic sampling, retain `StationLoadSamplerScratch` and call
+`sample_all_into`. It reuses subscriber aggregation, deterministic occupancy,
+Station output slots, and each Station's cell output. Consume the borrowed
+sample slice before the next call with that scratch. Use `sample_all` when an
+owned result must outlive the sampling pass. Subscriber counts remain explicit
+caller input and duplicate Station ids are still combined with saturating
+arithmetic.
+
 For repeated load-aware scheduling, retain `StationScheduleScratch` and call
 `plan_loaded_into` or `advance_loaded_into`. The scratch keeps only derived
 Station scores and stateless candidates; the borrowed `StationScheduleView`
@@ -257,7 +265,7 @@ collect OS metrics, or choose production alerting policy.
 | AOI-to-frame replication transport | `replication_bridge`, `replication_bridge_priority` |
 | Pause/freeze/resume client notification | `barrier_transport` |
 | Frozen snapshot upgrade hook and restore | `barrier_upgrade` |
-| Load sampling into bounded station scheduling | `load_sampling` |
+| Load sampling into bounded station scheduling | `load_sampling`, `load_sampling_reuse` |
 | Split planning and cell migration | `split_migration`, `split_tuning` |
 | Cross-station event transport | `station_event_transport`, `reliable_station_event` |
 
