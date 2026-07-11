@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- `StationSet` and `StationIndexSet` now preserve ordered iteration while using
+  an adaptive Station-id index for larger registries; explicit capacity APIs
+  reserve ordered slots and lookup storage for multi-room runtimes.
 - Reliable Client and Station senders now maintain per-peer in-flight counts,
   replacing full packet-map scans during window admission and count queries;
   ACK, timeout, and saturated-sequence replacement keep counts synchronized.

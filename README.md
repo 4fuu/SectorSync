@@ -49,6 +49,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   deterministic station scheduling.
 - Periodic load sampling supports caller-owned subscriber, occupancy, Station,
   and per-cell scratch storage across scheduling windows.
+- Ordered Station and spatial-index registries use allocation-free linear lookup
+  for small sets and an adaptive ID index for larger multi-room collections.
 - Load-aware Station scheduling supports caller-owned score/candidate scratch
   and deterministic top-k selection when the advancement budget is small.
 - Hotspot split planning supports reusable cell/proposal storage and selects a
@@ -170,6 +172,8 @@ cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example load_sampling
 cargo run -p sectorsync-bench --release --example load_sampling_reuse
 cargo run -p sectorsync-bench --release --example load_sampling_reuse -- --fresh-output
+cargo run -p sectorsync-bench --release --example station_registry_lookup
+cargo run -p sectorsync-bench --release --example station_registry_lookup -- --full-scan
 cargo run -p sectorsync-bench --example load_scheduler
 cargo run -p sectorsync-bench --release --example station_schedule_reuse
 cargo run -p sectorsync-bench --release --example station_schedule_reuse -- --fresh-output

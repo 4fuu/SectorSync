@@ -197,8 +197,8 @@ struct Workload {
 }
 
 fn create_workload(config: Config) -> Workload {
-    let mut stations = StationSet::default();
-    let mut indexes = StationIndexSet::default();
+    let mut stations = StationSet::with_capacity(config.rooms);
+    let mut indexes = StationIndexSet::with_capacity(config.rooms);
     let mut router = EventRouter::default();
     let mut subscriber_counts = Vec::with_capacity(config.rooms.saturating_mul(2));
     let grid = GridSpec::new(10.0).expect("grid should build");

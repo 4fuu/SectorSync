@@ -10,8 +10,8 @@ use sectorsync_runtime::{
 };
 
 fn main() {
-    let mut stations = StationSet::default();
-    let mut indexes = StationIndexSet::default();
+    let mut stations = StationSet::with_capacity(3);
+    let mut indexes = StationIndexSet::with_capacity(3);
     for (station_id, owned_entities, ghost_entities) in [(1, 1, 0), (2, 5, 1), (3, 2, 0)] {
         let (station, index) = populated_station(station_id, owned_entities, ghost_entities);
         stations.push(station);

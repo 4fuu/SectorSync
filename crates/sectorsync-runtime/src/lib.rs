@@ -2073,30 +2073,61 @@ impl GatewayClientTransportBridge {
     }
 }
 
-/// Small in-process station collection for simulations and embedders.
+// Linear scans win for small registries; larger sets amortize an ID index.
+const STATION_LOOKUP_INDEX_THRESHOLD: usize = 64;
+
+/// Small ordered in-process Station collection for simulations and embedders.
 #[derive(Clone, Debug, Default)]
 pub struct StationSet {
     stations: Vec<Station>,
+    positions: HashMap<StationId, usize>,
 }
 
 impl StationSet {
+    /// Creates an empty collection with capacity for `capacity` Stations.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            stations: Vec::with_capacity(capacity),
+            positions: if capacity >= STATION_LOOKUP_INDEX_THRESHOLD {
+                HashMap::with_capacity(capacity)
+            } else {
+                HashMap::new()
+            },
+        }
+    }
+
+    /// Reserves capacity for at least `additional` more Stations and lookup entries.
+    pub fn reserve(&mut self, additional: usize) {
+        self.stations.reserve(additional);
+        if !self.positions.is_empty() {
+            self.positions.reserve(additional);
+        } else if self.stations.len().saturating_add(additional) >= STATION_LOOKUP_INDEX_THRESHOLD {
+            self.positions.reserve(self.stations.len() + additional);
+        }
+    }
+
     /// Adds a station to the collection.
     pub fn push(&mut self, station: Station) {
+        let station_id = station.config().station_id;
+        self.activate_lookup_for(self.stations.len().saturating_add(1));
+        if !self.positions.is_empty() {
+            self.positions
+                .entry(station_id)
+                .or_insert(self.stations.len());
+        }
         self.stations.push(station);
     }
 
     /// Gets a station by id.
     pub fn get(&self, station_id: StationId) -> Option<&Station> {
-        self.stations
-            .iter()
-            .find(|station| station.config().station_id == station_id)
+        self.position(station_id)
+            .and_then(|index| self.stations.get(index))
     }
 
     /// Gets a mutable station by id.
     pub fn get_mut(&mut self, station_id: StationId) -> Option<&mut Station> {
-        self.stations
-            .iter_mut()
-            .find(|station| station.config().station_id == station_id)
+        let index = self.position(station_id)?;
+        self.stations.get_mut(index)
     }
 
     /// Gets two distinct mutable stations by id.
@@ -2109,14 +2140,8 @@ impl StationSet {
             return None;
         }
 
-        let left_index = self
-            .stations
-            .iter()
-            .position(|station| station.config().station_id == left_id)?;
-        let right_index = self
-            .stations
-            .iter()
-            .position(|station| station.config().station_id == right_id)?;
+        let left_index = self.position(left_id)?;
+        let right_index = self.position(right_id)?;
 
         if left_index < right_index {
             let (left, right) = self.stations.split_at_mut(right_index);
@@ -2154,9 +2179,46 @@ impl StationSet {
         self.stations.len()
     }
 
+    /// Station slots retained without growing the ordered collection.
+    pub fn station_capacity(&self) -> usize {
+        self.stations.capacity()
+    }
+
+    /// Lookup entries retained without rehashing the Station index.
+    pub fn lookup_capacity(&self) -> usize {
+        self.positions.capacity()
+    }
+
+    /// Returns whether Station lookup currently uses the indexed path.
+    pub fn lookup_index_active(&self) -> bool {
+        !self.positions.is_empty()
+    }
+
     /// Returns whether no stations are registered.
     pub fn is_empty(&self) -> bool {
         self.stations.is_empty()
+    }
+
+    fn position(&self, station_id: StationId) -> Option<usize> {
+        if self.positions.is_empty() {
+            self.stations
+                .iter()
+                .position(|station| station.config().station_id == station_id)
+        } else {
+            self.positions.get(&station_id).copied()
+        }
+    }
+
+    fn activate_lookup_for(&mut self, new_len: usize) {
+        if new_len < STATION_LOOKUP_INDEX_THRESHOLD || !self.positions.is_empty() {
+            return;
+        }
+        self.positions.reserve(new_len);
+        for (index, station) in self.stations.iter().enumerate() {
+            self.positions
+                .entry(station.config().station_id)
+                .or_insert(index);
+        }
     }
 }
 
@@ -2164,32 +2226,56 @@ impl StationSet {
 #[derive(Clone, Debug, Default)]
 pub struct StationIndexSet {
     indexes: Vec<(StationId, CellIndex)>,
+    positions: HashMap<StationId, usize>,
 }
 
 impl StationIndexSet {
+    /// Creates an empty collection with capacity for `capacity` Station indexes.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            indexes: Vec::with_capacity(capacity),
+            positions: if capacity >= STATION_LOOKUP_INDEX_THRESHOLD {
+                HashMap::with_capacity(capacity)
+            } else {
+                HashMap::new()
+            },
+        }
+    }
+
+    /// Reserves capacity for at least `additional` more indexes and lookup entries.
+    pub fn reserve(&mut self, additional: usize) {
+        self.indexes.reserve(additional);
+        if !self.positions.is_empty() {
+            self.positions.reserve(additional);
+        } else if self.indexes.len().saturating_add(additional) >= STATION_LOOKUP_INDEX_THRESHOLD {
+            self.positions.reserve(self.indexes.len() + additional);
+        }
+    }
+
     /// Adds or replaces one station index.
     pub fn insert(&mut self, station_id: StationId, index: CellIndex) {
-        if let Some((_, existing)) = self.indexes.iter_mut().find(|(id, _)| *id == station_id) {
-            *existing = index;
+        if let Some(position) = self.position(station_id) {
+            self.indexes[position].1 = index;
         } else {
+            self.activate_lookup_for(self.indexes.len().saturating_add(1));
+            if !self.positions.is_empty() {
+                self.positions.insert(station_id, self.indexes.len());
+            }
             self.indexes.push((station_id, index));
         }
     }
 
     /// Gets one station index.
     pub fn get(&self, station_id: StationId) -> Option<&CellIndex> {
-        self.indexes
-            .iter()
-            .find(|(id, _)| *id == station_id)
+        self.position(station_id)
+            .and_then(|position| self.indexes.get(position))
             .map(|(_, index)| index)
     }
 
     /// Gets one mutable station index.
     pub fn get_mut(&mut self, station_id: StationId) -> Option<&mut CellIndex> {
-        self.indexes
-            .iter_mut()
-            .find(|(id, _)| *id == station_id)
-            .map(|(_, index)| index)
+        let position = self.position(station_id)?;
+        self.indexes.get_mut(position).map(|(_, index)| index)
     }
 
     /// Gets two distinct mutable station indexes.
@@ -2202,8 +2288,8 @@ impl StationIndexSet {
             return None;
         }
 
-        let left_index = self.indexes.iter().position(|(id, _)| *id == left_id)?;
-        let right_index = self.indexes.iter().position(|(id, _)| *id == right_id)?;
+        let left_index = self.position(left_id)?;
+        let right_index = self.position(right_id)?;
 
         if left_index < right_index {
             let (left, right) = self.indexes.split_at_mut(right_index);
@@ -2219,6 +2305,21 @@ impl StationIndexSet {
         self.indexes.len()
     }
 
+    /// Index slots retained without growing the ordered collection.
+    pub fn index_capacity(&self) -> usize {
+        self.indexes.capacity()
+    }
+
+    /// Lookup entries retained without rehashing the Station index.
+    pub fn lookup_capacity(&self) -> usize {
+        self.positions.capacity()
+    }
+
+    /// Returns whether Station-index lookup currently uses the indexed path.
+    pub fn lookup_index_active(&self) -> bool {
+        !self.positions.is_empty()
+    }
+
     /// Iterates over registered indexes.
     pub fn iter(&self) -> impl Iterator<Item = (StationId, &CellIndex)> {
         self.indexes
@@ -2229,6 +2330,24 @@ impl StationIndexSet {
     /// Returns whether no indexes are registered.
     pub fn is_empty(&self) -> bool {
         self.indexes.is_empty()
+    }
+
+    fn position(&self, station_id: StationId) -> Option<usize> {
+        if self.positions.is_empty() {
+            self.indexes.iter().position(|(id, _)| *id == station_id)
+        } else {
+            self.positions.get(&station_id).copied()
+        }
+    }
+
+    fn activate_lookup_for(&mut self, new_len: usize) {
+        if new_len < STATION_LOOKUP_INDEX_THRESHOLD || !self.positions.is_empty() {
+            return;
+        }
+        self.positions.reserve(new_len);
+        for (index, (station_id, _)) in self.indexes.iter().enumerate() {
+            self.positions.entry(*station_id).or_insert(index);
+        }
     }
 }
 
@@ -4692,6 +4811,133 @@ mod tests {
             reconnect_grace_ticks: 10,
             max_commands_per_tick,
         })
+    }
+
+    #[test]
+    fn station_set_indexes_first_slot_and_reserves_both_storage_classes() {
+        let mut stations = StationSet::with_capacity(3);
+        let mut duplicate = station(1, 99);
+        duplicate.advance_tick();
+        stations.push(station(1, 10));
+        stations.push(duplicate);
+        stations.push(station(2, 10));
+
+        assert!(stations.station_capacity() >= 3);
+        assert!(!stations.lookup_index_active());
+        assert_eq!(
+            stations
+                .get(StationId::new(1))
+                .expect("first exists")
+                .tick(),
+            Tick::new(0)
+        );
+        let (first, second) = stations
+            .get_pair_mut(StationId::new(1), StationId::new(2))
+            .expect("distinct indexed Stations should borrow");
+        first.advance_tick();
+        second.advance_tick();
+        assert_eq!(
+            stations
+                .get(StationId::new(1))
+                .expect("first exists")
+                .tick(),
+            Tick::new(1)
+        );
+        assert_eq!(
+            stations
+                .get(StationId::new(2))
+                .expect("second exists")
+                .tick(),
+            Tick::new(1)
+        );
+
+        let lookup_capacity = stations.lookup_capacity();
+        stations.reserve(4);
+        assert!(stations.station_capacity() >= stations.len().saturating_add(4));
+        assert!(stations.lookup_capacity() >= lookup_capacity);
+    }
+
+    #[test]
+    fn station_index_set_replaces_in_place_and_indexes_mutable_pairs() {
+        let grid = GridSpec::new(10.0).expect("grid should build");
+        let first_id = StationId::new(1);
+        let second_id = StationId::new(2);
+        let first_handle = EntityHandle::new(1, 0);
+        let second_handle = EntityHandle::new(2, 0);
+        let mut indexes = StationIndexSet::with_capacity(2);
+        indexes.insert(first_id, CellIndex::new(grid));
+        indexes.insert(second_id, CellIndex::new(grid));
+
+        let mut replacement = CellIndex::new(grid);
+        replacement.upsert(first_handle, Position3::new(1.0, 0.0, 0.0), Bounds::Point);
+        indexes.insert(first_id, replacement);
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(
+            indexes.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        assert_eq!(
+            indexes
+                .get(first_id)
+                .expect("first index exists")
+                .entity_count(),
+            1
+        );
+
+        let (first, second) = indexes
+            .get_pair_mut(first_id, second_id)
+            .expect("distinct indexed cells should borrow");
+        first.remove(first_handle);
+        second.upsert(second_handle, Position3::new(11.0, 0.0, 0.0), Bounds::Point);
+        assert_eq!(
+            indexes
+                .get(first_id)
+                .expect("first index exists")
+                .entity_count(),
+            0
+        );
+        assert_eq!(
+            indexes
+                .get(second_id)
+                .expect("second index exists")
+                .entity_count(),
+            1
+        );
+        assert!(indexes.index_capacity() >= 2);
+        assert!(!indexes.lookup_index_active());
+    }
+
+    #[test]
+    fn station_registries_activate_lookup_index_at_adaptive_threshold() {
+        let grid = GridSpec::new(10.0).expect("grid should build");
+        let mut stations = StationSet::with_capacity(STATION_LOOKUP_INDEX_THRESHOLD);
+        let mut indexes = StationIndexSet::with_capacity(STATION_LOOKUP_INDEX_THRESHOLD);
+        for raw_id in 1..=STATION_LOOKUP_INDEX_THRESHOLD {
+            let station_id = StationId::new(u32::try_from(raw_id).expect("threshold fits u32"));
+            stations.push(station(station_id.get(), 10));
+            indexes.insert(station_id, CellIndex::new(grid));
+            if raw_id < STATION_LOOKUP_INDEX_THRESHOLD {
+                assert!(!stations.lookup_index_active());
+                assert!(!indexes.lookup_index_active());
+            }
+        }
+
+        assert!(stations.lookup_index_active());
+        assert!(indexes.lookup_index_active());
+        assert!(stations.lookup_capacity() >= STATION_LOOKUP_INDEX_THRESHOLD);
+        assert!(indexes.lookup_capacity() >= STATION_LOOKUP_INDEX_THRESHOLD);
+        let last = StationId::new(
+            u32::try_from(STATION_LOOKUP_INDEX_THRESHOLD).expect("threshold fits u32"),
+        );
+        assert_eq!(
+            stations
+                .get(last)
+                .expect("last Station exists")
+                .config()
+                .station_id,
+            last
+        );
+        assert!(indexes.get(last).is_some());
     }
 
     #[test]

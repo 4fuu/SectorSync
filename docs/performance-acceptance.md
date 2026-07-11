@@ -694,6 +694,38 @@ reduction on this development host. Client and Station tests cover independent
 peer counts, ACK decrement, zero-count cleanup, timeout cleanup, send failure,
 window limits, and saturated-sequence replacement.
 
+## Station Registry Lookup Measurement
+
+`StationSet` and `StationIndexSet` retain deterministic Vec iteration while
+switching ID lookup adaptively. Below 64 slots they scan the small Vec without
+allocating a lookup table; at 64 slots they build a `HashMap<StationId, usize>`
+and use it for immutable, mutable, and paired lookup. `with_capacity` and
+`reserve` preallocate ordered storage and, for larger requested sizes, lookup
+capacity. Duplicate `StationSet` ids retain first-match behavior, while
+`StationIndexSet::insert` still replaces in place without changing order.
+
+Compare the indexed registry against the previous two Vec scans with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example station_registry_lookup
+cargo run --release -q -p sectorsync-bench --example station_registry_lookup -- --full-scan
+```
+
+The default workload registers 4,096 Stations and indexes, then performs 10,000
+paired lookups. Guards cap 8,000 Stations, 2,000 queries per tick, and ten ticks
+without `--allow-heavy`; execution has a 10-second budget. Output includes
+lookup checksum, full-scan count, both lookup capacities and active-path flags,
+latency percentiles, guard metadata, path/workload verdicts, and `benchmark_ok`.
+
+Five alternating release A/B runs produced the same `39,687,200` checksum.
+Indexed lookup performed zero full scans; the comparison performed 20,000.
+Median tick p99 was 0.054 ms indexed versus 1.673 ms scanning, about a 97%
+reduction on this development host. A separate four-Station check kept both
+indexes inactive and reported 0.029 ms p99 versus 0.027 ms for the isolated
+scan comparison, avoiding the earlier small-set hash overhead. Runtime tests
+cover threshold activation, first-duplicate semantics, replacement order,
+paired mutable lookup, and both capacity classes.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

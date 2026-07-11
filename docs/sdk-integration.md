@@ -207,6 +207,13 @@ owned result must outlive the sampling pass. Subscriber counts remain explicit
 caller input and duplicate Station ids are still combined with saturating
 arithmetic.
 
+When one process hosts many Stations, construct `StationSet` and
+`StationIndexSet` with `with_capacity`, or call `reserve` before registration.
+Both registries retain insertion-order iteration. Sets below 64 slots use the
+small linear path without a lookup-table allocation; at 64 slots they build an
+ID-to-slot index and use it for `get`, `get_mut`, and `get_pair_mut`. Capacity
+and active-path accessors make the selected storage visible to integrations.
+
 For repeated load-aware scheduling, retain `StationScheduleScratch` and call
 `plan_loaded_into` or `advance_loaded_into`. The scratch keeps only derived
 Station scores and stateless candidates; the borrowed `StationScheduleView`
