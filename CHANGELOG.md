@@ -12,6 +12,12 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 - Added an explicit revision field so multiple releases can be published on
   the same Asia/Hong_Kong calendar day.
+- Replication transport bridges now retain planning scratch and encode dirty
+  components directly into binary packets without materializing intermediate
+  entity/component delta trees.
+- The guarded many-room benchmark now separates planning and encoding latency
+  and can vary per-room entities, dirty ratio, and component payload size
+  independently from player count.
 
 ## [2026.7.10] - 2026-07-10
 

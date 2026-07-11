@@ -93,8 +93,11 @@ Ghost records are read-only and must never finalize business state.
 
 Build viewer input from caller-owned client state, then use
 `ReplicationTransportBridge` with explicit policy, component selection,
-visibility, and budget input. High-frequency integrations should reuse
-`ReplicationScratch`; cadence and priority state must remain explicit.
+visibility, and budget input. The caller-owned bridge lazily retains its planning
+scratch and directly encodes selected dirty components into the outbound packet,
+avoiding intermediate entity/component delta allocations. Integrations that call
+`ReplicationPlanner` directly should retain their own `ReplicationScratch`;
+cadence and priority state must remain explicit.
 
 On the receive side, `ReplicationReceiveBridge` validates expected packet
 source and frame target before returning decoded frames. Applying those frames

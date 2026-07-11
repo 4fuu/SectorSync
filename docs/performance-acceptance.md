@@ -195,7 +195,8 @@ The guarded room benchmark models one `InstanceId` per room and assigns
 `ceil(players / players_per_station)` Stations, capped by
 `max_stations_per_room`. All room/Station work runs sequentially on the calling
 thread; every viewer performs a real Cell query and replication plan, and every
-selected entity becomes a concrete binary delta:
+dirty component selected for a viewer is encoded directly into a concrete binary
+delta. The runner reports planning and encoding p99 separately:
 
 ```powershell
 $env:CARGO_BUILD_JOBS=4
@@ -203,23 +204,33 @@ cargo run --release -q -p sectorsync-bench --example many_rooms
 ```
 
 The default cap is 500 rooms, 4-32 players per room, eight Stations per room,
-16 entities per player, and ten sweeps. The default workload uses the smaller
+16 entities per player, 256 explicit entities per room, 256 bytes per component,
+and ten sweeps. The default workload uses the smaller
 4-24 player, one Station per 12 players, eight entities per player, and eight
 sweep shape. Oversized manual values are clamped unless `--allow-heavy` is
 present, and the runner stops before another sweep after its 10-second budget.
 
 On the current development host, the default 500-room workload resolves to 784
 Stations, 6,966 players, and 55,728 entities. Repeated release runs reported
-37.18-46.83 ms sweep p99 while fully encoding 2,002,536 selected entities per
-run, which supports the configured 50 ms/20 Hz gate but not a stable 30 Hz
-claim. A guarded 300-room workload resolved to 468 Stations, 4,155 players, and
-33,240 entities, with three consecutive sweep p99 results of 21.68-21.79 ms,
-passing an explicit 33.333 ms/30 Hz gate:
+26.14-28.46 ms sweep p99 while directly encoding the same 2,002,536 selected
+entities and 75,709,944 bytes per run. Planning accounted for 12.13-14.02 ms p99
+and encoding for 13.83-15.07 ms p99. This is guarded regression evidence with
+30 Hz headroom on this host, not a complete room-server capacity claim.
+
+Entity pressure can be decoupled from player count, and dirty/component pressure
+can be varied independently:
 
 ```powershell
 cargo run --release -q -p sectorsync-bench --example many_rooms -- `
-  --rooms=300 --sweep-p99-budget-ms=33.333
+  --min-players=4 --max-players=10 --entities-per-room=128 `
+  --dirty-percent=10 --component-bytes=32 --sweep-p99-budget-ms=33.333
 ```
+
+On the current host that guarded shape resolved to 500 Stations, 3,494 players,
+and 64,000 entities. It selected 1,695,816 entities but encoded only 128,368
+dirty entity/component deltas and 9,154,528 bytes. Three consecutive runs
+reported 23.58-31.25 ms sweep p99, 11.87-14.70 ms planning p99, and
+11.51-17.11 ms encoding p99.
 
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or
