@@ -907,6 +907,35 @@ host. Identical admission/queue/send results and removal of retained ACK clones
 are the portable acceptance signals; detailed-report retention remains an
 explicit compatibility option.
 
+## Component Entity Cleanup Measurement
+
+`ComponentStore::remove_entity_into` clears and reuses caller-owned removed
+value storage. The compatible `remove_entity` path returns a fresh Vec, while
+`clear_entity` discards removed values for teardown paths that only need the
+component count.
+
+Compare reusable and fresh owned output using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example component_remove_reuse
+cargo run --release -q -p sectorsync-bench --example component_remove_reuse -- --fresh-output
+cargo run --release -q -p sectorsync-bench --example component_remove_reuse -- --discard
+```
+
+The default preloaded workload removes eight 32-byte components from 1,000
+entities per tick for ten ticks. Guards cap 2,000 entities per tick, 32
+components, 4 KiB payloads, 20 ticks, and 64 MiB aggregate payload work without
+`--allow-heavy`; execution has a 10-second budget.
+
+Five alternating release A/B runs each removed 10,000 entities and 80,000
+component blobs totaling `2,560,000` bytes with identical checksums. Reusable
+output created zero fresh result Vecs and retained capacity for eight entries;
+the compatible path created 10,000 fresh results. Median tick p99 was 1.881 ms
+reusable versus 2.031 ms fresh, about a 7.4% reduction on this development
+host. A discard run reported 1.741 ms p99. Identical removal counts, bytes, and
+checksums plus zero fresh outputs are the portable acceptance signals; host
+timings are directional rather than a universal guarantee.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

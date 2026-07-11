@@ -29,6 +29,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Reusable parallel multi-Station output slots and selected-entity capacity.
 - Explicit Station, spatial-index, and component-column capacity reservation.
 - Reusable typed-component encoding scratch and in-place blob byte updates.
+- Component entity cleanup supports reusable removed-value output and a
+  discard-only path for high-frequency despawn loops.
 - Dense replication frames use bounded dirty-data sampling to reduce output
   buffer growth, while sparse frames conservatively retain normal allocation.
 - Replication receivers can iterate fully validated borrowed entity/component

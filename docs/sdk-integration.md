@@ -139,6 +139,12 @@ result back through controlled APIs such as:
   data. For repeated writes, retain a caller-owned `ComponentEncodeScratch` and
   call `set_typed_with_scratch`; use `set_blob_from_slice` when compact bytes
   are already available. Existing blob capacity is reused when sufficient.
+- On entity despawn, call `ComponentStore::clear_entity` when removed component
+  values are not needed. If the application must inspect or transfer those
+  values, retain one `Vec<(ComponentId, ComponentBlob)>` and pass it to
+  `remove_entity_into`; use the compatible `remove_entity` owned result for
+  occasional cleanup. Entity lifetime and gameplay teardown ordering remain
+  application-owned.
 - `CellIndex::upsert` after transform/bounds changes. Point updates that remain
   in the same cell avoid index mutation and allocation automatically; point
   updates that cross cells retain their entity-cell list and update the mapping

@@ -892,6 +892,17 @@ impl ComponentStore {
     /// Removes all component blobs for an entity and returns the removed values.
     pub fn remove_entity(&mut self, entity: EntityHandle) -> Vec<(ComponentId, ComponentBlob)> {
         let mut removed = Vec::new();
+        self.remove_entity_into(entity, &mut removed);
+        removed
+    }
+
+    /// Removes all component blobs into caller-owned reusable output storage.
+    pub fn remove_entity_into(
+        &mut self,
+        entity: EntityHandle,
+        removed: &mut Vec<(ComponentId, ComponentBlob)>,
+    ) -> usize {
+        removed.clear();
         for (index, column) in self.columns.iter_mut().enumerate() {
             let Some(column) = column else {
                 continue;
@@ -901,6 +912,15 @@ impl ComponentStore {
                     .expect("component columns are indexed by u16 component ids");
                 removed.push((ComponentId::new(component_id), blob));
             }
+        }
+        removed.len()
+    }
+
+    /// Removes and drops all component blobs for an entity without output storage.
+    pub fn clear_entity(&mut self, entity: EntityHandle) -> usize {
+        let mut removed = 0_usize;
+        for column in self.columns.iter_mut().filter_map(Option::as_mut) {
+            removed = removed.saturating_add(usize::from(column.values.remove(&entity).is_some()));
         }
         removed
     }
@@ -1114,6 +1134,63 @@ mod tests {
                 .bytes,
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn component_entity_removal_supports_owned_reusable_and_discard_paths() {
+        let descriptors = [
+            ComponentDescriptor::sparse_blob(
+                ComponentId::new(1),
+                "health",
+                ComponentSyncMode::Delta,
+                ComponentMigrationMode::Copy,
+                8,
+            ),
+            ComponentDescriptor::sparse_blob(
+                ComponentId::new(2),
+                "armor",
+                ComponentSyncMode::Delta,
+                ComponentMigrationMode::Copy,
+                8,
+            ),
+        ];
+        let entities = [
+            EntityHandle::new(1, 0),
+            EntityHandle::new(2, 0),
+            EntityHandle::new(3, 0),
+            EntityHandle::new(4, 0),
+        ];
+        let mut store = ComponentStore::default();
+        for entity in entities {
+            for descriptor in &descriptors {
+                store
+                    .set_blob(
+                        descriptor,
+                        entity,
+                        1,
+                        vec![u8::try_from(descriptor.id.get()).expect("small component id"); 4],
+                    )
+                    .expect("bounded blob should write");
+            }
+        }
+
+        let owned = store.remove_entity(entities[0]);
+        assert_eq!(owned.len(), 2);
+        assert_eq!(owned[0].0, ComponentId::new(1));
+        assert_eq!(owned[1].0, ComponentId::new(2));
+
+        let mut removed = Vec::with_capacity(2);
+        let retained_pointer = removed.as_ptr();
+        assert_eq!(store.remove_entity_into(entities[1], &mut removed), 2);
+        assert_eq!(removed.as_ptr(), retained_pointer);
+        let retained_capacity = removed.capacity();
+        assert_eq!(store.remove_entity_into(entities[2], &mut removed), 2);
+        assert_eq!(removed.as_ptr(), retained_pointer);
+        assert_eq!(removed.capacity(), retained_capacity);
+
+        assert_eq!(store.clear_entity(entities[3]), 2);
+        assert_eq!(store.clear_entity(entities[3]), 0);
+        assert_eq!(store.blob_count(), 0);
     }
 
     #[test]

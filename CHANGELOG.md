@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Component storage now supports caller-owned output reuse when removing every
+  component for an entity, plus a discard-only cleanup path when removed values
+  are not needed; the compatible owned removal API remains available.
 - Gateway client transport now offers a compact ingress pump that moves encoded
   ACK buffers directly into transport and returns fixed-size counts instead of
   cloning ACKs into retained per-command reports.
