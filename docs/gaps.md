@@ -1,89 +1,49 @@
-# SectorSync Delivery Gap Register
+# SectorSync Delivery Status
 
-This document tracks the remaining gaps between the current implementation and
-the intended deliverable: a high-performance embedded Rust middleware for
-large-map, multi-station, real-time entity synchronization.
+SectorSync's basic embedded SDK is complete. This page records the delivered
+boundary and prevents future work from expanding the middleware into a game
+engine or production platform.
 
-It is not a product wish list. Items here should either protect SectorSync's
-middleware boundary, prove performance/latency/resource claims, or make the SDK
-usable from external game/business systems without turning SectorSync into a
-game engine.
+## Delivered
 
-## Current Shape
+- Authority, ghosts, handoff, 3D spatial indexing, AOI, visibility, compiled
+  sync policy, replication planning, and bounded tracking.
+- Bounded command/event queues, binary frames, in-memory/UDP/reliable transport
+  primitives, gateway admission, and deployment-route metadata.
+- Runtime barriers, in-memory snapshots, load sampling, conservative hotspot
+  planning, cell migration, and deterministic station scheduling.
+- A cohesive integration flow, production-adapter contracts, guarded
+  performance acceptance, executable examples, and public API documentation.
+- CI coverage for formatting, strict Clippy, all-feature tests, rustdoc, smoke
+  benchmarks, MSRV, packaging, and ordered crate publication.
 
-Already implemented and covered by examples or tests:
+The detailed contracts live in the [SDK integration guide](sdk-integration.md),
+[production adapter boundaries](production-adapters.md), and
+[performance acceptance matrix](performance-acceptance.md).
 
-- Core station/entity ownership with exactly one authoritative owner per
-  entity and read-only ghost copies.
-- 3D spatial primitives, station-local cell indexing, AOI candidate queries,
-  range/frustum/tag visibility filters, and reusable scratch buffers.
-- Compiled sync policies, adaptive replication cadence, budget-aware priority
-  selection, replication planning, replication frame building, and bounded
-  replication send/ACK tracking.
-- Bounded command/event queues, cross-station event frames, station event
-  routing, station-to-station packet transport, and reliable station packet
-  helpers.
-- Gateway/session primitives, low-level client command ingress, command ACKs,
-  gateway command pipeline, gateway-to-deployment dispatch metadata, and
-  bounded client/gateway transport bridges.
-- A cohesive SDK integration guide and executable command-to-replication flow
-  covering external validation, bounded failure handling, barrier/migration
-  sequencing, and observability handoff.
-- Production adapter guidance maps authentication/cipher, transport, key
-  lifecycle, route discovery, persistence, and GPU hooks to external owners,
-  backed by bounded local security and deployment examples.
-- Runtime barriers for tick-boundary freeze/snapshot/resume and frozen
-  snapshot upgrade hooks.
-- Conservative split scheduling, cell migration execution, deployment route
-  metadata, runtime load sampling from station/index/router state plus explicit
-  subscriber input, and bounded load-aware station scheduling.
-- Deterministic hotspot calibration covers Normal/Warm/Hot classification,
-  conservative scheduler guards, before/after pressure, and proposed/actual
-  moved cell/entity counts while keeping heavier calibration explicitly gated.
-- A committed performance acceptance matrix backed by machine-readable p50/p95/
-  p99, command/replication/router/split/scheduler fields, smoke-safe baseline
-  comparisons, and explicit heavy-profile opt-in.
+## Explicit Non-Goals
 
-## Delivery Status
+SectorSync does not own:
 
-No SDK-blocking delivery gaps remain for the basic embedded deliverable.
-
-Completion evidence:
-
-- README provides a use-case map to the integration, replication, barrier,
-  load/migration, production-adapter, and performance workflows.
-- `docs/sdk-integration.md`, `docs/performance-acceptance.md`, and
-  `docs/production-adapters.md` define integration order, error handling,
-  verification gates, and external ownership boundaries.
-- AGENTS names lightweight verification commands for each important SDK
-  boundary and keeps heavy calibration behind explicit `--allow-heavy`.
-- `cargo doc --workspace --no-deps` completes without rustdoc warnings.
-- `cargo clippy --workspace --all-targets -- -D warnings` completes without
-  warnings across libraries, tests, examples, and the benchmark runner.
-- Published crate manifests carry MIT metadata, descriptions, documentation
-  links, categories, keywords, and versioned internal dependencies; package
-  lists include README and LICENSE.
-- Push/PR CI enforces the release quality gate and MSRV, while the manual GitHub
-  Release workflow defaults to reviewable dry-run artifacts.
-- Executable examples and integration tests cover the recommended external
-  usage flows while core modules retain low-level middleware ownership.
-
-## Explicit Non-Gaps
-
-These are intentionally outside SectorSync unless implemented as optional
-external adapters:
-
-- Game business logic, combat, inventory, quest, economy, or gameplay ECS.
-- Built-in account authentication, anti-cheat, matchmaking, or reconnect loops.
+- Game rules, gameplay ECS state, combat, inventory, quests, or economy.
+- Account authentication, anti-cheat, matchmaking, or reconnect policy.
 - Durable persistence, crash recovery, backups, or failover orchestration.
-- Process manager, service discovery, cloud API integration, or cluster
-  scheduler.
-- Built-in GPU kernels, GPU memory/resource scheduling, or mandatory
-  accelerator runtime.
-- Dynamic script/WASM/plugin hot loading inside the core runtime.
+- Process supervision, service discovery, cloud APIs, or cluster scheduling.
+- Production cryptographic algorithms, key services, or certificate storage.
+- GPU kernels, accelerator scheduling, or mandatory GPU runtimes.
+- Dynamic script, WASM, or plugin loading inside the core runtime.
+
+These concerns may integrate through explicit external adapters; they are not
+missing SDK features.
 
 ## Future Work
 
-Future changes should be driven by integration feedback, production-specific
-adapters, or explicitly guarded calibration. They must not move the explicit
-non-gaps above into SectorSync core by default.
+Accept future work when it does at least one of the following:
+
+- Improves a general-purpose hot path with reproducible, guarded evidence.
+- Tightens boundedness, determinism, error visibility, or integration safety.
+- Adds a low-level adapter contract required by multiple applications.
+- Clarifies public SDK behavior without duplicating rustdoc or release history.
+
+Reject or keep external work that introduces business semantics, hidden
+threads, unbounded state, durable infrastructure, or automatic cluster policy.

@@ -51,46 +51,23 @@ Create capacities and ownership explicitly before accepting traffic:
 5. Register station/client transport endpoints and expected packet sources.
 6. Keep durable state and service discovery outside these runtime objects.
 
-Do not rely on default limits without checking that they fit the embedding
-application's resource budget.
+Do not rely on defaults without checking the application's resource budget.
+The steady-state allocation and lookup rules are:
 
-Core `CommandQueues` and `EventQueues` also start with zero retained slots and
-grow only the priority classes that receive traffic. Drained queues retain peak
-capacity for later ticks. Use `ready_retained_capacity` and
-`total_ready_retained_capacity` for Command queues,
-`barrier_buffer_retained_capacity` for barrier ingress, and
-`retained_capacity` or `total_retained_capacity` for Station Event queues.
-Configured limits remain hard backpressure/drop boundaries rather than eager
-memory reservations.
+| Surface | Behavior | Integration rule |
+| --- | --- | --- |
+| Command/Event queues | Priority storage starts empty, grows on accepted traffic, and retains peak capacity | Treat configured limits as hard backpressure/drop bounds |
+| In-memory packet queues | Endpoint registration reserves no packet slots; drained queues retain reached capacity | Size limits from the worst acceptable backlog and payload budget |
+| Endpoint registries | Ordered below 2,048 entries, then promoted once to hash lookup | No tuning is required; promotion preserves queues and does not reverse |
+| Client send | Validation and enqueue share one mutable target lookup | Error ordering and post-enqueue statistics remain stable |
+| In-memory batch send | Locks bounded 64-packet segments and stops at the first failure | The successful prefix remains queued and ordered |
+| Budgeted batch send | Checks aggregate and per-packet byte limits in one scan | Rejected batches are never forwarded |
 
-In-memory Client and Station transport registration starts with zero retained
-packet slots and grows each bounded queue only as traffic arrives. Drained
-queues retain their peak capacity for later bursts. Use `queued_capacity` for a
-specific endpoint and `retained_queue_capacity` for aggregate host metrics;
-the configured queue maximum remains a backpressure boundary, not an eager
-per-endpoint allocation. Applications should still choose limits from their
-worst acceptable backlog and payload budget.
-
-Endpoint lookup also adapts without configuration. Registries below 2,048
-entries retain ordered maps, which have lower constant cost for ordinary small
-rooms. Adding the 2,048th distinct Client or Station promotes that registry
-once to hash lookup for aggregated single-process deployments. Replacement of
-an existing endpoint does not trigger promotion, and queue contents survive the
-transition unchanged. Promoted registries stay hashed after removals to avoid
-allocation and migration churn around the threshold.
-Client packet sends use one mutable target lookup for both queue-limit
-validation and enqueueing. Missing-target, queue-full, and packet-size errors
-retain their existing ordering, and successful packet/byte counters advance
-only after the packet enters the target queue.
-`InMemoryTransportEndpoint::send_batch` acquires shared Hub state once per
-bounded 64-packet segment rather than once per packet. Large batches yield the
-lock between segments so receive and other senders can progress. Packets remain
-ordered; the first failure returns immediately, retains the successfully queued
-prefix and its statistics, and does not process the remaining suffix.
-`BudgetedTransport::send_batch` validates aggregate and per-packet byte limits
-in one metadata scan. It still reports an aggregate batch violation before any
-single-packet violation and forwards only fully valid batches to the wrapped
-transport, so callers do not need different error handling.
+Capacity inspection APIs remain available for host metrics: Command queue
+`ready_retained_capacity`, `total_ready_retained_capacity`, and
+`barrier_buffer_retained_capacity`; Event queue `retained_capacity` and
+`total_retained_capacity`; transport `queued_capacity` and
+`retained_queue_capacity`.
 
 ## Per-Tick Order
 

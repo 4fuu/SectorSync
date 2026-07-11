@@ -4,6 +4,23 @@ This document maps SectorSync performance claims to reproducible commands,
 machine-readable output fields, and default pass/fail gates. It is a development
 acceptance matrix, not a production capacity promise for arbitrary hardware.
 
+## How to Use This Document
+
+| Need | Section |
+| --- | --- |
+| Routine regression gate | [Default acceptance run](#default-acceptance-run) |
+| Verdict and output contracts | [Pass/fail gates](#passfail-gates) and [recorded evidence](#recorded-evidence) |
+| Planner comparison | [Baseline comparison](#baseline-comparison) |
+| Host-sized or many-room evidence | [Scenario measurements](#scenario-measurements) |
+| Focused A/B evidence | [Hot-path measurements](#hot-path-measurements) |
+| Deliberate large runs | [Heavy calibration](#heavy-calibration) |
+
+All benchmark examples are deterministic and guarded. Unless a section says
+otherwise, local timings compare alternating release-mode runs on the same
+development host. Portable acceptance comes from identical result checksums,
+bounded work/capacity counters, path verdicts, and `benchmark_ok=true`; timing
+percentages are directional regression evidence, not cross-machine guarantees.
+
 ## Default Acceptance Run
 
 Use the guarded smoke profile for routine development:
@@ -112,7 +129,12 @@ estimate while `encoded_bytes` measures the bounded wire-codec workload actually
 executed. The guarded local profile below raises the limit to the planner's 300
 entity viewer budget and fails unless every selected update is materialized.
 
-## Guarded Local Host Measurement
+## Scenario Measurements
+
+These runs exercise multiple subsystems together. Use them for local capacity
+signals after the routine smoke gate passes.
+
+### Guarded Local Host Measurement
 
 The `local` profile is a deliberate, release-mode measurement sized from the
 host's available parallelism. It remains behind `--allow-heavy` and is never run
@@ -151,7 +173,7 @@ measure WAN behavior, kernel UDP throughput, cross-machine deployment, durable
 storage, or production gameplay code. Record the full output and run it at least
 three times before treating changes as a local regression.
 
-## Optional SIMD, Parallel, and 128 Hz Modes
+### Optional SIMD, Parallel, and 128 Hz Modes
 
 Feature behavior is explicit:
 
@@ -189,7 +211,7 @@ p99 and 5.28-5.81 ms of 128 Hz headroom while fully encoding 443,402 selected
 deltas per 30-tick run. This remains local deterministic evidence, not a hard
 real-time or production-network guarantee.
 
-## Many-Room Single-Thread Measurement
+### Many-Room Single-Thread Measurement
 
 The guarded room benchmark models one `InstanceId` per room and assigns
 `ceil(players / players_per_station)` Stations, capped by
@@ -314,7 +336,13 @@ idle-room scheduling, command/event pumps, kernel networking, persistence, or
 matchmaking. Treat it as evidence for active-room spatial planning and encoding,
 not a complete room-server capacity promise.
 
-## Multi-Cell Bounds Update Measurement
+## Hot-Path Measurements
+
+These focused A/B runs isolate one algorithm, lookup, ownership, or allocation
+choice. Their percentages must not be added together or treated as whole-SDK
+speedups.
+
+### Multi-Cell Bounds Update Measurement
 
 The guarded `multi_cell_bounds` benchmark covers repeated sphere updates whose
 27-cell membership remains unchanged. The default path compares retained cells
@@ -338,7 +366,7 @@ membership. Three alternating release runs reported median update p99 of
 temporary cell coordinates. This isolates the removed list-construction work;
 real boundary crossings still rebuild persistent membership as required.
 
-## Single-Viewer Plan Output Measurement
+### Single-Viewer Plan Output Measurement
 
 `ReplicationTransportBridge` retains one `ReplicationPlan` output across
 normal, cadence, priority, and priority/cadence sends. The guarded
@@ -365,7 +393,7 @@ candidates and 4,000 calls, median p99 was effectively neutral (3.974 ms versus
 3.994 ms) because query/filter work dominated, while output allocations were
 still eliminated.
 
-## Budgeted Priority Top-K Measurement
+### Budgeted Priority Top-K Measurement
 
 Priority planning uses the same total comparator as before: score descending,
 distance ascending, then handle ascending. When the selected budget is less
@@ -388,7 +416,7 @@ compare top-k output against full sorting across zero, small, boundary, equal,
 and oversized limits. A `limit=1800` check reports `partition_applied=false`,
 confirming the high-budget fallback.
 
-## Parallel Multi-Station Output Measurement
+### Parallel Multi-Station Output Measurement
 
 `ParallelReplicationScratch` can retain both one planning lane per bounded
 worker and one `ReplicationBatchScratch` output slot per observed Station batch.
@@ -417,7 +445,7 @@ Runtime tests also compare every active Station plan and aggregate statistic,
 verify capacity retention after a smaller subsequent batch, and cover empty
 input.
 
-## Event Drain Output Measurement
+### Event Drain Output Measurement
 
 `EventQueues::drain_ready_into` visits each priority queue only for its initial
 length, moves ready events to caller-owned output, and rotates delayed events to
@@ -450,7 +478,7 @@ the removed intermediate allocation paths, exact event-count equivalence, core
 priority/FIFO tests, and retained-capacity test rather than a host-specific
 latency delta.
 
-## Station Schedule Scratch Measurement
+### Station Schedule Scratch Measurement
 
 `StationScheduleScratch` retains the Station-to-score hash table and candidate
 array across load-aware scheduling calls. `plan_loaded_into` and
@@ -481,7 +509,7 @@ zero, small, half, full, and oversized budget edges. A `limit=400` run reports
 `top_k_partition_applied=false` and the same `5,255,150` checksum for both output
 modes, confirming the high-budget fallback.
 
-## Hotspot Split Scratch Measurement
+### Hotspot Split Scratch Measurement
 
 `HotspotSplitScratch` retains copied `CellLoadSample` candidates across hotspot
 passes, while `propose_cell_split_into` also retains the proposal's coordinate
@@ -510,7 +538,7 @@ with full sorting across zero, small, half, full, and oversized budgets. A
 `limit=1500` run reports `top_k_partition_applied=false` and the same
 `2,601,231,850` checksum in both modes, confirming high-budget fallback.
 
-## Split Schedule Nested Output Measurement
+### Split Schedule Nested Output Measurement
 
 `SplitSchedulerScratch` retains fixed decision and action slots while exposing
 only active prefixes through `SplitScheduleView`. Each decision retains its
@@ -542,7 +570,7 @@ so no latency improvement is claimed. Acceptance is based on exact full-field
 equivalence, removed nested allocation paths, retained-capacity tests, and the
 executable borrowed `split_migration` flow.
 
-## Gateway Expiry Scan Measurement
+### Gateway Expiry Scan Measurement
 
 `GatewaySessionTable::expire_disconnected` uses one in-place map `retain` pass.
 Connected sessions and disconnected sessions at or inside the grace boundary
@@ -570,7 +598,7 @@ collect/remove, about a 67% reduction on this development host. Core tests cover
 connected sessions, the exact grace boundary, stale removal, repeated expiry,
 and cumulative statistics; the benchmark test compares final maps exactly.
 
-## Gateway Session Lookup Measurement
+### Gateway Session Lookup Measurement
 
 `GatewaySessionTable` starts with ordered session storage and promotes once to
 hash storage when adding the 1,024th distinct Client. The one-way transition
@@ -604,7 +632,7 @@ from 2.183 ms to 1.351 ms. Both modes execute one million identical operations
 and 125,000 admission-style updates with equal checksums; `map_probes` falls
 from exactly two million to one million.
 
-## Deployment Stale-Node Scan Measurement
+### Deployment Stale-Node Scan Measurement
 
 `DeploymentRouteTable::mark_stale_offline` now scans mutable node records once,
 marks only newly stale non-offline nodes, advances route epochs, and accumulates
@@ -632,7 +660,7 @@ versus 0.175 ms for collect/mark, about a 61% reduction on this development host
 Runtime tests cover fresh, exact-boundary, stale, existing-offline, repeated-pass,
 route-epoch, and counter behavior; benchmark tests compare every node route.
 
-## Load Sampling Output Reuse Measurement
+### Load Sampling Output Reuse Measurement
 
 `StationLoadSampler::sample_all_into` retains subscriber aggregation, sorted
 occupancy scratch, outer Station sample slots, and each Station's cell output.
@@ -661,7 +689,7 @@ tests verify deterministic occupancy, exact sample equivalence, duplicate
 subscriber aggregation, and retained outer and nested storage; benchmark tests
 verify guard enforcement and cross-path checksums.
 
-## Reliable Frame And Retry Reuse Measurement
+### Reliable Frame And Retry Reuse Measurement
 
 `ReliableClientFrame::encode_data` and `ReliableStationFrame::encode_data`
 append borrowed payloads directly to the final wire buffer. Reliable senders use
@@ -699,7 +727,7 @@ not a timing threshold. Transport tests cover byte equality, capacity retention,
 duplicate suppression, failed-send attempt preservation, and ordered timeout
 behavior.
 
-## Reliable Receive Payload Ownership Measurement
+### Reliable Receive Payload Ownership Measurement
 
 `ReliableClientFrame::decode_ref` and `ReliableStationFrame::decode_ref`
 validate frame structure while borrowing data payload bytes. Standard reliable
@@ -730,7 +758,7 @@ reuse versus 0.672 ms owned, about a 21.6% reduction. Exact bytes/checksums,
 full pointer reuse, zero fresh payloads, endpoint ACK/duplicate tests, guard
 metadata, and `benchmark_ok=true` are the portable acceptance signals.
 
-## Reliable Window Count Measurement
+### Reliable Window Count Measurement
 
 Reliable Client and Station senders maintain a `BTreeMap` count per active peer
 or target. `in_flight_for` and send-window admission therefore perform one
@@ -759,7 +787,7 @@ reduction on this development host. Client and Station tests cover independent
 peer counts, ACK decrement, zero-count cleanup, timeout cleanup, send failure,
 window limits, and saturated-sequence replacement.
 
-## Bounded Duplicate Index Measurement
+### Bounded Duplicate Index Measurement
 
 Security replay and reliable Client/Station duplicate histories retain FIFO
 eviction but select their membership index from the configured bound. Histories
@@ -783,7 +811,7 @@ threshold. Output retains operation conservation, retained count, checksum,
 latency percentiles, guard metadata, workload/time verdicts, and
 `benchmark_ok=true` as portable acceptance signals.
 
-## Replication Tracker Capacity Guard Measurement
+### Replication Tracker Capacity Guard Measurement
 
 `ReplicationTracker::record_plan_sent` first checks whether current entries plus
 the full plan length fit under `max_entries`. When they do, capacity is proven
@@ -807,7 +835,7 @@ calls/tick, ticks, and total updates unless `--allow-heavy` is present; output
 includes latency percentiles, call/update/probe/count/checksum fields, guard
 metadata, workload/capacity/time verdicts, and `benchmark_ok=true`.
 
-## Replication Tracker Map Measurement
+### Replication Tracker Map Measurement
 
 `ReplicationTracker` starts with ordered record storage and promotes once to a
 hash map when adding the 2,048th distinct client/entity key. The one-way
@@ -833,7 +861,7 @@ unless `--allow-heavy` is present; output includes latency percentiles,
 operation/ACK/count/checksum fields, guard metadata, workload/count/time
 verdicts, and `benchmark_ok=true`.
 
-## Station Registry Lookup Measurement
+### Station Registry Lookup Measurement
 
 `StationSet` and `StationIndexSet` retain deterministic Vec iteration while
 switching ID lookup adaptively. Below 64 slots they scan the small Vec without
@@ -865,7 +893,7 @@ scan comparison, avoiding the earlier small-set hash overhead. Runtime tests
 cover threshold activation, first-duplicate semantics, replacement order,
 paired mutable lookup, and both capacity classes.
 
-## Packet Security Seal Scratch Measurement
+### Packet Security Seal Scratch Measurement
 
 `PacketSecurityEnvelope::encode_parts` writes borrowed ciphertext/tag slices
 with the same limits and wire format as the owned envelope. `PacketSecurityBox`
@@ -896,7 +924,7 @@ versus 0.640 ms fresh, about a 34% reduction on this development host. Transport
 tests cover owned/borrowed byte equality, repeated pointer/capacity retention,
 automatic nonce reporting, payload/tag limits, and failure atomicity.
 
-## Packet Security Open Scratch Measurement
+### Packet Security Open Scratch Measurement
 
 `PacketSecurityEnvelopeRef::decode` validates the bounded wire envelope while
 borrowing its payload and tag. `PacketSecurityBox::open_with_scratch` and
@@ -928,7 +956,7 @@ cover borrowed offsets and limits, owned/scratch output equality, repeated
 pointer/capacity retention, key-ring opening, replay order, and authenticated
 failure behavior.
 
-## Borrowed Replication Decode Measurement
+### Borrowed Replication Decode Measurement
 
 `BinaryFrameDecoder::decode_replication_ref` validates the complete wire frame
 and exposes exact-size borrowed entity and component iterators. Component bytes
@@ -959,7 +987,7 @@ are local evidence; identical workload/checksum, complete validation, borrowed
 payload pointers, and zero owned materializations are the portable acceptance
 signals.
 
-## Borrowed UDP Receive Measurement
+### Borrowed UDP Receive Measurement
 
 `UdpTransport::try_recv_ref` and
 `UdpStationTransport::try_recv_station_ref` borrow datagram bytes from the
@@ -987,7 +1015,7 @@ does not show a latency improvement. The portable benefit is removal of
 per-datagram owned payload allocation for immediate consumers, not a claim that
 UDP syscall latency decreases.
 
-## In-Memory Queue Capacity Measurement
+### In-Memory Queue Capacity Measurement
 
 `InMemoryTransportHub` and `InMemoryStationTransport` register empty queues
 without reserving their configured packet maximum. Queues grow on demand,
@@ -1012,7 +1040,7 @@ limits, and bursts unless `--allow-heavy` is present; output includes room
 latency percentiles, exact queue/packet conservation, guard metadata,
 capacity/workload/lazy/time verdicts, and `benchmark_ok=true`.
 
-## Core Queue Capacity Measurement
+### Core Queue Capacity Measurement
 
 `CommandQueues` and `EventQueues` construct every priority queue with zero
 retained slots, grow only on accepted traffic, and retain reached capacity
@@ -1036,7 +1064,7 @@ Command/Event counts and capacities, avoided slots/percentage, room latency
 percentiles, guard metadata, workload/capacity/lazy/time verdicts, and
 `benchmark_ok=true`.
 
-## In-Memory Batch Send Measurement
+### In-Memory Batch Send Measurement
 
 `InMemoryTransportEndpoint::send_batch` processes packets under bounded
 64-packet lock segments. This amortizes shared Hub locking without allowing an
@@ -1062,7 +1090,7 @@ payload bytes, total packets, and aggregate payload work unless
 counts, queue and byte conservation, guard metadata, workload/call/time
 verdicts, and `benchmark_ok=true`.
 
-## Budget Batch Scan Measurement
+### Budget Batch Scan Measurement
 
 `BudgetedTransport::send_batch` accumulates saturated aggregate bytes and
 records the first oversized packet during one metadata scan. It checks the
@@ -1086,7 +1114,7 @@ present; output includes latency percentiles, inspection/byte/checksum fields,
 guard metadata, workload/inspection/validation/time verdicts, and
 `benchmark_ok=true`.
 
-## In-Memory Endpoint Lookup Measurement
+### In-Memory Endpoint Lookup Measurement
 
 Client and Station in-memory transport registries use ordered maps below 2,048
 entries and promote once to hash maps when adding the 2,048th distinct key.
@@ -1121,7 +1149,7 @@ from 2.063 ms to 1.077 ms. Both modes execute one million logical operations
 with identical mutations and checksums; `map_probes` is exactly two million for
 the comparison and one million for the optimized shape.
 
-## Replication Receive Visitor Measurement
+### Replication Receive Visitor Measurement
 
 `ReplicationReceiveBridge::pump_visit` consumes transport packets, validates
 expected source and frame target, performs complete borrowed wire validation,
@@ -1150,7 +1178,7 @@ about a 64% reduction on this development host. Identical bridge counters,
 workload/checksum, zero visitor materializations, visitor-error propagation,
 and complete source/wire/target validation are the portable acceptance signals.
 
-## Mixed Client Receive Visitor Measurement
+### Mixed Client Receive Visitor Measurement
 
 `ClientTransportBridge::pump_visit` accepts command ACKs, borrowed replication
 frames, and barrier notifications in one fallible visitor loop. It shares
@@ -1183,7 +1211,7 @@ materialized zero owned replication frames; mixed owned pumping materialized
 statistics, visitor-error propagation, zero materializations, guard metadata,
 and `benchmark_ok=true` are the portable acceptance signals.
 
-## Gateway ACK Ownership Measurement
+### Gateway ACK Ownership Measurement
 
 `GatewayClientTransportBridge::pump_ingress_compact` shares packet decoding,
 source validation, gateway admission, queueing, ACK encoding, transport send,
@@ -1213,7 +1241,7 @@ host. Identical admission/queue/send results and removal of retained ACK clones
 are the portable acceptance signals; detailed-report retention remains an
 explicit compatibility option.
 
-## Component Entity Cleanup Measurement
+### Component Entity Cleanup Measurement
 
 `ComponentStore::remove_entity_into` clears and reuses caller-owned removed
 value storage. The compatible `remove_entity` path returns a fresh Vec, while
@@ -1242,7 +1270,7 @@ host. A discard run reported 1.741 ms p99. Identical removal counts, bytes, and
 checksums plus zero fresh outputs are the portable acceptance signals; host
 timings are directional rather than a universal guarantee.
 
-## Cell Migration Storage Measurement
+### Cell Migration Storage Measurement
 
 `CellMigrationExecutor::migrate_cells` now scans `handles_in_cell_slice`
 directly, avoiding one temporary handle Vec per scanned cell. Repeated passes
@@ -1271,7 +1299,7 @@ checksums, final index membership, zero fresh-storage passes, and retained
 scratch/report capacities are the portable acceptance signals; host timings
 are directional rather than a universal guarantee.
 
-## Multi-Room Split Execution Storage Measurement
+### Multi-Room Split Execution Storage Measurement
 
 `SplitScheduler::execute_into` and `execute_view_into` retain outer ownership
 and migration report slots, moved-cell and nested entity-migration capacity,
@@ -1300,7 +1328,7 @@ development host. Identical action/update/entity counts, checksums, target
 indexes, zero fresh reports, and retained nested capacities are the portable
 acceptance signals; host timings are directional rather than universal.
 
-## Multi-Room Barrier Snapshot Storage Measurement
+### Multi-Room Barrier Snapshot Storage Measurement
 
 `Station::snapshot_into` reuses one snapshot's entity Vec, while
 `BarrierController::export_snapshots_into` retains Station snapshot slots and
@@ -1329,7 +1357,7 @@ counts, checksums, barrier metrics, zero fresh batches, and retained nested
 capacity are the portable acceptance signals; host timings are directional
 rather than universal.
 
-## Multi-Room Station Restore Capacity Measurement
+### Multi-Room Station Restore Capacity Measurement
 
 `Station::restore` constructs record, generation, and entity-id lookup storage
 with the snapshot entity count before inserting records. `restore_tracked`
@@ -1356,7 +1384,11 @@ preallocated versus 1.026 ms previous, so no latency improvement is claimed.
 Zero growth, exact Station/entity counts, checksum stability, capacity totals,
 guard metadata, and `benchmark_ok=true` are the portable acceptance signals.
 
-## Optional Heavy Calibration
+## Heavy Calibration
+
+These runs are manual, explicitly admitted, and unsuitable for routine CI.
+
+### Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
 opt-in:
@@ -1376,7 +1408,7 @@ Do not promote heavy-run numbers into committed defaults from a single
 development host. Record hardware, profile, baseline, full output, and repeated
 run variance before changing thresholds.
 
-## Hotspot Calibration
+### Hotspot Calibration
 
 Use the deterministic examples before any heavier threshold experiment:
 

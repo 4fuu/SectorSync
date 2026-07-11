@@ -7,6 +7,9 @@ that must supply policy, credentials, endpoints, storage, or execution.
 The examples use deterministic in-memory or localhost adapters. They prove the
 contract and rejection behavior; they are not production implementations.
 
+For application tick ordering and bounded error handling, start with the
+[SDK integration guide](sdk-integration.md). API signatures remain in rustdoc.
+
 ## Adapter Map
 
 | SectorSync surface | External adapter supplies | SectorSync retains |

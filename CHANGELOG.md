@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Documentation now uses a concise root README, a dedicated docs index, and
+  layered integration, performance, adapter-boundary, and delivery-status
+  guides without duplicating benchmark command inventories at the project root.
 - Replication tracker records now retain ordered lookup for small sets and
   promote once to hash lookup at 2,048 client/entity keys, preserving send,
   ACK, cleanup, capacity, and statistics state across migration.
