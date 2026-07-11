@@ -7,10 +7,10 @@ pub use crate::command::{
 };
 pub use crate::component::{
     ComponentBlob, ComponentCodec, ComponentCodecError, ComponentDescriptor,
-    ComponentFieldDescriptor, ComponentFieldType, ComponentMigrationMode, ComponentRegistry,
-    ComponentRegistryError, ComponentSchema, ComponentSchemaError, ComponentStorageKind,
-    ComponentStore, ComponentStoreError, ComponentSyncMode, F32LeCodec, GeneratedComponentSchema,
-    GeneratedSchemaRegistrationError, U32LeCodec, Vec3LeCodec,
+    ComponentEncodeScratch, ComponentFieldDescriptor, ComponentFieldType, ComponentMigrationMode,
+    ComponentRegistry, ComponentRegistryError, ComponentSchema, ComponentSchemaError,
+    ComponentStorageKind, ComponentStore, ComponentStoreError, ComponentSyncMode, F32LeCodec,
+    GeneratedComponentSchema, GeneratedSchemaRegistrationError, U32LeCodec, Vec3LeCodec,
 };
 pub use crate::entity::{DirtyMask, EntityRecord, EntityRole, EntityTags};
 pub use crate::event::{

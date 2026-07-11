@@ -1,11 +1,12 @@
 //! Generated component schema SDK example.
 
 use sectorsync_core::prelude::{
-    Bounds, CellIndex, ClientId, CompiledSyncPolicy, ComponentFieldDescriptor, ComponentFieldType,
-    ComponentId, ComponentMigrationMode, ComponentRegistry, ComponentStorageKind, ComponentStore,
-    ComponentSyncMode, EntityId, GeneratedComponentSchema, GridSpec, InstanceId, NodeId, PolicyId,
-    PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station,
-    StationConfig, StationId, Vec3, Vec3LeCodec, ViewerQuery,
+    Bounds, CellIndex, ClientId, CompiledSyncPolicy, ComponentEncodeScratch,
+    ComponentFieldDescriptor, ComponentFieldType, ComponentId, ComponentMigrationMode,
+    ComponentRegistry, ComponentStorageKind, ComponentStore, ComponentSyncMode, EntityId,
+    GeneratedComponentSchema, GridSpec, InstanceId, NodeId, PolicyId, PolicyTable, Position3,
+    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig, StationId,
+    Vec3, Vec3LeCodec, ViewerQuery,
 };
 use sectorsync_wire::{
     BinaryFrameEncoder, ComponentSelection, FrameEncoder, ReplicationFrameBuilder,
@@ -61,11 +62,29 @@ fn main() {
         .expect("spawn should work");
     index.upsert(handle, Position3::new(4.0, 5.0, 6.0), Bounds::Point);
 
-    let position = Vec3::new(4.0, 5.0, 6.0);
     let mut components = ComponentStore::default();
+    let mut encode_scratch = ComponentEncodeScratch::with_capacity(12);
     components
-        .set_typed(&schema.descriptor, handle, 1, &Vec3LeCodec, &position)
+        .set_typed_with_scratch(
+            &schema.descriptor,
+            handle,
+            1,
+            &Vec3LeCodec,
+            &Vec3::new(4.0, 5.0, 6.0),
+            &mut encode_scratch,
+        )
         .expect("generated component should encode");
+    let position = Vec3::new(7.0, 8.0, 9.0);
+    components
+        .set_typed_with_scratch(
+            &schema.descriptor,
+            handle,
+            2,
+            &Vec3LeCodec,
+            &position,
+            &mut encode_scratch,
+        )
+        .expect("repeated component update should reuse scratch");
     let decoded = components
         .get_typed(ComponentId::new(20), handle, &Vec3LeCodec)
         .expect("generated component should decode");
@@ -103,10 +122,11 @@ fn main() {
         .expect("frame should encode");
 
     println!(
-        "generated_schema hash={} fixed_size={} fields={} frame_bytes={}",
+        "generated_schema hash={} fixed_size={} fields={} encode_scratch_capacity={} frame_bytes={}",
         schema.descriptor.schema_hash,
         schema.fixed_size.expect("fixed size"),
         TRANSFORM_SCHEMA.fields.len(),
+        encode_scratch.retained_capacity(),
         bytes.len()
     );
 }

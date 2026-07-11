@@ -644,6 +644,31 @@ pub struct ComponentBlob {
     pub bytes: Vec<u8>,
 }
 
+/// Caller-owned reusable storage for typed component encoding.
+#[derive(Clone, Debug, Default)]
+pub struct ComponentEncodeScratch {
+    bytes: Vec<u8>,
+}
+
+impl ComponentEncodeScratch {
+    /// Creates empty encoding scratch.
+    pub const fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    /// Creates encoding scratch with an initial byte capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Retained byte capacity available to subsequent encodes.
+    pub fn retained_capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+}
+
 /// Component storage error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentStoreError {
@@ -729,16 +754,7 @@ impl ComponentStore {
         version: u64,
         bytes: Vec<u8>,
     ) -> Result<(), ComponentStoreError> {
-        if descriptor.storage != ComponentStorageKind::SparseBlob {
-            return Err(ComponentStoreError::NotBlobStorage(descriptor.id));
-        }
-        if bytes.len() > descriptor.max_bytes {
-            return Err(ComponentStoreError::BlobTooLarge {
-                component_id: descriptor.id,
-                actual: bytes.len(),
-                max: descriptor.max_bytes,
-            });
-        }
+        validate_blob_write(descriptor, bytes.len())?;
 
         let column = self.column_mut(descriptor.id);
         column.values.insert(
@@ -749,6 +765,37 @@ impl ComponentStore {
                 bytes,
             },
         );
+        Ok(())
+    }
+
+    /// Copies an opaque component value into retained blob storage.
+    ///
+    /// Existing blob byte capacity is reused when sufficient. Validation runs
+    /// before mutation, so failed writes leave the previous value unchanged.
+    pub fn set_blob_from_slice(
+        &mut self,
+        descriptor: &ComponentDescriptor,
+        entity: EntityHandle,
+        version: u64,
+        bytes: &[u8],
+    ) -> Result<(), ComponentStoreError> {
+        validate_blob_write(descriptor, bytes.len())?;
+        let column = self.column_mut(descriptor.id);
+        if let Some(blob) = column.values.get_mut(&entity) {
+            blob.bytes.clear();
+            blob.bytes.extend_from_slice(bytes);
+            blob.version = version;
+            blob.dirty = true;
+        } else {
+            column.values.insert(
+                entity,
+                ComponentBlob {
+                    version,
+                    dirty: true,
+                    bytes: bytes.to_vec(),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -766,6 +813,27 @@ impl ComponentStore {
             .encode(value, &mut bytes)
             .map_err(ComponentStoreError::Codec)?;
         self.set_blob(descriptor, entity, version, bytes)
+    }
+
+    /// Encodes a typed value through caller-owned scratch and copies it into
+    /// retained blob storage.
+    pub fn set_typed_with_scratch<T, C: ComponentCodec<T>>(
+        &mut self,
+        descriptor: &ComponentDescriptor,
+        entity: EntityHandle,
+        version: u64,
+        codec: &C,
+        value: &T,
+        scratch: &mut ComponentEncodeScratch,
+    ) -> Result<(), ComponentStoreError> {
+        scratch.bytes.clear();
+        if let Some(size) = codec.fixed_size() {
+            scratch.bytes.reserve(size);
+        }
+        codec
+            .encode(value, &mut scratch.bytes)
+            .map_err(ComponentStoreError::Codec)?;
+        self.set_blob_from_slice(descriptor, entity, version, &scratch.bytes)
     }
 
     /// Gets an opaque component blob.
@@ -876,6 +944,23 @@ impl ComponentStore {
     }
 }
 
+fn validate_blob_write(
+    descriptor: &ComponentDescriptor,
+    bytes: usize,
+) -> Result<(), ComponentStoreError> {
+    if descriptor.storage != ComponentStorageKind::SparseBlob {
+        return Err(ComponentStoreError::NotBlobStorage(descriptor.id));
+    }
+    if bytes > descriptor.max_bytes {
+        return Err(ComponentStoreError::BlobTooLarge {
+            component_id: descriptor.id,
+            actual: bytes,
+            max: descriptor.max_bytes,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +991,51 @@ mod tests {
                 .map(|blob| blob.bytes.as_slice()),
             Some(&[1, 2, 3, 4][..])
         );
+    }
+
+    #[test]
+    fn slice_updates_reuse_blob_storage_and_reject_oversized_values_atomically() {
+        let component_id = ComponentId::new(4);
+        let descriptor = ComponentDescriptor::sparse_blob(
+            component_id,
+            "state",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            8,
+        );
+        let handle = EntityHandle::new(1, 0);
+        let mut store = ComponentStore::default();
+        store
+            .set_blob(&descriptor, handle, 1, vec![0; 8])
+            .expect("initial blob should fit");
+        let retained_bytes = store
+            .get_blob(component_id, handle)
+            .expect("blob exists")
+            .bytes
+            .as_ptr();
+
+        store
+            .set_blob_from_slice(&descriptor, handle, 2, &[1, 2, 3, 4])
+            .expect("slice update should fit");
+        let blob = store.get_blob(component_id, handle).expect("blob exists");
+        assert_eq!(blob.bytes, [1, 2, 3, 4]);
+        assert_eq!(blob.bytes.as_ptr(), retained_bytes);
+        assert_eq!(blob.version, 2);
+        assert!(blob.dirty);
+
+        assert_eq!(
+            store
+                .set_blob_from_slice(&descriptor, handle, 3, &[9; 9])
+                .expect_err("oversized update should fail"),
+            ComponentStoreError::BlobTooLarge {
+                component_id,
+                actual: 9,
+                max: 8,
+            }
+        );
+        let blob = store.get_blob(component_id, handle).expect("blob remains");
+        assert_eq!(blob.bytes, [1, 2, 3, 4]);
+        assert_eq!(blob.version, 2);
     }
 
     #[test]
@@ -1011,6 +1141,50 @@ mod tests {
             .get_typed(ComponentId::new(3), entity, &Vec3LeCodec)
             .expect("typed get should work");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn typed_component_scratch_reuses_encoding_and_blob_capacity() {
+        let component_id = ComponentId::new(5);
+        let descriptor = ComponentDescriptor::sparse_blob(
+            component_id,
+            "score",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let entity = EntityHandle::new(7, 0);
+        let mut store = ComponentStore::default();
+        let mut scratch = ComponentEncodeScratch::new();
+
+        store
+            .set_typed_with_scratch(&descriptor, entity, 1, &U32LeCodec, &10, &mut scratch)
+            .expect("initial typed write should work");
+        let retained_scratch = scratch.retained_capacity();
+        let retained_blob = store
+            .get_blob(component_id, entity)
+            .expect("blob exists")
+            .bytes
+            .as_ptr();
+        store
+            .set_typed_with_scratch(&descriptor, entity, 2, &U32LeCodec, &20, &mut scratch)
+            .expect("repeated typed write should work");
+
+        assert_eq!(scratch.retained_capacity(), retained_scratch);
+        assert_eq!(
+            store
+                .get_blob(component_id, entity)
+                .expect("blob exists")
+                .bytes
+                .as_ptr(),
+            retained_blob
+        );
+        assert_eq!(
+            store
+                .get_typed(component_id, entity, &U32LeCodec)
+                .expect("typed value decodes"),
+            20
+        );
     }
 
     #[test]
