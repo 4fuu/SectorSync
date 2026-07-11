@@ -135,6 +135,14 @@ single-process work:
 cargo run --release -q -p sectorsync-bench --example many_rooms
 ```
 
+The deterministic gameplay-shaped scenario adds active/idle/hot room mixes,
+commands, movement, component changes, projectiles, events, frame transport,
+client decode, ACK tracking, and bounded room recreation:
+
+```bash
+cargo run --release -q -p sectorsync-bench --example dynamic_gameplay
+```
+
 On the current development host, its default 500-room workload has demonstrated
 30 Hz headroom for spatial planning and direct delta encoding. This excludes
 gameplay, room lifecycle, persistence, matchmaking, and kernel networking, so

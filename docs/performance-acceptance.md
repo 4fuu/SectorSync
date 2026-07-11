@@ -343,6 +343,44 @@ idle-room scheduling, command/event pumps, kernel networking, persistence, or
 matchmaking. Treat it as evidence for active-room spatial planning and encoding,
 not a complete room-server capacity promise.
 
+### Dynamic Gameplay Measurement
+
+`dynamic_gameplay` is the broader deterministic application-shaped workload.
+It keeps game semantics inside the benchmark while exercising SectorSync's
+public middleware path: 4-10 players per room, active/idle/hot room mixes,
+gateway command admission, bounded command queues, player/NPC movement, sparse
+component changes, projectile spawn/despawn, event routing, reusable batch
+planning, direct binary frame encoding, in-memory packet delivery, borrowed
+client decode, replication tracking, immediate benchmark ACKs, and bounded room
+recreation.
+
+Run the smoke-safe release profile with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example dynamic_gameplay
+```
+
+The default workload uses 20 rooms, 128 initial entities per room, and 30
+ticks. `standard` (100 rooms, 256 entities, 180 ticks) and `large` (500 rooms,
+512 entities, 300 ticks) require `--allow-heavy`. Manual values remain clamped
+to the active profile's limits, and every run has a cooperative ten-second
+budget.
+
+Two initial release runs completed all 30 ticks with 1,392 admitted and
+applied commands, 60 routed and drained events, 4,110 viewer plans and packets,
+3,035,294 encoded and decoded bytes, zero oversized packets, and 6.595-6.875 ms
+tick p99 on the development host. Each selected 537,076 entities but encoded
+41,409, or about 13 selected entities per encoded entity. This is the baseline
+signal for dirty-aware planning rather than a claim that the current ratio is
+ideal.
+
+Machine-readable output retains phase percentiles, command/event/transport
+conservation, spawn/despawn and lifecycle counts, selected/encoded/component
+counts, actual bytes, packet-budget failures, tracker state/ACK counts, world
+and client checksums, retained capacity classes, threshold verdicts, and
+`benchmark_ok`. It does not implement combat, persistence, matchmaking, kernel
+networking, or production client prediction.
+
 ## Hot-Path Measurements
 
 These focused A/B runs isolate one algorithm, lookup, ownership, or allocation

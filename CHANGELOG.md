@@ -8,6 +8,13 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ## [Unreleased]
 
+### Added
+
+- A guarded deterministic `dynamic_gameplay` benchmark now exercises mixed
+  active/idle/hot rooms through commands, movement, component changes,
+  projectile churn, events, replication, in-memory transport, client decode,
+  ACK tracking, and bounded room recreation.
+
 ### Changed
 
 - Guarded planner baselines now share identical phased viewer, command, event,
