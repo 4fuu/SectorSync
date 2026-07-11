@@ -3013,17 +3013,26 @@ impl CellOwnershipTable {
         proposal: &SplitProposal,
         target_station: StationId,
     ) -> CellOwnershipUpdate {
-        let mut moved_cells = Vec::new();
+        let mut update = CellOwnershipUpdate::default();
+        self.apply_split_into(proposal, target_station, &mut update);
+        update
+    }
+
+    /// Applies a split into caller-owned reusable update storage.
+    pub fn apply_split_into(
+        &mut self,
+        proposal: &SplitProposal,
+        target_station: StationId,
+        update: &mut CellOwnershipUpdate,
+    ) {
+        update.source_station = proposal.source_station;
+        update.target_station = target_station;
+        update.moved_cells.clear();
         for cell in &proposal.cells_to_move {
             let previous = self.assign(*cell, target_station);
             if previous != Some(target_station) {
-                moved_cells.push(*cell);
+                update.moved_cells.push(*cell);
             }
-        }
-        CellOwnershipUpdate {
-            source_station: proposal.source_station,
-            target_station,
-            moved_cells,
         }
     }
 
@@ -3084,9 +3093,18 @@ impl CellMigrationScratch {
 
     /// Reserves deduplication and candidate storage for an expected pass size.
     pub fn reserve(&mut self, handles: usize, entities: usize) {
-        self.seen_handles.reserve(handles);
-        self.seen_entities.reserve(entities);
-        self.entity_ids.reserve(entities);
+        if self.seen_handles.capacity() < handles {
+            self.seen_handles
+                .reserve(handles.saturating_sub(self.seen_handles.len()));
+        }
+        if self.seen_entities.capacity() < entities {
+            self.seen_entities
+                .reserve(entities.saturating_sub(self.seen_entities.len()));
+        }
+        if self.entity_ids.capacity() < entities {
+            self.entity_ids
+                .reserve(entities.saturating_sub(self.entity_ids.len()));
+        }
     }
 
     /// Retained handle-deduplication capacity.
@@ -3522,6 +3540,106 @@ pub struct SplitScheduleExecutionReport {
     pub cell_migrations: Vec<CellMigrationReport>,
 }
 
+/// Borrowed result of executing a split schedule into reusable storage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplitScheduleExecutionView<'a> {
+    /// Ownership changes applied during this pass.
+    pub ownership_updates: &'a [CellOwnershipUpdate],
+    /// Cell migration reports produced during this pass.
+    pub cell_migrations: &'a [CellMigrationReport],
+}
+
+/// Caller-owned reusable output and working storage for split execution.
+#[derive(Clone, Debug, Default)]
+pub struct SplitScheduleExecutionScratch {
+    ownership_updates: Vec<CellOwnershipUpdate>,
+    cell_migrations: Vec<CellMigrationReport>,
+    active_actions: usize,
+    migration: CellMigrationScratch,
+}
+
+impl SplitScheduleExecutionScratch {
+    /// Creates empty split-execution storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves outer action slots and per-action cell/entity report capacity.
+    pub fn reserve(&mut self, actions: usize, cells_per_action: usize, entities_per_action: usize) {
+        while self.ownership_updates.len() < actions {
+            self.ownership_updates.push(CellOwnershipUpdate::default());
+            self.cell_migrations.push(CellMigrationReport::default());
+        }
+        for update in &mut self.ownership_updates[..actions] {
+            if update.moved_cells.capacity() < cells_per_action {
+                update
+                    .moved_cells
+                    .reserve(cells_per_action.saturating_sub(update.moved_cells.len()));
+            }
+        }
+        for report in &mut self.cell_migrations[..actions] {
+            if report.scanned_cells.capacity() < cells_per_action {
+                report
+                    .scanned_cells
+                    .reserve(cells_per_action.saturating_sub(report.scanned_cells.len()));
+            }
+            if report.entity_migrations.capacity() < entities_per_action {
+                report
+                    .entity_migrations
+                    .reserve(entities_per_action.saturating_sub(report.entity_migrations.len()));
+            }
+        }
+        self.migration
+            .reserve(entities_per_action, entities_per_action);
+    }
+
+    /// Ownership-update slots retained across passes.
+    pub fn retained_ownership_slots(&self) -> usize {
+        self.ownership_updates.len()
+    }
+
+    /// Cell-migration report slots retained across passes.
+    pub fn retained_migration_slots(&self) -> usize {
+        self.cell_migrations.len()
+    }
+
+    /// Total moved-cell capacity retained across ownership updates.
+    pub fn retained_update_cell_capacity(&self) -> usize {
+        self.ownership_updates
+            .iter()
+            .map(|update| update.moved_cells.capacity())
+            .sum()
+    }
+
+    /// Total entity-report capacity retained across cell migrations.
+    pub fn retained_entity_migration_capacity(&self) -> usize {
+        self.cell_migrations
+            .iter()
+            .map(|report| report.entity_migrations.capacity())
+            .sum()
+    }
+
+    /// Retained candidate entity capacity in the shared migration scratch.
+    pub fn retained_candidate_capacity(&self) -> usize {
+        self.migration.candidate_capacity()
+    }
+
+    fn prepare(&mut self, actions: usize) {
+        while self.ownership_updates.len() < actions {
+            self.ownership_updates.push(CellOwnershipUpdate::default());
+            self.cell_migrations.push(CellMigrationReport::default());
+        }
+        self.active_actions = 0;
+    }
+
+    fn view(&self) -> SplitScheduleExecutionView<'_> {
+        SplitScheduleExecutionView {
+            ownership_updates: &self.ownership_updates[..self.active_actions],
+            cell_migrations: &self.cell_migrations[..self.active_actions],
+        }
+    }
+}
+
 /// Split schedule execution error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitScheduleExecutionError {
@@ -3733,6 +3851,75 @@ impl SplitScheduler {
         ownership: &mut CellOwnershipTable,
     ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
         self.execute_actions(schedule.actions, stations, indexes, ownership)
+    }
+
+    /// Executes an owned schedule into fully reusable caller-owned storage.
+    pub fn execute_into<'a>(
+        &self,
+        schedule: &SplitSchedule,
+        stations: &mut StationSet,
+        indexes: &mut StationIndexSet,
+        ownership: &mut CellOwnershipTable,
+        scratch: &'a mut SplitScheduleExecutionScratch,
+    ) -> Result<SplitScheduleExecutionView<'a>, SplitScheduleExecutionError> {
+        self.execute_actions_into(&schedule.actions, stations, indexes, ownership, scratch)
+    }
+
+    /// Executes a borrowed schedule into fully reusable caller-owned storage.
+    pub fn execute_view_into<'a>(
+        &self,
+        schedule: SplitScheduleView<'_>,
+        stations: &mut StationSet,
+        indexes: &mut StationIndexSet,
+        ownership: &mut CellOwnershipTable,
+        scratch: &'a mut SplitScheduleExecutionScratch,
+    ) -> Result<SplitScheduleExecutionView<'a>, SplitScheduleExecutionError> {
+        self.execute_actions_into(schedule.actions, stations, indexes, ownership, scratch)
+    }
+
+    fn execute_actions_into<'a>(
+        &self,
+        actions: &[SplitAction],
+        stations: &mut StationSet,
+        indexes: &mut StationIndexSet,
+        ownership: &mut CellOwnershipTable,
+        scratch: &'a mut SplitScheduleExecutionScratch,
+    ) -> Result<SplitScheduleExecutionView<'a>, SplitScheduleExecutionError> {
+        scratch.prepare(actions.len());
+
+        for action in actions {
+            if indexes.get(action.source_station).is_none() {
+                return Err(SplitScheduleExecutionError::MissingSourceIndex(
+                    action.source_station,
+                ));
+            }
+            if indexes.get(action.target_station).is_none() {
+                return Err(SplitScheduleExecutionError::MissingTargetIndex(
+                    action.target_station,
+                ));
+            }
+
+            let action_index = scratch.active_actions;
+            let update = &mut scratch.ownership_updates[action_index];
+            ownership.apply_split_into(&action.proposal, action.target_station, update);
+            let (source_index, target_index) = indexes
+                .get_pair_mut(action.source_station, action.target_station)
+                .expect("indexes were checked above");
+            CellMigrationExecutor::migrate_cells_into(
+                stations,
+                source_index,
+                target_index,
+                action.source_station,
+                action.target_station,
+                &update.moved_cells,
+                self.config.ghost_ttl_ticks,
+                &mut scratch.migration,
+                &mut scratch.cell_migrations[action_index],
+            )?;
+            scratch.active_actions = scratch.active_actions.saturating_add(1);
+        }
+
+        Ok(scratch.view())
     }
 
     fn execute_actions(
@@ -7111,6 +7298,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn split_scheduler_plans_and_executes_hot_cell_move() {
         let grid = GridSpec::new(16.0).expect("valid grid");
         let hot_cell = CellCoord3::new(0, 0, 0);
@@ -7177,19 +7365,80 @@ mod tests {
 
         let mut ownership = CellOwnershipTable::default();
         ownership.assign(hot_cell, StationId::new(1));
-        let report = scheduler
-            .execute(&schedule, &mut stations, &mut indexes, &mut ownership)
-            .expect("execute should work");
+        let mut execution_scratch = SplitScheduleExecutionScratch::new();
+        execution_scratch.reserve(1, 1, 1);
+        {
+            let report = scheduler
+                .execute_into(
+                    &schedule,
+                    &mut stations,
+                    &mut indexes,
+                    &mut ownership,
+                    &mut execution_scratch,
+                )
+                .expect("reusable execute should work");
+            assert_eq!(report.cell_migrations.len(), 1);
+            assert_eq!(report.cell_migrations[0].entity_migrations.len(), 1);
+        }
 
         assert_eq!(ownership.owner_of(hot_cell), Some(StationId::new(2)));
-        assert_eq!(report.cell_migrations.len(), 1);
-        assert_eq!(report.cell_migrations[0].entity_migrations.len(), 1);
         assert_eq!(
             indexes
                 .get(StationId::new(2))
                 .expect("target index")
                 .entity_count(),
             1
+        );
+
+        let retained_ownership_slots = execution_scratch.retained_ownership_slots();
+        let retained_migration_slots = execution_scratch.retained_migration_slots();
+        let retained_update_cells = execution_scratch.retained_update_cell_capacity();
+        let retained_entity_migrations = execution_scratch.retained_entity_migration_capacity();
+        let retained_candidates = execution_scratch.retained_candidate_capacity();
+        execution_scratch.reserve(1, 1, 1);
+        assert_eq!(
+            execution_scratch.retained_update_cell_capacity(),
+            retained_update_cells
+        );
+        assert_eq!(
+            execution_scratch.retained_entity_migration_capacity(),
+            retained_entity_migrations
+        );
+        assert_eq!(
+            execution_scratch.retained_candidate_capacity(),
+            retained_candidates
+        );
+        let empty = SplitSchedule::default();
+        let empty_report = scheduler
+            .execute_into(
+                &empty,
+                &mut stations,
+                &mut indexes,
+                &mut ownership,
+                &mut execution_scratch,
+            )
+            .expect("empty reusable execute should work");
+        assert!(empty_report.ownership_updates.is_empty());
+        assert!(empty_report.cell_migrations.is_empty());
+        assert_eq!(
+            execution_scratch.retained_ownership_slots(),
+            retained_ownership_slots
+        );
+        assert_eq!(
+            execution_scratch.retained_migration_slots(),
+            retained_migration_slots
+        );
+        assert_eq!(
+            execution_scratch.retained_update_cell_capacity(),
+            retained_update_cells
+        );
+        assert_eq!(
+            execution_scratch.retained_entity_migration_capacity(),
+            retained_entity_migrations
+        );
+        assert_eq!(
+            execution_scratch.retained_candidate_capacity(),
+            retained_candidates
         );
     }
 

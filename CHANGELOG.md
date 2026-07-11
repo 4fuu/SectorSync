@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Split schedule execution now offers reusable ownership-update, nested
+  migration-report, and shared migration working storage across multi-room
+  passes while retaining compatible owned execution reports.
 - Cell migration now scans borrowed cell membership instead of copying one
   handle Vec per cell, and offers caller-owned reusable deduplication,
   candidate, and report storage for repeated migration passes.

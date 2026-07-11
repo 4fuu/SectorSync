@@ -288,9 +288,12 @@ When the complete split pass repeats, prefer `SplitSchedulerScratch` with
 `plan_into` or `plan_with_state_into`. The returned `SplitScheduleView` exposes
 only active decision/action slots while retaining decision reason vectors,
 action proposal coordinates, and hotspot candidates across passes. Use
-`execute_view` and `SplitSchedulerState::record_schedule_view` directly before
-the next planning call; owned schedule APIs remain available when results must
-outlive the scratch borrow.
+`SplitScheduleExecutionScratch` with `execute_view_into` to retain ownership
+updates, per-action migration reports, and shared migration working storage;
+consume both borrowed views before the next call mutates their corresponding
+scratch. Call `SplitSchedulerState::record_schedule_view` before the next
+planning pass. Owned planning and execution APIs remain available when results
+must outlive scratch borrows or execution is occasional.
 
 Execute ownership changes through `CellMigrationExecutor` or
 `EntityMigrationExecutor` so target ghosts are prewarmed, owner commit is

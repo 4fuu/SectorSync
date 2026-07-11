@@ -63,6 +63,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   deterministic station scheduling.
 - Cell migration scans borrowed index membership and supports caller-owned
   deduplication, candidate, and report storage across repeated split passes.
+- Split execution can retain ownership updates, nested migration reports, and
+  shared migration scratch across actions and rooms.
 - Periodic load sampling supports caller-owned subscriber, occupancy, Station,
   and per-cell scratch storage across scheduling windows.
 - Ordered Station and spatial-index registries use allocation-free linear lookup

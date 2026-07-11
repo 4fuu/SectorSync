@@ -965,6 +965,35 @@ checksums, final index membership, zero fresh-storage passes, and retained
 scratch/report capacities are the portable acceptance signals; host timings
 are directional rather than a universal guarantee.
 
+## Multi-Room Split Execution Storage Measurement
+
+`SplitScheduler::execute_into` and `execute_view_into` retain outer ownership
+and migration report slots, moved-cell and nested entity-migration capacity,
+and one shared `CellMigrationScratch` across actions and rooms. The compatible
+`execute` and `execute_view` APIs continue returning owned reports.
+
+Compare retained and fresh execution storage using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example split_execution_reuse
+cargo run --release -q -p sectorsync-bench --example split_execution_reuse -- --fresh-storage
+```
+
+The default preloaded workload executes four one-cell split actions in each of
+ten independent rooms, with 128 entities per action. Stations, indexes,
+schedules, and ownership are prepared before timing. Guards cap 20 rooms,
+eight actions per room, 512 entities per action, and 20,000 aggregate entities
+without `--allow-heavy`; execution has a 10-second budget.
+
+Five alternating release A/B runs each executed 40 actions, applied 40
+ownership updates, and migrated 5,120 entities with a `13,109,760` entity-id
+checksum and identical target-index totals. Reusable execution created zero
+fresh execution reports; compatible execution created ten. Median room p99 was
+0.361 ms reusable versus 0.528 ms fresh, about a 31.6% reduction on this
+development host. Identical action/update/entity counts, checksums, target
+indexes, zero fresh reports, and retained nested capacities are the portable
+acceptance signals; host timings are directional rather than universal.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
