@@ -17,12 +17,14 @@ const GUARD_MAX_TICKS: usize = 20;
 const GUARD_MAX_OPERATIONS: usize = 2_000_000;
 const TIME_BUDGET_MS: u64 = 10_000;
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug)]
 struct Config {
     sessions: usize,
     operations_per_tick: usize,
     ticks: usize,
     hash_map: bool,
+    double_lookup: bool,
     allow_heavy: bool,
     guard_applied: bool,
 }
@@ -77,6 +79,7 @@ impl<K: Eq + Hash> SessionMap<K> for HashMap<K, SessionRecord> {
 struct ResultSummary {
     ticks_completed: usize,
     operations: usize,
+    map_probes: usize,
     admissions: usize,
     checksum: u64,
     p50: f64,
@@ -85,6 +88,7 @@ struct ResultSummary {
     max: f64,
     workload_ok: bool,
     admission_count_ok: bool,
+    probe_count_ok: bool,
     time_budget_exhausted: bool,
     benchmark_ok: bool,
 }
@@ -102,6 +106,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run<M: SessionMap<ClientId>>(config: Config, mut sessions: M) -> ResultSummary {
     for index in 0..config.sessions {
         let numeric = u64::try_from(index).expect("guarded session id fits u64");
@@ -123,6 +128,7 @@ fn run<M: SessionMap<ClientId>>(config: Config, mut sessions: M) -> ResultSummar
     let mut latencies = Vec::with_capacity(config.ticks);
     let mut ticks_completed = 0_usize;
     let mut operations = 0_usize;
+    let mut map_probes = 0_usize;
     let mut admissions = 0_usize;
     let mut checksum = 0_u64;
     let mut time_budget_exhausted = false;
@@ -139,6 +145,14 @@ fn run<M: SessionMap<ClientId>>(config: Config, mut sessions: M) -> ResultSummar
                 % config.sessions;
             let client_id =
                 ClientId::new(u64::try_from(index).expect("guarded session id fits u64"));
+            if config.double_lookup {
+                black_box(
+                    sessions
+                        .session(&client_id)
+                        .expect("inserted session should exist"),
+                );
+                map_probes = map_probes.saturating_add(1);
+            }
             if operation % 8 == 0 {
                 let session = sessions
                     .session_mut(&client_id)
@@ -163,6 +177,7 @@ fn run<M: SessionMap<ClientId>>(config: Config, mut sessions: M) -> ResultSummar
                     .wrapping_add(session.generation)
                     .wrapping_add(session.route_epoch);
             }
+            map_probes = map_probes.saturating_add(1);
             operations = operations.saturating_add(1);
         }
         latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -177,10 +192,15 @@ fn run<M: SessionMap<ClientId>>(config: Config, mut sessions: M) -> ResultSummar
         .saturating_mul(config.ticks);
     let workload_ok = ticks_completed == config.ticks && operations == expected_operations;
     let admission_count_ok = admissions == expected_admissions;
-    let benchmark_ok = workload_ok && admission_count_ok && !time_budget_exhausted;
+    let expected_probes =
+        expected_operations.saturating_mul(if config.double_lookup { 2 } else { 1 });
+    let probe_count_ok = map_probes == expected_probes;
+    let benchmark_ok =
+        workload_ok && admission_count_ok && probe_count_ok && !time_budget_exhausted;
     ResultSummary {
         ticks_completed,
         operations,
+        map_probes,
         admissions,
         checksum,
         p50: percentile(&latencies, 0.50),
@@ -189,6 +209,7 @@ fn run<M: SessionMap<ClientId>>(config: Config, mut sessions: M) -> ResultSummar
         max: latencies.last().copied().unwrap_or_default(),
         workload_ok,
         admission_count_ok,
+        probe_count_ok,
         time_budget_exhausted,
         benchmark_ok,
     }
@@ -199,6 +220,7 @@ fn parse_config() -> Config {
     let mut operations_per_tick = DEFAULT_OPERATIONS_PER_TICK;
     let mut ticks = DEFAULT_TICKS;
     let mut hash_map = true;
+    let mut double_lookup = false;
     let mut allow_heavy = false;
     for arg in env::args().skip(1) {
         if let Some(value) = arg.strip_prefix("--sessions=") {
@@ -209,6 +231,8 @@ fn parse_config() -> Config {
             ticks = value.parse().unwrap_or(ticks);
         } else if arg == "--btree" {
             hash_map = false;
+        } else if arg == "--double-lookup" {
+            double_lookup = true;
         } else if arg == "--allow-heavy" {
             allow_heavy = true;
         }
@@ -230,6 +254,7 @@ fn parse_config() -> Config {
         operations_per_tick,
         ticks,
         hash_map,
+        double_lookup,
         allow_heavy,
         guard_applied: requested != (sessions, operations_per_tick, ticks),
     }
@@ -261,7 +286,9 @@ fn print_result(config: Config, result: &ResultSummary) {
     println!("ticks={}", config.ticks);
     println!("ticks_completed={}", result.ticks_completed);
     println!("hash_map={}", config.hash_map);
+    println!("double_lookup={}", config.double_lookup);
     println!("operations={}", result.operations);
+    println!("map_probes={}", result.map_probes);
     println!("admissions={}", result.admissions);
     println!("session_checksum={}", result.checksum);
     println!("tick_ms_p50={:.3}", result.p50);
@@ -270,6 +297,7 @@ fn print_result(config: Config, result: &ResultSummary) {
     println!("tick_ms_max={:.3}", result.max);
     println!("threshold_workload_completed_ok={}", result.workload_ok);
     println!("threshold_admission_count_ok={}", result.admission_count_ok);
+    println!("threshold_probe_count_ok={}", result.probe_count_ok);
     println!("time_budget_ms={TIME_BUDGET_MS}");
     println!("time_budget_exhausted={}", result.time_budget_exhausted);
     println!("benchmark_ok={}", result.benchmark_ok);

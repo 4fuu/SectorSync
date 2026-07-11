@@ -225,6 +225,7 @@ cargo run -p sectorsync-bench --release --example gateway_expiry_scan
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan -- --collect-remove
 cargo run -p sectorsync-bench --release --example gateway_session_lookup
 cargo run -p sectorsync-bench --release --example gateway_session_lookup -- --btree
+cargo run -p sectorsync-bench --release --example gateway_session_lookup -- --double-lookup
 cargo run -p sectorsync-bench --example deployment_routing
 cargo run -p sectorsync-bench --release --example deployment_stale_scan
 cargo run -p sectorsync-bench --release --example deployment_stale_scan -- --collect-mark

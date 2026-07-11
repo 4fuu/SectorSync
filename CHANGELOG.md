@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Gateway `connect` now refreshes or replaces an existing session through one
+  mutable lookup instead of a membership probe followed by a second lookup;
+  all connection outcomes and counters remain unchanged.
 - Gateway session storage now retains ordered lookup for small tables and
   promotes once to hash lookup at 1,024 sessions, preserving route, admission,
   reconnect, expiry, capacity, and statistics semantics across migration.

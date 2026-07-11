@@ -583,6 +583,7 @@ Compare Gateway-shaped records under identical route and admission operations:
 ```powershell
 cargo run --release -q -p sectorsync-bench --example gateway_session_lookup
 cargo run --release -q -p sectorsync-bench --example gateway_session_lookup -- --btree
+cargo run --release -q -p sectorsync-bench --example gateway_session_lookup -- --double-lookup
 ```
 
 At ten sessions, seven release runs produced median p50 values of 0.578 ms for
@@ -594,6 +595,14 @@ and checksums. Guards cap sessions, operations/tick, ticks, and total operations
 unless `--allow-heavy` is present; output includes latency percentiles,
 operation/admission/checksum fields, guard metadata, workload/admission/time
 verdicts, and `benchmark_ok=true`.
+
+The `--double-lookup` comparison models the previous existing-session connect
+path, which checked membership and then fetched the same mutable record. Across
+seven release runs at ten ordered sessions, removing the second probe reduced
+median p50 from 1.022 ms to 0.543 ms. At 4,096 hashed sessions it reduced p50
+from 2.183 ms to 1.351 ms. Both modes execute one million identical operations
+and 125,000 admission-style updates with equal checksums; `map_probes` falls
+from exactly two million to one million.
 
 ## Deployment Stale-Node Scan Measurement
 

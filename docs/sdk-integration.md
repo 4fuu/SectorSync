@@ -132,6 +132,9 @@ storage when adding the 1,024th distinct session. Routes, reconnect generations,
 admission counters, disconnected state, expiry, and capacity accounting survive
 the migration. Promoted tables stay hashed after expiry/removal to avoid churn
 around the threshold; no iteration order is exposed as Gateway behavior.
+Refreshing an existing session through `connect` performs one mutable session
+lookup. `AlreadyConnected`, `Reconnected`, `ReplacedExpired`, route changes,
+generation resets, and their cumulative counters retain the same behavior.
 
 For multi-node delivery, resolve `DeploymentRouteTable` metadata and send the
 stamped envelope through `CommandDispatchTransportBridge`. External service

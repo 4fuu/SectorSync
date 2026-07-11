@@ -33,13 +33,6 @@ impl<K: Copy + Eq + Hash + Ord, V> AdaptiveSessionMap<K, V> {
         }
     }
 
-    fn contains_key(&self, key: &K) -> bool {
-        match self {
-            Self::Ordered(entries) => entries.contains_key(key),
-            Self::Hashed(entries) => entries.contains_key(key),
-        }
-    }
-
     fn get(&self, key: &K) -> Option<&V> {
         match self {
             Self::Ordered(entries) => entries.get(key),
@@ -406,8 +399,15 @@ impl GatewaySessionTable {
         station_id: StationId,
         now: Tick,
     ) -> Result<GatewayConnectReport, GatewayError> {
-        if self.sessions.contains_key(&client_id) {
-            return Ok(self.connect_existing(client_id, station_id, now));
+        let reconnect_grace_ticks = self.config.reconnect_grace_ticks;
+        if let Some(session) = self.sessions.get_mut(&client_id) {
+            return Ok(Self::connect_existing(
+                session,
+                station_id,
+                now,
+                reconnect_grace_ticks,
+                &mut self.stats,
+            ));
         }
 
         if self.sessions.len() >= self.config.max_sessions {
@@ -611,22 +611,19 @@ impl GatewaySessionTable {
     }
 
     fn connect_existing(
-        &mut self,
-        client_id: ClientId,
+        session: &mut GatewaySession,
         station_id: StationId,
         now: Tick,
+        reconnect_grace_ticks: u64,
+        stats: &mut GatewayStats,
     ) -> GatewayConnectReport {
-        let session = self
-            .sessions
-            .get_mut(&client_id)
-            .expect("session existence was checked");
         match session.state {
             GatewaySessionState::Connected => {
                 session.last_seen = now;
                 if session.station_id != station_id {
                     session.station_id = station_id;
                     session.route_epoch = session.route_epoch.saturating_add(1);
-                    self.stats.routes_changed = self.stats.routes_changed.saturating_add(1);
+                    stats.routes_changed = stats.routes_changed.saturating_add(1);
                 }
                 GatewayConnectReport {
                     outcome: GatewayConnectOutcome::AlreadyConnected,
@@ -635,7 +632,7 @@ impl GatewaySessionTable {
             }
             GatewaySessionState::Disconnected { since } => {
                 let disconnected_for = now.get().saturating_sub(since.get());
-                if disconnected_for > self.config.reconnect_grace_ticks {
+                if disconnected_for > reconnect_grace_ticks {
                     session.station_id = station_id;
                     session.connected_at = now;
                     session.last_seen = now;
@@ -645,7 +642,7 @@ impl GatewaySessionTable {
                     session.last_sequence = None;
                     session.command_tick = now;
                     session.commands_this_tick = 0;
-                    self.stats.sessions_expired = self.stats.sessions_expired.saturating_add(1);
+                    stats.sessions_expired = stats.sessions_expired.saturating_add(1);
                     GatewayConnectReport {
                         outcome: GatewayConnectOutcome::ReplacedExpired { disconnected_for },
                         route: session.route(),
@@ -654,8 +651,7 @@ impl GatewaySessionTable {
                     session.station_id = station_id;
                     session.last_seen = now;
                     session.state = GatewaySessionState::Connected;
-                    self.stats.sessions_reconnected =
-                        self.stats.sessions_reconnected.saturating_add(1);
+                    stats.sessions_reconnected = stats.sessions_reconnected.saturating_add(1);
                     GatewayConnectReport {
                         outcome: GatewayConnectOutcome::Reconnected { disconnected_for },
                         route: session.route(),
