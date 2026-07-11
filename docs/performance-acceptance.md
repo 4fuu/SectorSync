@@ -954,6 +954,30 @@ payload bytes, total packets, and aggregate payload work unless
 counts, queue and byte conservation, guard metadata, workload/call/time
 verdicts, and `benchmark_ok=true`.
 
+## Budget Batch Scan Measurement
+
+`BudgetedTransport::send_batch` accumulates saturated aggregate bytes and
+records the first oversized packet during one metadata scan. It checks the
+aggregate result first, preserving the previous error priority when both batch
+and packet limits are exceeded, and never forwards a rejected batch.
+
+Compare the production scan with the previous two-pass shape using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example budget_batch_scan
+cargo run --release -q -p sectorsync-bench --example budget_batch_scan -- --double-scan
+```
+
+The default workload revalidates one prebuilt 100,000-packet batch for ten
+ticks. Seven release runs reduced median p50 from 0.065 ms double-scan to
+0.056 ms single-scan, about 14%, while metadata inspections fell from two
+million to one million. Both paths produce identical aggregate bytes,
+oversized-packet state, and checksum. Guards cap packet count, payload bytes,
+ticks, total inspections, and resident payload work unless `--allow-heavy` is
+present; output includes latency percentiles, inspection/byte/checksum fields,
+guard metadata, workload/inspection/validation/time verdicts, and
+`benchmark_ok=true`.
+
 ## In-Memory Endpoint Lookup Measurement
 
 Client and Station in-memory transport registries use ordered maps below 2,048

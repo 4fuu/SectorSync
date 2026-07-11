@@ -4301,20 +4301,26 @@ impl<T: TransportSink> TransportSink for BudgetedTransport<T> {
     }
 
     fn send_batch(&mut self, batch: PacketBatch) -> Result<(), Self::Error> {
-        let bytes = batch.bytes_len();
+        let mut bytes = 0_usize;
+        let mut first_oversized_packet = None;
+        for packet in &batch.packets {
+            let packet_bytes = packet.bytes.len();
+            bytes = bytes.saturating_add(packet_bytes);
+            if first_oversized_packet.is_none() && packet_bytes > self.max_packet_bytes {
+                first_oversized_packet = Some(packet_bytes);
+            }
+        }
         if bytes > self.max_batch_bytes {
             return Err(TransportError::ByteBudgetExceeded {
                 budget: self.max_batch_bytes,
                 actual: bytes,
             });
         }
-        for packet in &batch.packets {
-            if packet.bytes.len() > self.max_packet_bytes {
-                return Err(TransportError::ByteBudgetExceeded {
-                    budget: self.max_packet_bytes,
-                    actual: packet.bytes.len(),
-                });
-            }
+        if let Some(actual) = first_oversized_packet {
+            return Err(TransportError::ByteBudgetExceeded {
+                budget: self.max_packet_bytes,
+                actual,
+            });
         }
         self.inner.send_batch(batch).map_err(TransportError::Inner)
     }
@@ -4531,6 +4537,45 @@ mod tests {
             }
         );
         assert_eq!(transport.inner().packets_sent(), 0);
+
+        let mut both_limits = PacketBatch::new();
+        both_limits.push(packet(20));
+        let error = transport
+            .send_batch(both_limits)
+            .expect_err("aggregate budget should retain priority");
+        assert_eq!(
+            error,
+            TransportError::ByteBudgetExceeded {
+                budget: 12,
+                actual: 20,
+            }
+        );
+
+        let mut packet_limit = PacketBatch::new();
+        packet_limit.push(packet(8));
+        packet_limit.push(packet(20));
+        let mut packet_budget = BudgetedTransport::new(FakeTransport::default(), 16, 64);
+        let error = packet_budget
+            .send_batch(packet_limit)
+            .expect_err("single packet should exceed budget");
+        assert_eq!(
+            error,
+            TransportError::ByteBudgetExceeded {
+                budget: 16,
+                actual: 20,
+            }
+        );
+        assert_eq!(packet_budget.inner().packets_sent(), 0);
+
+        let mut valid = PacketBatch::new();
+        valid.push(packet(8));
+        valid.push(packet(12));
+        packet_budget
+            .send_batch(valid)
+            .expect("valid batch should forward once");
+        assert_eq!(packet_budget.inner().batches_sent(), 1);
+        assert_eq!(packet_budget.inner().packets_sent(), 2);
+        assert_eq!(packet_budget.inner().bytes_sent(), 20);
     }
 
     #[test]

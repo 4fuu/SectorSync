@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- `BudgetedTransport` batch validation now computes aggregate bytes and records
+  the first oversized packet in one metadata scan while preserving aggregate
+  budget error priority and all-or-nothing forwarding to the inner transport.
 - In-memory Client batch sends now reuse one shared-state lock for bounded
   64-packet segments instead of locking once per packet, preserving ordered
   partial commits while preventing unbounded lock hold times.

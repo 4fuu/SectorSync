@@ -78,6 +78,10 @@ bounded 64-packet segment rather than once per packet. Large batches yield the
 lock between segments so receive and other senders can progress. Packets remain
 ordered; the first failure returns immediately, retains the successfully queued
 prefix and its statistics, and does not process the remaining suffix.
+`BudgetedTransport::send_batch` validates aggregate and per-packet byte limits
+in one metadata scan. It still reports an aggregate batch violation before any
+single-packet violation and forwards only fully valid batches to the wrapped
+transport, so callers do not need different error handling.
 
 ## Per-Tick Order
 

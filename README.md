@@ -230,6 +230,8 @@ cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --release --example in_memory_queue_capacity
 cargo run -p sectorsync-bench --release --example in_memory_batch_send
 cargo run -p sectorsync-bench --release --example in_memory_batch_send -- --per-packet
+cargo run -p sectorsync-bench --release --example budget_batch_scan
+cargo run -p sectorsync-bench --release --example budget_batch_scan -- --double-scan
 cargo run -p sectorsync-bench --release --example endpoint_map_lookup
 cargo run -p sectorsync-bench --release --example endpoint_map_lookup -- --btree
 cargo run -p sectorsync-bench --release --example endpoint_map_lookup -- --double-lookup
