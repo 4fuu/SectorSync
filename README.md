@@ -37,6 +37,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   separate propagation of transport/validation and caller application errors.
 - Bounded command, event, client packet, and station packet queues.
 - Gateway session expiry uses one allocation-free ordered-map retain scan.
+- Gateway client ingress can move ACK buffers directly into transport and
+  return compact counts when per-command reports are not required.
 - Deployment stale-node marking updates state and route epochs in one
   allocation-free ordered-map scan.
 - Event draining retains delayed priority queues in place and supports reusable
@@ -203,6 +205,8 @@ cargo run -p sectorsync-bench --release --example security_seal_reuse -- --fresh
 cargo run -p sectorsync-bench --release --example security_open_reuse
 cargo run -p sectorsync-bench --release --example security_open_reuse -- --fresh-output
 cargo run -p sectorsync-bench --example gateway_session
+cargo run -p sectorsync-bench --release --example gateway_ack_ownership
+cargo run -p sectorsync-bench --release --example gateway_ack_ownership -- --retain-reports
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan -- --collect-remove
 cargo run -p sectorsync-bench --example deployment_routing

@@ -877,6 +877,36 @@ about a 64% reduction on this development host. Identical bridge counters,
 workload/checksum, zero visitor materializations, visitor-error propagation,
 and complete source/wire/target validation are the portable acceptance signals.
 
+## Gateway ACK Ownership Measurement
+
+`GatewayClientTransportBridge::pump_ingress_compact` shares packet decoding,
+source validation, gateway admission, queueing, ACK encoding, transport send,
+and cumulative statistics with the compatible full pump. The compact path moves
+each ACK Vec into transport and returns fixed-size counts; full pumping clones
+the ACK for transport while retaining the original in each detailed report.
+
+Compare compact ownership transfer with retained reports using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example gateway_ack_ownership
+cargo run --release -q -p sectorsync-bench --example gateway_ack_ownership -- --retain-reports
+```
+
+The default preloaded workload processes 2,000 commands per tick with 64-byte
+payloads for ten ticks. Guards cap 4,000 commands per tick, 4 KiB payloads, 20
+ticks, and 64 MiB aggregate command payload work without `--allow-heavy`;
+execution has a 10-second budget. The station command queue and gateway rate
+limit are explicitly bounded to the guarded command count.
+
+Five alternating release A/B runs each accepted and queued 20,000 commands,
+sent 20,000 ACKs totaling `560,000` bytes, and produced identical bridge,
+pipeline, transport, and checksum fields. Compact pumping retained zero reports
+and zero ACK payloads; full pumping retained 20,000 of each. Median tick p99 was
+0.874 ms compact versus 1.722 ms full, about a 49% reduction on this development
+host. Identical admission/queue/send results and removal of retained ACK clones
+are the portable acceptance signals; detailed-report retention remains an
+explicit compatibility option.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

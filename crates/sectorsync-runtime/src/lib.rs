@@ -20,8 +20,8 @@ use sectorsync_core::prelude::{
     ViewerQuery, VisibilityFilter,
 };
 use sectorsync_transport::{
-    OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
-    TransportReceiver, TransportSink,
+    InboundPacket, OutboundPacket, StationOutboundPacket, StationTransportReceiver,
+    StationTransportSink, TransportReceiver, TransportSink,
 };
 use sectorsync_wire::{
     BarrierFrame, BinaryDecodeError, BinaryEncodeError, BinaryFrameDecoder, BinaryFrameEncoder,
@@ -2043,6 +2043,23 @@ impl GatewayClientTransportPump {
     }
 }
 
+/// Compact result of pumping gateway commands without retaining per-command reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GatewayClientTransportSummary {
+    /// Client packets consumed from transport.
+    pub packets_received: usize,
+    /// Client packet bytes consumed from transport.
+    pub bytes_received: usize,
+    /// Commands accepted by the gateway pipeline.
+    pub commands_accepted: usize,
+    /// Commands rejected by the gateway pipeline.
+    pub commands_rejected: usize,
+    /// Command ACK frames submitted to client transport.
+    pub acks_sent: usize,
+    /// Command ACK bytes submitted to client transport.
+    pub ack_bytes_sent: usize,
+}
+
 /// Error produced while pumping gateway-side client command packets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GatewayClientTransportError<E> {
@@ -2145,52 +2162,16 @@ impl GatewayClientTransportBridge {
             else {
                 break;
             };
-            self.stats.packets_received = self.stats.packets_received.saturating_add(1);
-            self.stats.bytes_received =
-                self.stats.bytes_received.saturating_add(packet.bytes.len());
-            pump.packets_received = pump.packets_received.saturating_add(1);
-            pump.bytes_received = pump.bytes_received.saturating_add(packet.bytes.len());
-
-            let command_frame = match pipeline.decode_command_frame(&packet.bytes) {
-                Ok(command_frame) => command_frame,
-                Err(GatewayCommandPipelineError::Decode(error)) => {
-                    return Err(GatewayClientTransportError::Decode(error));
-                }
-                Err(GatewayCommandPipelineError::NonCommandFrame) => {
-                    return Err(GatewayClientTransportError::NonCommandFrame);
-                }
-                Err(error) => {
-                    unreachable!(
-                        "decode_command_frame only returns decode/non-command errors: {error}"
-                    );
-                }
-            };
-            self.stats.command_frames_received =
-                self.stats.command_frames_received.saturating_add(1);
-
-            if let Some(packet_client_id) = packet.client_id
-                && packet_client_id != command_frame.client_id
-            {
-                self.stats.source_mismatches = self.stats.source_mismatches.saturating_add(1);
-                return Err(GatewayClientTransportError::SourceMismatch {
-                    packet_client_id,
-                    frame_client_id: command_frame.client_id,
-                });
-            }
-
-            let ack_client_id = command_frame.client_id;
-            let report = pipeline.process_command_frame(
+            let (ack_client_id, packet_bytes, report) = self.process_ingress_packet::<E>(
+                pipeline,
                 gateway,
                 station_queues,
-                command_frame,
+                &packet,
                 now,
                 ingress,
-            );
-            if report.accepted {
-                self.stats.commands_accepted = self.stats.commands_accepted.saturating_add(1);
-            } else {
-                self.stats.commands_rejected = self.stats.commands_rejected.saturating_add(1);
-            }
+            )?;
+            pump.packets_received = pump.packets_received.saturating_add(1);
+            pump.bytes_received = pump.bytes_received.saturating_add(packet_bytes);
 
             if let Some(bytes) = &report.ack_bytes {
                 let ack_len = bytes.len();
@@ -2208,6 +2189,115 @@ impl GatewayClientTransportBridge {
             pump.reports.push(report);
         }
         Ok(pump)
+    }
+
+    /// Pumps commands and moves ACK buffers directly into transport without
+    /// retaining per-command pipeline reports.
+    ///
+    /// Use [`Self::pump_ingress`] when the caller needs detailed error reports
+    /// or encoded ACK bytes after sending.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn pump_ingress_compact<T, E>(
+        &mut self,
+        transport: &mut T,
+        pipeline: &mut GatewayCommandPipeline,
+        gateway: &mut GatewaySessionTable,
+        station_queues: &mut BTreeMap<StationId, CommandQueues>,
+        now: Tick,
+        ingress: CommandIngress,
+        max_packets: usize,
+    ) -> Result<GatewayClientTransportSummary, GatewayClientTransportError<E>>
+    where
+        T: TransportReceiver<Error = E> + TransportSink<Error = E>,
+    {
+        let mut summary = GatewayClientTransportSummary::default();
+        for _ in 0..max_packets {
+            let Some(packet) = transport
+                .try_recv()
+                .map_err(GatewayClientTransportError::Transport)?
+            else {
+                break;
+            };
+            let (ack_client_id, packet_bytes, mut report) = self.process_ingress_packet::<E>(
+                pipeline,
+                gateway,
+                station_queues,
+                &packet,
+                now,
+                ingress,
+            )?;
+            summary.packets_received = summary.packets_received.saturating_add(1);
+            summary.bytes_received = summary.bytes_received.saturating_add(packet_bytes);
+            if report.accepted {
+                summary.commands_accepted = summary.commands_accepted.saturating_add(1);
+            } else {
+                summary.commands_rejected = summary.commands_rejected.saturating_add(1);
+            }
+
+            if let Some(bytes) = report.ack_bytes.take() {
+                let ack_len = bytes.len();
+                transport
+                    .send(OutboundPacket {
+                        client_id: ack_client_id,
+                        bytes,
+                    })
+                    .map_err(GatewayClientTransportError::Transport)?;
+                self.stats.acks_sent = self.stats.acks_sent.saturating_add(1);
+                self.stats.ack_bytes_sent = self.stats.ack_bytes_sent.saturating_add(ack_len);
+                summary.acks_sent = summary.acks_sent.saturating_add(1);
+                summary.ack_bytes_sent = summary.ack_bytes_sent.saturating_add(ack_len);
+            }
+        }
+        Ok(summary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_ingress_packet<E>(
+        &mut self,
+        pipeline: &mut GatewayCommandPipeline,
+        gateway: &mut GatewaySessionTable,
+        station_queues: &mut BTreeMap<StationId, CommandQueues>,
+        packet: &InboundPacket,
+        now: Tick,
+        ingress: CommandIngress,
+    ) -> Result<(ClientId, usize, GatewayCommandPipelineReport), GatewayClientTransportError<E>>
+    {
+        let packet_bytes = packet.bytes.len();
+        self.stats.packets_received = self.stats.packets_received.saturating_add(1);
+        self.stats.bytes_received = self.stats.bytes_received.saturating_add(packet_bytes);
+        let command_frame = match pipeline.decode_command_frame(&packet.bytes) {
+            Ok(command_frame) => command_frame,
+            Err(GatewayCommandPipelineError::Decode(error)) => {
+                return Err(GatewayClientTransportError::Decode(error));
+            }
+            Err(GatewayCommandPipelineError::NonCommandFrame) => {
+                return Err(GatewayClientTransportError::NonCommandFrame);
+            }
+            Err(error) => {
+                unreachable!(
+                    "decode_command_frame only returns decode/non-command errors: {error}"
+                );
+            }
+        };
+        self.stats.command_frames_received = self.stats.command_frames_received.saturating_add(1);
+        if let Some(packet_client_id) = packet.client_id
+            && packet_client_id != command_frame.client_id
+        {
+            self.stats.source_mismatches = self.stats.source_mismatches.saturating_add(1);
+            return Err(GatewayClientTransportError::SourceMismatch {
+                packet_client_id,
+                frame_client_id: command_frame.client_id,
+            });
+        }
+        let ack_client_id = command_frame.client_id;
+        let report =
+            pipeline.process_command_frame(gateway, station_queues, command_frame, now, ingress);
+        if report.accepted {
+            self.stats.commands_accepted = self.stats.commands_accepted.saturating_add(1);
+        } else {
+            self.stats.commands_rejected = self.stats.commands_rejected.saturating_add(1);
+        }
+        Ok((ack_client_id, packet_bytes, report))
     }
 }
 
@@ -5869,6 +5959,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn gateway_client_transport_bridge_queues_command_and_sends_ack() {
         let client_id = ClientId::new(7);
         let server_id = ClientId::new(0);
@@ -5940,6 +6031,48 @@ mod tests {
         assert_eq!(ack_pump.command_acks_received(), 1);
         assert!(ack_pump.command_acks[0].accepted);
         assert_eq!(ack_pump.command_acks[0].command_id, command.command_id);
+
+        let compact_command = CommandFrame {
+            command_id: CommandId::new(43),
+            sequence: 10,
+            ..command
+        };
+        client_bridge
+            .send_command_frame(&mut client_transport, &compact_command)
+            .expect("second client command should send");
+        let summary = gateway_bridge
+            .pump_ingress_compact(
+                &mut server_transport,
+                &mut pipeline,
+                &mut gateway,
+                &mut station_queues,
+                Tick::new(11),
+                CommandIngress::RUNNING,
+                4,
+            )
+            .expect("compact gateway transport should pump");
+        assert_eq!(summary.packets_received, 1);
+        assert_eq!(summary.commands_accepted, 1);
+        assert_eq!(summary.commands_rejected, 0);
+        assert_eq!(summary.acks_sent, 1);
+        assert!(summary.ack_bytes_sent > 0);
+        let compact_queued = station_queues
+            .get_mut(&station_id)
+            .expect("station queue should exist")
+            .pop_next()
+            .expect("compact command should queue");
+        assert_eq!(compact_queued.id, compact_command.command_id);
+        let compact_ack = client_bridge
+            .pump(&mut client_transport, 4)
+            .expect("client should receive compact ACK");
+        assert_eq!(compact_ack.command_acks_received(), 1);
+        assert_eq!(
+            compact_ack.command_acks[0].command_id,
+            compact_command.command_id
+        );
+        assert_eq!(gateway_bridge.stats().packets_received, 2);
+        assert_eq!(gateway_bridge.stats().commands_accepted, 2);
+        assert_eq!(gateway_bridge.stats().acks_sent, 2);
     }
 
     #[test]

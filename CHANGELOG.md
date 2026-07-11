@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Gateway client transport now offers a compact ingress pump that moves encoded
+  ACK buffers directly into transport and returns fixed-size counts instead of
+  cloning ACKs into retained per-command reports.
 - Replication receive bridges now offer fallible borrowed-frame visitors that
   preserve source/target validation and cumulative statistics while avoiding
   nested owned frame materialization for immediate client-world application.

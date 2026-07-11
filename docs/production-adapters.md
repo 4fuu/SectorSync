@@ -132,6 +132,14 @@ route movement, heartbeat staleness, and offline state.
 `gateway_deployment_dispatch` demonstrates route resolution followed by bounded
 station packet delivery while preserving the gateway-stamped command tick.
 
+Gateway adapters that only need aggregate ingress telemetry should use
+`GatewayClientTransportBridge::pump_ingress_compact`. It transfers ACK buffer
+ownership into the transport and avoids retaining duplicate ACK payloads and
+per-command reports. Use full `pump_ingress` at explicit audit/debug boundaries
+that require detailed rejection errors, delivery metadata, reason codes, or raw
+ACK bytes after send; do not enable that retention accidentally on the steady
+state ingress path.
+
 ## Persistence, Upgrade, And GPU Work
 
 SectorSync snapshots are in-memory values. An external adapter may serialize or

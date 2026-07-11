@@ -74,6 +74,14 @@ The pipeline validates generic session generation, sequence/replay state,
 per-tick admission limits, station route metadata, queue presence, and barrier
 ingress policy. It stamps `received_at` and returns an ACK report.
 
+For the common local-queue path, use
+`GatewayClientTransportBridge::pump_ingress_compact`. It returns fixed-size
+accepted/rejected/ACK counts and moves each encoded ACK Vec directly into the
+transport packet. Use the compatible `pump_ingress` when the caller must retain
+per-command pipeline errors, routing metadata, reason codes, or encoded ACK
+bytes after sending. Both variants share the same packet decode, source check,
+gateway admission, queueing, and accumulated bridge statistics.
+
 Call `GatewaySessionTable::expire_disconnected` at an application-controlled
 maintenance cadence. Expiry performs one allocation-free ordered-map scan,
 retains connected sessions and sessions exactly at the grace boundary, and

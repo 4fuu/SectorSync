@@ -10,8 +10,8 @@ use sectorsync_core::prelude::{
     StationConfig, StationId, U32LeCodec, ViewerQuery,
 };
 use sectorsync_runtime::{
-    ClientTransportBridge, ClientTransportConfig, GATEWAY_COMMAND_ACK_ACCEPTED,
-    GatewayClientTransportBridge, GatewayCommandPipeline, ReplicationTransportBridge,
+    ClientTransportBridge, ClientTransportConfig, GatewayClientTransportBridge,
+    GatewayCommandPipeline, ReplicationTransportBridge,
 };
 use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub};
 use sectorsync_wire::{CommandFrame, ComponentSelection};
@@ -71,7 +71,7 @@ fn main() {
     let mut gateway_pipeline = GatewayCommandPipeline::default();
     let mut gateway_transport = GatewayClientTransportBridge::default();
     let ingress = gateway_transport
-        .pump_ingress(
+        .pump_ingress_compact(
             &mut server_transport,
             &mut gateway_pipeline,
             &mut gateway,
@@ -81,9 +81,8 @@ fn main() {
             4,
         )
         .expect("gateway transport should pump command");
-    assert_eq!(ingress.commands_accepted(), 1);
+    assert_eq!(ingress.commands_accepted, 1);
     assert_eq!(ingress.acks_sent, 1);
-    assert_eq!(ingress.reports[0].reason_code, GATEWAY_COMMAND_ACK_ACCEPTED);
     let applied = station_queues
         .get_mut(&station_id)
         .expect("station queue should exist")
