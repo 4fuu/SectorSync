@@ -570,6 +570,34 @@ collect/remove, about a 67% reduction on this development host. Core tests cover
 connected sessions, the exact grace boundary, stale removal, repeated expiry,
 and cumulative statistics; the benchmark test compares final maps exactly.
 
+## Deployment Stale-Node Scan Measurement
+
+`DeploymentRouteTable::mark_stale_offline` now scans mutable node records once,
+marks only newly stale non-offline nodes, advances route epochs, and accumulates
+both stale-detection and offline counters directly. `stale_nodes` remains an
+ordered allocating query for callers that need IDs. The benchmark compares the
+direct mark with the previous public `stale_nodes` plus `mark_offline` sequence:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example deployment_stale_scan
+cargo run --release -q -p sectorsync-bench --example deployment_stale_scan -- --collect-mark
+```
+
+Snapshot cloning and final route checksum occur outside the measured operation.
+The default workload maintains 5,000 mixed fresh, grace-boundary, stale, and
+already-offline nodes across 500 calls. Guards cap 20,000 nodes, 100 calls per
+tick, and 20 ticks without `--allow-heavy`; execution has a 10-second budget.
+Output includes marked count, route-state/epoch checksum, temporary-id collection
+count, operation percentiles, guard metadata, path/workload verdicts, and
+`benchmark_ok`.
+
+Five alternating release A/B runs marked `625,000` nodes with the same
+`8,750,000` route checksum. The direct path created zero temporary ID collections;
+the comparison created 500 per run. Median operation p99 was 0.069 ms direct
+versus 0.175 ms for collect/mark, about a 61% reduction on this development host.
+Runtime tests cover fresh, exact-boundary, stale, existing-offline, repeated-pass,
+route-epoch, and counter behavior; benchmark tests compare every node route.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

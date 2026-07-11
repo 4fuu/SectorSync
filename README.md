@@ -33,6 +33,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
   buffer growth, while sparse frames conservatively retain normal allocation.
 - Bounded command, event, client packet, and station packet queues.
 - Gateway session expiry uses one allocation-free ordered-map retain scan.
+- Deployment stale-node marking updates state and route epochs in one
+  allocation-free ordered-map scan.
 - Event draining retains delayed priority queues in place and supports reusable
   caller-owned ready output across Stations and ticks.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
@@ -173,6 +175,9 @@ cargo run -p sectorsync-bench --example secure_command_ingress
 cargo run -p sectorsync-bench --example gateway_session
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan
 cargo run -p sectorsync-bench --release --example gateway_expiry_scan -- --collect-remove
+cargo run -p sectorsync-bench --example deployment_routing
+cargo run -p sectorsync-bench --release --example deployment_stale_scan
+cargo run -p sectorsync-bench --release --example deployment_stale_scan -- --collect-mark
 cargo run -p sectorsync-bench --example station_event_transport
 cargo run -p sectorsync-bench --release --example event_drain_reuse
 cargo run -p sectorsync-bench --release --example event_drain_reuse -- --fresh-output

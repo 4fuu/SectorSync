@@ -566,13 +566,20 @@ impl DeploymentRouteTable {
 
     /// Marks stale nodes offline.
     pub fn mark_stale_offline(&mut self, now: Tick) -> usize {
-        let stale = self.stale_nodes(now);
-        self.stats.stale_nodes_detected =
-            self.stats.stale_nodes_detected.saturating_add(stale.len());
-        for node_id in &stale {
-            let _ = self.mark_offline(*node_id);
+        let stale_after = self.config.stale_after_ticks;
+        let mut stale = 0_usize;
+        for node in self.nodes.values_mut() {
+            if node.route.state != DeploymentNodeState::Offline
+                && now.get().saturating_sub(node.route.last_heartbeat.get()) > stale_after
+            {
+                node.route.state = DeploymentNodeState::Offline;
+                node.route.route_epoch = node.route.route_epoch.saturating_add(1);
+                stale = stale.saturating_add(1);
+            }
         }
-        stale.len()
+        self.stats.stale_nodes_detected = self.stats.stale_nodes_detected.saturating_add(stale);
+        self.stats.nodes_offline = self.stats.nodes_offline.saturating_add(stale);
+        stale
     }
 
     fn ensure_node_can_accept(&self, node_id: NodeId) -> Result<(), DeploymentError> {
@@ -803,5 +810,57 @@ mod tests {
                 .state,
             DeploymentNodeState::Offline
         );
+    }
+
+    #[test]
+    fn stale_mark_retains_fresh_boundary_and_existing_offline_nodes() {
+        let mut table = DeploymentRouteTable::new(DeploymentConfig {
+            max_nodes: 4,
+            max_stations_per_node: 1,
+            stale_after_ticks: 3,
+        });
+        for node_id in 1..=4 {
+            table
+                .register_node(NodeId::new(node_id), 1, Tick::new(10))
+                .expect("node should register");
+        }
+        table
+            .heartbeat(NodeId::new(1), Tick::new(15))
+            .expect("fresh heartbeat succeeds");
+        table
+            .heartbeat(NodeId::new(2), Tick::new(12))
+            .expect("boundary heartbeat succeeds");
+        table
+            .mark_offline(NodeId::new(4))
+            .expect("node can be explicitly offline");
+        let offline_before = table.stats().nodes_offline;
+
+        assert_eq!(table.mark_stale_offline(Tick::new(15)), 1);
+        assert_eq!(
+            table.node_route(NodeId::new(1)).expect("fresh node").state,
+            DeploymentNodeState::Online
+        );
+        assert_eq!(
+            table
+                .node_route(NodeId::new(2))
+                .expect("boundary node")
+                .state,
+            DeploymentNodeState::Online
+        );
+        assert_eq!(
+            table.node_route(NodeId::new(3)).expect("stale node").state,
+            DeploymentNodeState::Offline
+        );
+        assert_eq!(
+            table
+                .node_route(NodeId::new(4))
+                .expect("existing offline node")
+                .route_epoch,
+            2
+        );
+        assert_eq!(table.stats().nodes_offline, offline_before + 1);
+        assert_eq!(table.stats().stale_nodes_detected, 1);
+        assert_eq!(table.mark_stale_offline(Tick::new(15)), 0);
+        assert_eq!(table.stats().nodes_offline, offline_before + 1);
     }
 }

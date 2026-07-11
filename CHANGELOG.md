@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Deployment stale-node marking now mutates node state and route epochs in one
+  allocation-free ordered-map scan; the ordered stale-id query remains available
+  for external control planes that need it.
 - Gateway disconnected-session expiry now removes stale records in one
   allocation-free ordered-map retain scan instead of collecting client ids and
   performing a second removal pass.

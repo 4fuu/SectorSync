@@ -85,6 +85,12 @@ stamped envelope through `CommandDispatchTransportBridge`. External service
 discovery decides where the node endpoint is; SectorSync only validates route
 and packet metadata.
 
+Call `DeploymentRouteTable::mark_stale_offline` from an externally scheduled
+heartbeat maintenance pass. It scans node records once, marks newly stale nodes
+Offline, advances their route epochs, and updates detection/offline counters
+without allocating an intermediate ID list. Use `stale_nodes` separately only
+when the embedding control plane actually needs ordered stale IDs.
+
 ### 3. Apply Station-Local Business Work
 
 At the station tick boundary, pop a bounded number of commands from
