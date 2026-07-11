@@ -61,6 +61,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
+- Cell migration scans borrowed index membership and supports caller-owned
+  deduplication, candidate, and report storage across repeated split passes.
 - Periodic load sampling supports caller-owned subscriber, occupancy, Station,
   and per-cell scratch storage across scheduling windows.
 - Ordered Station and spatial-index registries use allocation-free linear lookup

@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Cell migration now scans borrowed cell membership instead of copying one
+  handle Vec per cell, and offers caller-owned reusable deduplication,
+  candidate, and report storage for repeated migration passes.
 - Component storage now supports caller-owned output reuse when removing every
   component for an entity, plus a discard-only cleanup path when removed values
   are not needed; the compatible owned removal API remains available.

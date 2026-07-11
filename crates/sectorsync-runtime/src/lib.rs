@@ -6,7 +6,7 @@ pub mod deployment;
 #[cfg(feature = "parallel")]
 mod parallel;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sectorsync_core::prelude::{
     BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CellLoadSample, CellOccupancy,
@@ -3068,6 +3068,49 @@ pub struct CellMigrationReport {
     pub skipped_duplicate_entities: usize,
 }
 
+/// Caller-owned working storage for repeated cell migration passes.
+#[derive(Clone, Debug, Default)]
+pub struct CellMigrationScratch {
+    seen_handles: HashSet<EntityHandle>,
+    seen_entities: HashSet<EntityId>,
+    entity_ids: Vec<EntityId>,
+}
+
+impl CellMigrationScratch {
+    /// Creates empty migration scratch storage.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves deduplication and candidate storage for an expected pass size.
+    pub fn reserve(&mut self, handles: usize, entities: usize) {
+        self.seen_handles.reserve(handles);
+        self.seen_entities.reserve(entities);
+        self.entity_ids.reserve(entities);
+    }
+
+    /// Retained handle-deduplication capacity.
+    pub fn handle_capacity(&self) -> usize {
+        self.seen_handles.capacity()
+    }
+
+    /// Retained entity-deduplication capacity.
+    pub fn entity_capacity(&self) -> usize {
+        self.seen_entities.capacity()
+    }
+
+    /// Retained candidate entity capacity.
+    pub fn candidate_capacity(&self) -> usize {
+        self.entity_ids.capacity()
+    }
+
+    fn clear(&mut self) {
+        self.seen_handles.clear();
+        self.seen_entities.clear();
+        self.entity_ids.clear();
+    }
+}
+
 /// Cell-level migration error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellMigrationError {
@@ -3116,22 +3159,55 @@ impl CellMigrationExecutor {
         cells: &[CellCoord3],
         ghost_ttl_ticks: u64,
     ) -> Result<CellMigrationReport, CellMigrationError> {
-        let mut report = CellMigrationReport {
+        let mut report = CellMigrationReport::default();
+        let mut scratch = CellMigrationScratch::new();
+        Self::migrate_cells_into(
+            stations,
+            source_index,
+            target_index,
             source_station,
             target_station,
-            scanned_cells: cells.to_vec(),
-            ..CellMigrationReport::default()
-        };
-        let mut seen_handles = BTreeSet::new();
-        let mut entity_ids = Vec::new();
+            cells,
+            ghost_ttl_ticks,
+            &mut scratch,
+            &mut report,
+        )?;
+        Ok(report)
+    }
+
+    /// Migrates cells using caller-owned reusable working and report storage.
+    ///
+    /// The report is reset before processing. As with [`Self::migrate_cells`],
+    /// an error may occur after earlier entities have already migrated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_cells_into(
+        stations: &mut StationSet,
+        source_index: &mut CellIndex,
+        target_index: &mut CellIndex,
+        source_station: StationId,
+        target_station: StationId,
+        cells: &[CellCoord3],
+        ghost_ttl_ticks: u64,
+        scratch: &mut CellMigrationScratch,
+        report: &mut CellMigrationReport,
+    ) -> Result<(), CellMigrationError> {
+        report.source_station = source_station;
+        report.target_station = target_station;
+        report.scanned_cells.clear();
+        report.scanned_cells.extend_from_slice(cells);
+        report.entity_migrations.clear();
+        report.skipped_missing_handles = 0;
+        report.skipped_non_owned = 0;
+        report.skipped_duplicate_entities = 0;
+        scratch.clear();
 
         {
             let source = stations
                 .get(source_station)
                 .ok_or(EntityMigrationError::MissingSource(source_station))?;
             for cell in cells {
-                for handle in source_index.handles_in_cell(*cell) {
-                    if !seen_handles.insert(handle) {
+                for &handle in source_index.handles_in_cell_slice(*cell) {
+                    if !scratch.seen_handles.insert(handle) {
                         report.skipped_duplicate_entities += 1;
                         continue;
                     }
@@ -3140,7 +3216,7 @@ impl CellMigrationExecutor {
                         continue;
                     };
                     if record.is_owned() {
-                        entity_ids.push(record.id);
+                        scratch.entity_ids.push(record.id);
                     } else {
                         report.skipped_non_owned += 1;
                     }
@@ -3148,9 +3224,8 @@ impl CellMigrationExecutor {
             }
         }
 
-        let mut seen_entities = BTreeSet::new();
-        for entity_id in entity_ids {
-            if !seen_entities.insert(entity_id) {
+        for &entity_id in &scratch.entity_ids {
+            if !scratch.seen_entities.insert(entity_id) {
                 report.skipped_duplicate_entities += 1;
                 continue;
             }
@@ -3193,7 +3268,7 @@ impl CellMigrationExecutor {
             report.entity_migrations.push(migration);
         }
 
-        Ok(report)
+        Ok(())
     }
 }
 
@@ -6969,7 +7044,12 @@ mod tests {
         assert_eq!(ownership.owner_of(cell), Some(StationId::new(2)));
         assert_eq!(update.moved_cells, vec![cell]);
 
-        let report = CellMigrationExecutor::migrate_cells(
+        let mut scratch = CellMigrationScratch::new();
+        scratch.reserve(2, 2);
+        let mut report = CellMigrationReport::default();
+        report.scanned_cells.reserve(1);
+        report.entity_migrations.reserve(2);
+        CellMigrationExecutor::migrate_cells_into(
             &mut stations,
             &mut source_index,
             &mut target_index,
@@ -6977,6 +7057,8 @@ mod tests {
             StationId::new(2),
             &update.moved_cells,
             4,
+            &mut scratch,
+            &mut report,
         )
         .expect("cell migration should work");
 
@@ -6998,6 +7080,34 @@ mod tests {
                 .expect("target owner")
                 .is_owned()
         );
+
+        let retained_handle_capacity = scratch.handle_capacity();
+        let retained_entity_capacity = scratch.entity_capacity();
+        let retained_candidate_capacity = scratch.candidate_capacity();
+        let retained_scanned_capacity = report.scanned_cells.capacity();
+        let retained_migration_capacity = report.entity_migrations.capacity();
+        CellMigrationExecutor::migrate_cells_into(
+            &mut stations,
+            &mut source_index,
+            &mut target_index,
+            StationId::new(1),
+            StationId::new(2),
+            &[],
+            4,
+            &mut scratch,
+            &mut report,
+        )
+        .expect("empty reusable migration should work");
+        assert!(report.scanned_cells.is_empty());
+        assert!(report.entity_migrations.is_empty());
+        assert_eq!(report.scanned_cells.capacity(), retained_scanned_capacity);
+        assert_eq!(
+            report.entity_migrations.capacity(),
+            retained_migration_capacity
+        );
+        assert_eq!(scratch.handle_capacity(), retained_handle_capacity);
+        assert_eq!(scratch.entity_capacity(), retained_entity_capacity);
+        assert_eq!(scratch.candidate_capacity(), retained_candidate_capacity);
     }
 
     #[test]

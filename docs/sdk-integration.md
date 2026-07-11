@@ -295,8 +295,15 @@ outlive the scratch borrow.
 Execute ownership changes through `CellMigrationExecutor` or
 `EntityMigrationExecutor` so target ghosts are prewarmed, owner commit is
 single-authority, source ghosts survive the handoff window, and both spatial
-indexes are refreshed. External cluster placement and failover remain outside
-this flow.
+indexes are refreshed. `CellMigrationExecutor::migrate_cells` automatically
+scans borrowed index membership without copying a handle Vec per cell. For
+repeated split execution, retain `CellMigrationScratch` and a
+`CellMigrationReport`, reserve for the expected entity count, and call
+`migrate_cells_into`; both working and result capacity survive subsequent
+passes. As with the owned API, an error can follow already committed earlier
+entity migrations; reusable reports retain successfully completed entries, but
+the application must reconcile authoritative state instead of retrying blindly.
+External cluster placement and failover remain outside this flow.
 
 ### 7. Export Observability
 

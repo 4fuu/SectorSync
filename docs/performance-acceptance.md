@@ -936,6 +936,35 @@ host. A discard run reported 1.741 ms p99. Identical removal counts, bytes, and
 checksums plus zero fresh outputs are the portable acceptance signals; host
 timings are directional rather than a universal guarantee.
 
+## Cell Migration Storage Measurement
+
+`CellMigrationExecutor::migrate_cells` now scans `handles_in_cell_slice`
+directly, avoiding one temporary handle Vec per scanned cell. Repeated passes
+can additionally call `migrate_cells_into` with caller-owned
+`CellMigrationScratch` and `CellMigrationReport` storage; the compatible owned
+API constructs those buffers for occasional migrations.
+
+Compare retained and fresh migration storage using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example cell_migration_reuse
+cargo run --release -q -p sectorsync-bench --example cell_migration_reuse -- --fresh-storage
+```
+
+The default preloaded workload migrates 500 point entities from each of ten
+distinct cells. Station and index capacity are reserved before timing. Guards
+cap 2,000 entities per cell, 20 ticks, and 20,000 aggregate entities without
+`--allow-heavy`; execution has a 10-second budget.
+
+Five alternating release A/B runs each migrated 5,000 entities with a
+`12,502,500` entity-id checksum and identical final target-index counts.
+Reusable migration performed zero fresh-storage passes; the compatible path
+performed ten. Median tick p99 was 0.531 ms reusable versus 0.563 ms fresh,
+about a 5.7% reduction on this development host. Identical migration counts,
+checksums, final index membership, zero fresh-storage passes, and retained
+scratch/report capacities are the portable acceptance signals; host timings
+are directional rather than a universal guarantee.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit
