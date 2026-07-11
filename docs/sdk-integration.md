@@ -54,6 +54,15 @@ Create capacities and ownership explicitly before accepting traffic:
 Do not rely on default limits without checking that they fit the embedding
 application's resource budget.
 
+Core `CommandQueues` and `EventQueues` also start with zero retained slots and
+grow only the priority classes that receive traffic. Drained queues retain peak
+capacity for later ticks. Use `ready_retained_capacity` and
+`total_ready_retained_capacity` for Command queues,
+`barrier_buffer_retained_capacity` for barrier ingress, and
+`retained_capacity` or `total_retained_capacity` for Station Event queues.
+Configured limits remain hard backpressure/drop boundaries rather than eager
+memory reservations.
+
 In-memory Client and Station transport registration starts with zero retained
 packet slots and grows each bounded queue only as traffic arrives. Drained
 queues retain their peak capacity for later bursts. Use `queued_capacity` for a

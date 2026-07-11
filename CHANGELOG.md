@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Core Command and Station Event priority queues now allocate slots on demand
+  instead of reserving every configured maximum at construction; per-priority
+  and aggregate retained capacities are observable for multi-room host metrics.
 - `BudgetedTransport` batch validation now computes aggregate bytes and records
   the first oversized packet in one metadata scan while preserving aggregate
   budget error priority and all-or-nothing forwarding to the inner transport.

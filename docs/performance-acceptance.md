@@ -928,6 +928,30 @@ limits, and bursts unless `--allow-heavy` is present; output includes room
 latency percentiles, exact queue/packet conservation, guard metadata,
 capacity/workload/lazy/time verdicts, and `benchmark_ok=true`.
 
+## Core Queue Capacity Measurement
+
+`CommandQueues` and `EventQueues` construct every priority queue with zero
+retained slots, grow only on accepted traffic, and retain reached capacity
+after draining. Command ready priorities, the barrier buffer, Event priorities,
+and both aggregate ready capacities are directly observable. Queue limits and
+their existing full/drop behavior are unchanged.
+
+Run the guarded multi-room workload with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example core_queue_capacity
+```
+
+The default workload models 100 rooms with one Station each and queues eight
+normal Commands plus eight important Events per Station. It retains 1,600
+slots. Reserving all default priority limits would retain 2,662,400 slots, so
+lazy construction avoids 2,660,800 slots (99.940%) on this workload; a
+zero-burst run retains zero. Guards cap rooms, stations/room, burst size, and
+total queued items unless `--allow-heavy` is present. Output includes exact
+Command/Event counts and capacities, avoided slots/percentage, room latency
+percentiles, guard metadata, workload/capacity/lazy/time verdicts, and
+`benchmark_ok=true`.
+
 ## In-Memory Batch Send Measurement
 
 `InMemoryTransportEndpoint::send_batch` processes packets under bounded

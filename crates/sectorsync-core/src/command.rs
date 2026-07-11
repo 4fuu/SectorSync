@@ -155,9 +155,9 @@ impl CommandQueues {
     pub fn new(limits: CommandQueueLimits) -> Self {
         Self {
             limits,
-            high: VecDeque::with_capacity(limits.high),
-            normal: VecDeque::with_capacity(limits.normal),
-            low: VecDeque::with_capacity(limits.low),
+            high: VecDeque::new(),
+            normal: VecDeque::new(),
+            low: VecDeque::new(),
             barrier_buffer: VecDeque::new(),
         }
     }
@@ -238,6 +238,28 @@ impl CommandQueues {
     /// Returns command count buffered by an active barrier.
     pub fn barrier_buffer_len(&self) -> usize {
         self.barrier_buffer.len()
+    }
+
+    /// Returns slots retained by one ready priority queue.
+    pub fn ready_retained_capacity(&self, priority: CommandPriority) -> usize {
+        match priority {
+            CommandPriority::High => self.high.capacity(),
+            CommandPriority::Normal => self.normal.capacity(),
+            CommandPriority::Low => self.low.capacity(),
+        }
+    }
+
+    /// Returns slots retained across all ready priority queues.
+    pub fn total_ready_retained_capacity(&self) -> usize {
+        self.high
+            .capacity()
+            .saturating_add(self.normal.capacity())
+            .saturating_add(self.low.capacity())
+    }
+
+    /// Returns slots retained by the barrier buffer.
+    pub fn barrier_buffer_retained_capacity(&self) -> usize {
+        self.barrier_buffer.capacity()
     }
 
     /// Maximum commands retained while a barrier buffers ingress.
@@ -326,6 +348,52 @@ mod tests {
         assert_eq!(queues.pop_next().expect("high").id, CommandId::new(2));
         assert_eq!(queues.pop_next().expect("normal").id, CommandId::new(3));
         assert_eq!(queues.pop_next().expect("low").id, CommandId::new(1));
+    }
+
+    #[test]
+    fn command_queues_allocate_lazily_and_retain_peak_capacity() {
+        let mut queues = CommandQueues::new(CommandQueueLimits::default());
+        assert_eq!(queues.total_ready_retained_capacity(), 0);
+        assert_eq!(queues.barrier_buffer_retained_capacity(), 0);
+
+        for (offset, priority) in [
+            CommandPriority::High,
+            CommandPriority::Normal,
+            CommandPriority::Low,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for index in 0..8 {
+                queues
+                    .push(
+                        command(
+                            u64::try_from(offset * 8 + index).expect("test id fits u64"),
+                            priority,
+                        ),
+                        CommandIngress::RUNNING,
+                    )
+                    .expect("ready burst should queue");
+            }
+            assert!(queues.ready_retained_capacity(priority) >= 8);
+        }
+        let ready_peak = queues.total_ready_retained_capacity();
+        while queues.pop_next().is_some() {}
+        assert_eq!(queues.total_ready_retained_capacity(), ready_peak);
+
+        let frozen = CommandIngress {
+            barrier_state: BarrierState::Frozen,
+            command_mode: CommandQueueMode::Buffer,
+        };
+        for index in 0..8 {
+            queues
+                .push(command(100 + index, CommandPriority::Normal), frozen)
+                .expect("barrier burst should queue");
+        }
+        let barrier_peak = queues.barrier_buffer_retained_capacity();
+        assert!(barrier_peak >= 8);
+        assert_eq!(queues.clear_barrier_buffer(), 8);
+        assert_eq!(queues.barrier_buffer_retained_capacity(), barrier_peak);
     }
 
     #[test]

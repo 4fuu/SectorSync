@@ -114,9 +114,9 @@ impl EventQueues {
     pub fn new(limits: EventQueueLimits) -> Self {
         Self {
             limits,
-            critical: VecDeque::with_capacity(limits.critical),
-            important: VecDeque::with_capacity(limits.important),
-            best_effort: VecDeque::with_capacity(limits.best_effort),
+            critical: VecDeque::new(),
+            important: VecDeque::new(),
+            best_effort: VecDeque::new(),
         }
     }
 
@@ -180,6 +180,23 @@ impl EventQueues {
     /// Returns whether all queues are empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Returns slots retained by one event priority queue.
+    pub fn retained_capacity(&self, priority: EventPriority) -> usize {
+        match priority {
+            EventPriority::Critical => self.critical.capacity(),
+            EventPriority::Important => self.important.capacity(),
+            EventPriority::BestEffort => self.best_effort.capacity(),
+        }
+    }
+
+    /// Returns slots retained across all event priority queues.
+    pub fn total_retained_capacity(&self) -> usize {
+        self.critical
+            .capacity()
+            .saturating_add(self.important.capacity())
+            .saturating_add(self.best_effort.capacity())
     }
 }
 
@@ -251,5 +268,34 @@ mod tests {
             [EventId::new(1), EventId::new(4), EventId::new(6)]
         );
         assert!(queues.is_empty());
+    }
+
+    #[test]
+    fn event_queues_allocate_lazily_and_retain_peak_capacity() {
+        let mut queues = EventQueues::new(EventQueueLimits::default());
+        assert_eq!(queues.total_retained_capacity(), 0);
+
+        for (offset, priority) in [
+            EventPriority::Critical,
+            EventPriority::Important,
+            EventPriority::BestEffort,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for index in 0..8 {
+                queues
+                    .push(event(
+                        u64::try_from(offset * 8 + index).expect("test id fits u64"),
+                        priority,
+                        0,
+                    ))
+                    .expect("event burst should queue");
+            }
+            assert!(queues.retained_capacity(priority) >= 8);
+        }
+        let peak = queues.total_retained_capacity();
+        while queues.pop_next().is_some() {}
+        assert_eq!(queues.total_retained_capacity(), peak);
     }
 }
