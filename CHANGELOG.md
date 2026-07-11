@@ -30,6 +30,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Point entities crossing cells now retain their entity-cell membership storage
   and update it in place instead of removing and rebuilding the entity index
   mapping.
+- Component storage now supports validated in-place slice updates and
+  caller-owned typed encoding scratch, avoiding repeated blob-buffer allocation
+  on high-frequency component writes.
 
 ## [2026.7.10] - 2026-07-10
 

@@ -22,6 +22,7 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Range, frustum, tag, cadence, priority, and byte-budget replication filters.
 - Reusable caller-owned query and replication scratch buffers.
 - Explicit Station, spatial-index, and component-column capacity reservation.
+- Reusable typed-component encoding scratch and in-place blob byte updates.
 - Bounded command, event, client packet, and station packet queues.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
   event frames.
@@ -226,8 +227,10 @@ runner reports planning, movement, and encoding phase p99 values separately.
 Use `--moving-percent` to exercise indexed entity movement;
 `--cross-cell-movement` switches from sub-cell movement to adjacent-cell
 movement, while `--force-index-reinsert` exists only for an old-path A/B
-comparison. This measures spatial planning and wire encoding, not gameplay,
-matchmaking, room lifecycle, persistence, or network capacity.
+comparison. Use `--component-update-percent` to exercise repeated component
+writes; `--force-component-replace` is its allocation/replacement comparison.
+This measures spatial planning and wire encoding, not gameplay, matchmaking,
+room lifecycle, persistence, or network capacity.
 
 For explicit parallel planning, `ParallelReplicationScratch` retains at most one
 planning scratch lane per configured worker, not per Station batch. The

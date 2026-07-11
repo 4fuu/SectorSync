@@ -87,7 +87,10 @@ rechecks authoritative ownership, and applies its rule-specific work. Feed the
 result back through controlled APIs such as:
 
 - `Station::move_owned` and `Station::set_tags` for authoritative built-ins.
-- `ComponentStore::set` or `set_typed` for external component data.
+- `ComponentStore::set_blob` or `set_typed` for occasional external component
+  data. For repeated writes, retain a caller-owned `ComponentEncodeScratch` and
+  call `set_typed_with_scratch`; use `set_blob_from_slice` when compact bytes
+  are already available. Existing blob capacity is reused when sufficient.
 - `CellIndex::upsert` after transform/bounds changes. Point updates that remain
   in the same cell avoid index mutation and allocation automatically; point
   updates that cross cells retain their entity-cell list and update the mapping

@@ -46,6 +46,13 @@ enum MovementPattern {
     CrossCell,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ComponentUpdateMode {
+    #[default]
+    InPlace,
+    ForceReplace,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Config {
     rooms: usize,
@@ -57,6 +64,8 @@ struct Config {
     entities_per_room: usize,
     component_bytes: usize,
     dirty_percent: usize,
+    component_update_percent: usize,
+    component_update_mode: ComponentUpdateMode,
     moving_percent: usize,
     movement_pattern: MovementPattern,
     index_update_mode: IndexUpdateMode,
@@ -80,6 +89,8 @@ impl Default for Config {
             entities_per_room: 0,
             component_bytes: DEFAULT_COMPONENT_BYTES,
             dirty_percent: DEFAULT_DIRTY_PERCENT,
+            component_update_percent: 0,
+            component_update_mode: ComponentUpdateMode::InPlace,
             moving_percent: 0,
             movement_pattern: MovementPattern::SameCell,
             index_update_mode: IndexUpdateMode::SameCellFastPath,
@@ -109,6 +120,11 @@ impl Config {
             } else {
                 MovementPattern::SameCell
             },
+            component_update_mode: if args.iter().any(|arg| arg == "--force-component-replace") {
+                ComponentUpdateMode::ForceReplace
+            } else {
+                ComponentUpdateMode::InPlace
+            },
             ..Self::default()
         };
         for arg in args {
@@ -130,6 +146,9 @@ impl Config {
                 config.component_bytes = parse_usize(value, config.component_bytes);
             } else if let Some(value) = arg.strip_prefix("--dirty-percent=") {
                 config.dirty_percent = parse_usize(value, config.dirty_percent);
+            } else if let Some(value) = arg.strip_prefix("--component-update-percent=") {
+                config.component_update_percent =
+                    parse_usize(value, config.component_update_percent);
             } else if let Some(value) = arg.strip_prefix("--moving-percent=") {
                 config.moving_percent = parse_usize(value, config.moving_percent);
             } else if let Some(value) = arg.strip_prefix("--ticks=") {
@@ -154,6 +173,7 @@ impl Config {
         self.entities_per_player = self.entities_per_player.max(1);
         self.component_bytes = self.component_bytes.max(1);
         self.dirty_percent = self.dirty_percent.min(100);
+        self.component_update_percent = self.component_update_percent.min(100);
         self.moving_percent = self.moving_percent.min(100);
         self.ticks = self.ticks.max(1);
         self.time_budget_ms = self.time_budget_ms.max(1);
@@ -179,6 +199,7 @@ impl Config {
             || before.entities_per_room != self.entities_per_room
             || before.component_bytes != self.component_bytes
             || before.dirty_percent != self.dirty_percent
+            || before.component_update_percent != self.component_update_percent
             || before.moving_percent != self.moving_percent
             || before.ticks != self.ticks;
     }
@@ -219,6 +240,8 @@ struct StationWork {
     scratch: ReplicationScratch,
     batch_scratch: ReplicationBatchScratch,
     moving_entities: Vec<(EntityHandle, Position3)>,
+    updating_components: Vec<EntityHandle>,
+    component_payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -234,6 +257,7 @@ struct Stats {
     planning_ms: Vec<f64>,
     encoding_ms: Vec<f64>,
     movement_ms: Vec<f64>,
+    component_update_ms: Vec<f64>,
     room_updates: usize,
     viewer_queries: usize,
     selected_entities: usize,
@@ -248,8 +272,44 @@ struct Stats {
     index_updates_inserted: usize,
     index_updates_unchanged: usize,
     index_updates_relocated: usize,
+    component_updates: usize,
+    component_updates_in_place: usize,
+    component_updates_replaced: usize,
     ticks_completed: usize,
     time_budget_exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    Pass,
+    Fail,
+}
+
+impl Check {
+    const fn from_bool(value: bool) -> Self {
+        if value { Self::Pass } else { Self::Fail }
+    }
+
+    const fn passed(self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Verdicts {
+    workload: Check,
+    retained_capacity: Check,
+    movement: Check,
+    component_updates: Check,
+}
+
+impl Verdicts {
+    const fn all(self) -> bool {
+        self.workload.passed()
+            && self.retained_capacity.passed()
+            && self.movement.passed()
+            && self.component_updates.passed()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -272,6 +332,12 @@ struct RetainedCapacity {
     component_column_slots: usize,
 }
 
+struct ReplicationWorkload {
+    selection: ComponentSelection,
+    builder: ReplicationFrameBuilder,
+    budget: ReplicationBudget,
+}
+
 fn main() {
     let config = Config::from_args(env::args().skip(1));
     let setup_start = Instant::now();
@@ -283,13 +349,13 @@ fn main() {
     let stats = run(&mut rooms, config);
     let elapsed = run_start.elapsed();
     let sweep_p99 = percentile_ms(&stats.sweep_ms, 0.99);
-    let workload_ok = workload_completed(config, inventory, &stats);
-    let retained_capacity_ok = retained_capacity_sufficient(inventory, retained);
-    let movement_ok = movement_updates_succeeded(config, &stats);
-    let benchmark_ok = workload_ok
-        && retained_capacity_ok
-        && movement_ok
-        && sweep_p99 <= config.sweep_p99_budget_ms;
+    let verdicts = Verdicts {
+        workload: Check::from_bool(workload_completed(config, inventory, &stats)),
+        retained_capacity: Check::from_bool(retained_capacity_sufficient(inventory, retained)),
+        movement: Check::from_bool(movement_updates_succeeded(config, &stats)),
+        component_updates: Check::from_bool(component_updates_succeeded(config, &stats)),
+    };
+    let benchmark_ok = verdicts.all() && sweep_p99 <= config.sweep_p99_budget_ms;
 
     println!("SectorSync many-room single-thread benchmark");
     println!("single_thread=true");
@@ -325,6 +391,7 @@ fn main() {
     println!("component_bytes={}", config.component_bytes);
     println!("dirty_percent={}", config.dirty_percent);
     println!("dirty_distribution=per-room-scaled");
+    print_component_update_config(config);
     print_movement_config(config);
     println!("preallocate={}", config.preallocate);
     println!("ticks={}", config.ticks);
@@ -343,7 +410,25 @@ fn main() {
         stats.batch_entity_capacity_max
     );
     print_movement_stats(&stats);
+    print_component_update_stats(&stats);
     println!("setup_ms={setup_ms:.3}");
+    print_latency_stats(&stats, sweep_p99);
+    println!("threshold_sweep_ms_p99={:.3}", config.sweep_p99_budget_ms);
+    println!(
+        "threshold_sweep_ok={}",
+        sweep_p99 <= config.sweep_p99_budget_ms
+    );
+    print_verdicts(verdicts);
+    println!("time_budget_ms={}", config.time_budget_ms);
+    println!("time_budget_exhausted={}", stats.time_budget_exhausted);
+    println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1_000.0);
+    println!("benchmark_ok={benchmark_ok}");
+    if !benchmark_ok {
+        std::process::exit(1);
+    }
+}
+
+fn print_latency_stats(stats: &Stats, sweep_p99: f64) {
     println!("sweep_ms_p50={:.3}", percentile_ms(&stats.sweep_ms, 0.50));
     println!("sweep_ms_p95={:.3}", percentile_ms(&stats.sweep_ms, 0.95));
     println!("sweep_ms_p99={sweep_p99:.3}");
@@ -360,19 +445,21 @@ fn main() {
         "movement_ms_p99={:.3}",
         percentile_ms(&stats.movement_ms, 0.99)
     );
-    println!("threshold_sweep_ms_p99={:.3}", config.sweep_p99_budget_ms);
     println!(
-        "threshold_sweep_ok={}",
-        sweep_p99 <= config.sweep_p99_budget_ms
+        "component_update_ms_p99={:.3}",
+        percentile_ms(&stats.component_update_ms, 0.99)
     );
-    print_verdicts(workload_ok, retained_capacity_ok, movement_ok);
-    println!("time_budget_ms={}", config.time_budget_ms);
-    println!("time_budget_exhausted={}", stats.time_budget_exhausted);
-    println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1_000.0);
-    println!("benchmark_ok={benchmark_ok}");
-    if !benchmark_ok {
-        std::process::exit(1);
-    }
+}
+
+fn print_component_update_config(config: Config) {
+    println!(
+        "component_update_percent={}",
+        config.component_update_percent
+    );
+    println!(
+        "component_update_in_place={}",
+        config.component_update_mode == ComponentUpdateMode::InPlace
+    );
 }
 
 fn print_movement_config(config: Config) {
@@ -423,6 +510,21 @@ fn movement_updates_succeeded(config: Config, stats: &Stats) -> bool {
     }
 }
 
+fn component_updates_succeeded(config: Config, stats: &Stats) -> bool {
+    if config.component_update_percent == 0 {
+        stats.component_updates == 0
+    } else {
+        let expected_updates = match config.component_update_mode {
+            ComponentUpdateMode::InPlace => stats.component_updates_in_place,
+            ComponentUpdateMode::ForceReplace => stats.component_updates_replaced,
+        };
+        stats.component_updates > 0
+            && expected_updates == stats.component_updates
+            && stats.component_updates_in_place + stats.component_updates_replaced
+                == stats.component_updates
+    }
+}
+
 fn print_movement_stats(stats: &Stats) {
     println!("index_updates={}", stats.index_updates);
     println!("index_updates_inserted={}", stats.index_updates_inserted);
@@ -430,11 +532,39 @@ fn print_movement_stats(stats: &Stats) {
     println!("index_updates_relocated={}", stats.index_updates_relocated);
 }
 
-fn print_verdicts(workload_ok: bool, retained_capacity_ok: bool, movement_ok: bool) {
-    println!("threshold_workload_completed_ok={workload_ok}");
-    println!("threshold_retained_capacity_ok={retained_capacity_ok}");
-    println!("threshold_movement_updates_ok={movement_ok}");
-    println!("threshold_same_cell_movement_ok={movement_ok}");
+fn print_component_update_stats(stats: &Stats) {
+    println!("component_updates={}", stats.component_updates);
+    println!(
+        "component_updates_in_place={}",
+        stats.component_updates_in_place
+    );
+    println!(
+        "component_updates_replaced={}",
+        stats.component_updates_replaced
+    );
+}
+
+fn print_verdicts(verdicts: Verdicts) {
+    println!(
+        "threshold_workload_completed_ok={}",
+        verdicts.workload.passed()
+    );
+    println!(
+        "threshold_retained_capacity_ok={}",
+        verdicts.retained_capacity.passed()
+    );
+    println!(
+        "threshold_movement_updates_ok={}",
+        verdicts.movement.passed()
+    );
+    println!(
+        "threshold_same_cell_movement_ok={}",
+        verdicts.movement.passed()
+    );
+    println!(
+        "threshold_component_updates_ok={}",
+        verdicts.component_updates.passed()
+    );
 }
 
 fn print_retained_capacity(retained: RetainedCapacity) {
@@ -482,13 +612,7 @@ fn create_rooms(config: Config) -> Vec<Room> {
     let mut next_station_id = 1_u32;
     let mut next_client_id = 1_u64;
     let mut next_entity_id = 1_u64;
-    let component_descriptor = ComponentDescriptor::sparse_blob(
-        ComponentId::new(1),
-        "benchmark",
-        ComponentSyncMode::Delta,
-        ComponentMigrationMode::Copy,
-        config.component_bytes,
-    );
+    let component_descriptor = benchmark_component_descriptor(config.component_bytes);
     (0..config.rooms)
         .map(|room_index| {
             let instance_id = InstanceId::new(
@@ -511,6 +635,8 @@ fn create_rooms(config: Config) -> Vec<Room> {
                         entity_capacity,
                         config.preallocate,
                         config.moving_percent,
+                        config.component_update_percent,
+                        config.component_bytes,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -545,6 +671,10 @@ fn create_rooms(config: Config) -> Vec<Room> {
                     stations[station_index]
                         .moving_entities
                         .push((handle, position));
+                }
+                let component_update_bucket = entity_index.saturating_mul(100) / entities.max(1);
+                if component_update_bucket < config.component_update_percent {
+                    stations[station_index].updating_components.push(handle);
                 }
                 stations[station_index]
                     .components
@@ -582,6 +712,8 @@ fn create_station_work(
     entity_capacity: usize,
     preallocate: bool,
     moving_percent: usize,
+    component_update_percent: usize,
+    component_bytes: usize,
 ) -> StationWork {
     let grid = GridSpec::new(32.0).expect("valid benchmark grid");
     let mut components = ComponentStore::default();
@@ -612,6 +744,16 @@ fn create_station_work(
         moving_entities: Vec::with_capacity(
             entity_capacity.saturating_mul(moving_percent).div_ceil(100),
         ),
+        updating_components: Vec::with_capacity(
+            entity_capacity
+                .saturating_mul(component_update_percent)
+                .div_ceil(100),
+        ),
+        component_payload: if component_update_percent == 0 {
+            Vec::new()
+        } else {
+            vec![0; component_bytes]
+        },
     }
 }
 
@@ -625,6 +767,16 @@ fn create_policies() -> PolicyTable {
     let mut policies = PolicyTable::default();
     policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 1, 30, 128.0));
     policies
+}
+
+fn benchmark_component_descriptor(component_bytes: usize) -> ComponentDescriptor {
+    ComponentDescriptor::sparse_blob(
+        ComponentId::new(1),
+        "benchmark",
+        ComponentSyncMode::Delta,
+        ComponentMigrationMode::Copy,
+        component_bytes,
+    )
 }
 
 fn inventory(rooms: &[Room]) -> Inventory {
@@ -669,19 +821,8 @@ fn retained_capacity(rooms: &[Room]) -> RetainedCapacity {
 
 fn run(rooms: &mut [Room], config: Config) -> Stats {
     let policies = create_policies();
-    let selection = ComponentSelection {
-        component_ids: vec![ComponentId::new(1)],
-    };
-    let builder = ReplicationFrameBuilder::new(ReplicationFrameLimits {
-        max_entity_deltas: 128,
-        max_components_per_entity: 1,
-        max_component_bytes: config.component_bytes,
-    });
-    let budget = ReplicationBudget {
-        max_entities: 128,
-        max_bytes: 128 * 32,
-        estimated_entity_bytes: 32,
-    };
+    let component_descriptor = benchmark_component_descriptor(config.component_bytes);
+    let replication = create_replication_workload(config.component_bytes);
     let started = Instant::now();
     let time_budget = Duration::from_millis(config.time_budget_ms);
     let mut stats = Stats::default();
@@ -693,19 +834,28 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
         }
         let sweep_start = Instant::now();
         let mut movement_elapsed = Duration::ZERO;
+        let mut component_update_elapsed = Duration::ZERO;
         let mut planning_elapsed = Duration::ZERO;
         let mut encoding_elapsed = Duration::ZERO;
         for room in &mut *rooms {
             for work in &mut room.stations {
                 work.station.advance_tick();
                 movement_elapsed += move_indexed_entities(work, &mut stats, config);
+                if config.component_update_percent > 0 {
+                    component_update_elapsed += update_components(
+                        work,
+                        &component_descriptor,
+                        &mut stats,
+                        config.component_update_mode,
+                    );
+                }
                 let planning_start = Instant::now();
                 let batch = ReplicationPlanner::plan_for_viewers_range_into(
                     &work.station,
                     &work.index,
                     &policies,
                     &work.viewers,
-                    budget,
+                    replication.budget,
                     &mut work.scratch,
                     &mut work.batch_scratch,
                 );
@@ -716,14 +866,15 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
                 let encoding_start = Instant::now();
                 for (viewer, plan) in work.viewers.iter().zip(batch.plans) {
                     let mut bytes = Vec::new();
-                    let build_stats = builder
+                    let build_stats = replication
+                        .builder
                         .encode_binary_into(
                             viewer.client_id,
                             work.station.tick(),
                             &work.station,
                             plan,
                             &work.components,
-                            &selection,
+                            &replication.selection,
                             &mut bytes,
                         )
                         .expect("guarded benchmark frame should encode");
@@ -750,22 +901,97 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
             }
             stats.room_updates = stats.room_updates.saturating_add(1);
         }
-        stats
-            .sweep_ms
-            .push(sweep_start.elapsed().as_secs_f64() * 1_000.0);
-        stats
-            .planning_ms
-            .push(planning_elapsed.as_secs_f64() * 1_000.0);
-        stats
-            .movement_ms
-            .push(movement_elapsed.as_secs_f64() * 1_000.0);
-        stats
-            .encoding_ms
-            .push(encoding_elapsed.as_secs_f64() * 1_000.0);
+        push_tick_latencies(
+            &mut stats,
+            sweep_start.elapsed(),
+            planning_elapsed,
+            encoding_elapsed,
+            movement_elapsed,
+            component_update_elapsed,
+        );
         stats.ticks_completed = stats.ticks_completed.saturating_add(1);
         stats.time_budget_exhausted |= started.elapsed() >= time_budget;
     }
     stats
+}
+
+fn create_replication_workload(component_bytes: usize) -> ReplicationWorkload {
+    ReplicationWorkload {
+        selection: ComponentSelection {
+            component_ids: vec![ComponentId::new(1)],
+        },
+        builder: ReplicationFrameBuilder::new(ReplicationFrameLimits {
+            max_entity_deltas: 128,
+            max_components_per_entity: 1,
+            max_component_bytes: component_bytes,
+        }),
+        budget: ReplicationBudget {
+            max_entities: 128,
+            max_bytes: 128 * 32,
+            estimated_entity_bytes: 32,
+        },
+    }
+}
+
+fn push_tick_latencies(
+    stats: &mut Stats,
+    sweep: Duration,
+    planning: Duration,
+    encoding: Duration,
+    movement: Duration,
+    component_update: Duration,
+) {
+    const MILLIS_PER_SECOND: f64 = 1_000.0;
+    stats.sweep_ms.push(sweep.as_secs_f64() * MILLIS_PER_SECOND);
+    stats
+        .planning_ms
+        .push(planning.as_secs_f64() * MILLIS_PER_SECOND);
+    stats
+        .encoding_ms
+        .push(encoding.as_secs_f64() * MILLIS_PER_SECOND);
+    stats
+        .movement_ms
+        .push(movement.as_secs_f64() * MILLIS_PER_SECOND);
+    stats
+        .component_update_ms
+        .push(component_update.as_secs_f64() * MILLIS_PER_SECOND);
+}
+
+fn update_components(
+    work: &mut StationWork,
+    descriptor: &ComponentDescriptor,
+    stats: &mut Stats,
+    mode: ComponentUpdateMode,
+) -> Duration {
+    let started = Instant::now();
+    if let Some(first) = work.component_payload.first_mut() {
+        *first = work.station.tick().get().to_le_bytes()[0];
+    }
+    for &handle in &work.updating_components {
+        let version = work.station.tick().get();
+        match mode {
+            ComponentUpdateMode::InPlace => work
+                .components
+                .set_blob_from_slice(descriptor, handle, version, &work.component_payload)
+                .expect("guarded in-place component update should fit"),
+            ComponentUpdateMode::ForceReplace => work
+                .components
+                .set_blob(descriptor, handle, version, work.component_payload.clone())
+                .expect("guarded replacement component update should fit"),
+        }
+        stats.component_updates = stats.component_updates.saturating_add(1);
+        match mode {
+            ComponentUpdateMode::InPlace => {
+                stats.component_updates_in_place =
+                    stats.component_updates_in_place.saturating_add(1);
+            }
+            ComponentUpdateMode::ForceReplace => {
+                stats.component_updates_replaced =
+                    stats.component_updates_replaced.saturating_add(1);
+            }
+        }
+    }
+    started.elapsed()
 }
 
 fn move_indexed_entities(work: &mut StationWork, stats: &mut Stats, config: Config) -> Duration {
@@ -867,6 +1093,64 @@ mod tests {
     }
 
     #[test]
+    fn component_updates_are_in_place_by_default_and_replace_only_for_comparison() {
+        assert_eq!(
+            Config::default().component_update_mode,
+            ComponentUpdateMode::InPlace
+        );
+        let config = Config::from_args(["--force-component-replace".to_owned()].into_iter());
+        assert_eq!(
+            config.component_update_mode,
+            ComponentUpdateMode::ForceReplace
+        );
+    }
+
+    #[test]
+    fn component_update_workload_records_in_place_updates() {
+        let config = Config {
+            rooms: 1,
+            min_players: 1,
+            max_players: 1,
+            players_per_station: 1,
+            entities_per_player: 2,
+            component_update_percent: 100,
+            ticks: 2,
+            sweep_p99_budget_ms: f64::MAX,
+            ..Config::default()
+        };
+        let mut rooms = create_rooms(config);
+        let stats = run(&mut rooms, config);
+
+        assert_eq!(stats.component_updates, 4);
+        assert_eq!(stats.component_updates_in_place, 4);
+        assert_eq!(stats.component_updates_replaced, 0);
+        assert!(component_updates_succeeded(config, &stats));
+    }
+
+    #[test]
+    fn component_update_comparison_records_replacements() {
+        let config = Config {
+            rooms: 1,
+            min_players: 1,
+            max_players: 1,
+            players_per_station: 1,
+            entities_per_player: 2,
+            component_update_percent: 100,
+            component_update_mode: ComponentUpdateMode::ForceReplace,
+            ticks: 1,
+            sweep_p99_budget_ms: f64::MAX,
+            ..Config::default()
+        };
+        let mut rooms = create_rooms(config);
+        let stats = run(&mut rooms, config);
+
+        assert_eq!(stats.component_updates, 2);
+        assert_eq!(stats.component_updates_in_place, 0);
+        assert_eq!(stats.component_updates_replaced, 2);
+        assert!(component_updates_succeeded(config, &stats));
+    }
+
+    #[test]
     fn forced_reinsert_comparison_records_inserted_updates() {
         let config = Config {
             rooms: 1,
@@ -925,6 +1209,7 @@ mod tests {
                 "--entities-per-room=1000",
                 "--component-bytes=1000",
                 "--dirty-percent=1000",
+                "--component-update-percent=1000",
                 "--moving-percent=1000",
                 "--ticks=100",
             ]
@@ -939,6 +1224,7 @@ mod tests {
         assert_eq!(config.entities_per_room, GUARD_MAX_ENTITIES_PER_ROOM);
         assert_eq!(config.component_bytes, GUARD_MAX_COMPONENT_BYTES);
         assert_eq!(config.dirty_percent, 100);
+        assert_eq!(config.component_update_percent, 100);
         assert_eq!(config.moving_percent, 100);
         assert_eq!(config.ticks, GUARD_MAX_TICKS);
         assert!(config.guard_applied);

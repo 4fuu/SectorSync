@@ -273,6 +273,23 @@ entry. The same 447,232-update workload reported median movement p99 of
 29.919 ms versus 36.810 ms, and median total time of 208.854 ms versus
 261.278 ms across three alternating release A/B runs.
 
+Use `--component-update-percent` to rewrite a deterministic share of component
+blobs before replication planning on every sweep. The default path uses
+`set_blob_from_slice` to retain existing blob byte capacity;
+`--force-component-replace` allocates a new payload and replaces the stored blob
+for comparison. The runner reports `component_updates`,
+`component_updates_in_place`, `component_updates_replaced`,
+`component_update_ms_p99`, `component_update_in_place`, and
+`threshold_component_updates_ok`.
+
+In the 500-room, 4-10 player, 16-entities-per-player shape with 32-byte
+components and 100% component updates, three alternating release A/B runs each
+performed 447,232 writes. Median component-update p99 was 5.653 ms in place
+versus 9.855 ms with replacement, median sweep p99 was 29.158 ms versus
+32.465 ms, and median total time was 193.121 ms versus 219.395 ms. The isolated
+component phase improved in every run; whole-sweep figures also include normal
+planning and encoding variance.
+
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or
 matchmaking. Treat it as evidence for active-room spatial planning and encoding,
