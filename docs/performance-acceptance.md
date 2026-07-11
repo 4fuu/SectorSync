@@ -510,7 +510,9 @@ planning calls per tick, and 20 ticks. Without `--allow-heavy`, guards cap 64
 rooms, ten players, 512 entities per room, 100 calls per tick, and 30 ticks;
 execution also has a 10-second budget. Output retains room/player/entity guard
 metadata, selected checksum, fresh-output count, retained slot/entity capacity,
-latency percentiles, path/workload verdicts, and `benchmark_ok`.
+pool thread and active scratch-lane counts, latency percentiles,
+path/workload/lane-utilization verdicts, and `benchmark_ok`. With 12 rooms and
+the bounded two-thread pool, both lanes must be active.
 
 Five alternating release A/B runs produced the same `2,764,800` selected
 checksum. The reusable path created zero fresh results and retained 12 Station

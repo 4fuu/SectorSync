@@ -237,6 +237,12 @@ scratch lane per configured worker. Steady-state multi-room loops should use
 plan/entity capacity. Consume or encode that view before the next planning call.
 Cadence, priority, per-client tracking, and send state must remain explicit.
 
+Parallel planning partitions by Station/room so a scratch lane never carries
+implicit cross-room state. Active lanes are `min(pool threads, room batches)`;
+submit independent rooms together to fill the pool. A single room remains one
+deterministic batch unless the embedding application explicitly partitions its
+caller-owned viewer set.
+
 Sparse-update integrations can use
 `plan_for_viewer_eligible_with_scratch_into` or
 `plan_for_viewers_eligible_into` to reject entities before they consume the
@@ -322,6 +328,11 @@ in-memory transport endpoints. Ordered runtime registries preserve the relative
 order of survivors. Router and transport teardown return discarded queue counts
 so integrations can require zero backlog or account for intentional loss before
 reusing an identifier.
+
+Use a separate `InMemoryTransportHub` per independent room or test shard, as in
+`dynamic_gameplay`. A hub intentionally serializes its endpoint registry,
+queues, batch partial-commit rules, and statistics under one lock; it is a
+bounded in-process adapter, not the production cross-room network transport.
 
 ### 5. Handle Barriers Explicitly
 

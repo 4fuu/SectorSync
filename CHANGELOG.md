@@ -35,6 +35,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Parallel multi-room acceptance now verifies active scratch lanes against the
+  bounded pool, and integration guidance makes per-room in-memory transport
+  sharding explicit.
 - Guarded planner baselines now share identical phased viewer, command, event,
   gateway, and client-bridge workloads, and benchmark acceptance verifies
   selected update counts and deterministic work checksums against an

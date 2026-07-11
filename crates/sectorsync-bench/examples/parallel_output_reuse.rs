@@ -126,6 +126,8 @@ struct RunStats {
     fresh_outputs: usize,
     retained_batch_slots: usize,
     retained_entity_capacity: usize,
+    pool_threads: usize,
+    active_scratch_lanes: usize,
     ticks_completed: usize,
     time_budget_exhausted: bool,
 }
@@ -147,6 +149,7 @@ fn main() {
         && stats.ticks_completed == config.ticks
         && !stats.time_budget_exhausted
         && stats.selected_checksum > 0
+        && stats.active_scratch_lanes == stats.pool_threads.min(config.rooms)
         && output_path_ok;
 
     println!("SectorSync parallel output reuse benchmark");
@@ -167,6 +170,8 @@ fn main() {
     println!("calls={}", stats.calls);
     println!("selected_checksum={}", stats.selected_checksum);
     println!("fresh_outputs={}", stats.fresh_outputs);
+    println!("pool_threads={}", stats.pool_threads);
+    println!("active_scratch_lanes={}", stats.active_scratch_lanes);
     println!("retained_batch_slots={}", stats.retained_batch_slots);
     println!(
         "retained_entity_capacity={}",
@@ -177,6 +182,10 @@ fn main() {
     println!("tick_ms_p99={:.3}", percentile_ms(&stats.tick_ms, 0.99));
     println!("tick_ms_max={:.3}", percentile_ms(&stats.tick_ms, 1.00));
     println!("threshold_output_path_ok={output_path_ok}");
+    println!(
+        "threshold_lane_utilization_ok={}",
+        stats.active_scratch_lanes == stats.pool_threads.min(config.rooms)
+    );
     println!(
         "threshold_workload_completed_ok={}",
         stats.calls == expected_calls
@@ -299,6 +308,8 @@ fn run(world: &World, config: Config) -> RunStats {
     }
     stats.retained_batch_slots = scratch.retained_batch_slots();
     stats.retained_entity_capacity = scratch.retained_entity_capacity();
+    stats.pool_threads = pool.threads();
+    stats.active_scratch_lanes = scratch.lanes();
     stats.time_budget_exhausted |= started.elapsed() >= time_budget;
     stats
 }
