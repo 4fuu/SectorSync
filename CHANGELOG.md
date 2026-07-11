@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- In-memory Client and Station transport queues now allocate packet slots on
+  demand instead of reserving each configured queue maximum at registration;
+  retained per-queue and aggregate capacities are observable for host metrics.
 - Security replay and reliable Client/Station duplicate-suppression windows now
   choose their bounded lookup index from configured capacity: compact ordered
   sets for small histories and faster hash lookup for histories of 256 or more.

@@ -1664,12 +1664,11 @@ impl InMemoryTransportHub {
         remote_addr: SocketAddr,
     ) -> Result<Option<SocketAddr>, InMemoryTransportError> {
         let mut inner = self.lock_inner()?;
-        let queue_capacity = inner.limits.max_queued_packets_per_client;
         let old_addr = inner.clients.insert(
             client_id,
             InMemoryTransportClient {
                 remote_addr,
-                queue: VecDeque::with_capacity(queue_capacity),
+                queue: VecDeque::new(),
             },
         );
         let previous_addr = old_addr.map(|client| client.remote_addr);
@@ -1710,6 +1709,28 @@ impl InMemoryTransportHub {
             .clients
             .get(&client_id)
             .map(|client| client.queue.len()))
+    }
+
+    /// Returns packet slots retained by one client queue.
+    pub fn queued_capacity(
+        &self,
+        client_id: ClientId,
+    ) -> Result<Option<usize>, InMemoryTransportError> {
+        let inner = self.lock_inner()?;
+        Ok(inner
+            .clients
+            .get(&client_id)
+            .map(|client| client.queue.capacity()))
+    }
+
+    /// Returns packet slots retained across all registered client queues.
+    pub fn retained_queue_capacity(&self) -> Result<usize, InMemoryTransportError> {
+        let inner = self.lock_inner()?;
+        Ok(inner
+            .clients
+            .values()
+            .map(|client| client.queue.capacity())
+            .sum())
     }
 
     /// Returns configured limits.
@@ -3570,14 +3591,22 @@ impl InMemoryStationTransport {
 
     /// Registers a target station queue.
     pub fn register_station(&mut self, station_id: StationId) {
-        self.queues
-            .entry(station_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.limits.max_queued_packets_per_station));
+        self.queues.entry(station_id).or_default();
     }
 
     /// Returns queued packet count for a station.
     pub fn queued_len(&self, station_id: StationId) -> Option<usize> {
         self.queues.get(&station_id).map(VecDeque::len)
+    }
+
+    /// Returns packet slots retained by one station queue.
+    pub fn queued_capacity(&self, station_id: StationId) -> Option<usize> {
+        self.queues.get(&station_id).map(VecDeque::capacity)
+    }
+
+    /// Returns packet slots retained across all registered station queues.
+    pub fn retained_queue_capacity(&self) -> usize {
+        self.queues.values().map(VecDeque::capacity).sum()
     }
 
     /// Returns configured limits.
@@ -4872,6 +4901,45 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_transport_queues_allocate_lazily_and_retain_peak_capacity() {
+        let client_id = ClientId::new(7);
+        let server_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::default();
+        let mut client = hub
+            .endpoint(client_id, memory_addr(20007))
+            .expect("client should register");
+        let mut server = hub
+            .endpoint(server_id, memory_addr(20000))
+            .expect("server should register");
+        assert_eq!(
+            hub.retained_queue_capacity().expect("capacity should read"),
+            0
+        );
+
+        for _ in 0..8 {
+            client
+                .send(OutboundPacket {
+                    client_id: server_id,
+                    bytes: vec![1],
+                })
+                .expect("burst packet should send");
+        }
+        let peak = hub
+            .queued_capacity(server_id)
+            .expect("capacity should read")
+            .expect("server should remain registered");
+        assert!(peak >= 8);
+        for _ in 0..8 {
+            assert!(server.try_recv().expect("receive should work").is_some());
+        }
+        assert_eq!(
+            hub.queued_capacity(server_id)
+                .expect("capacity should read"),
+            Some(peak)
+        );
+    }
+
+    #[test]
     fn in_memory_transport_rejects_full_queue_and_large_packet() {
         let client_id = ClientId::new(7);
         let server_id = ClientId::new(0);
@@ -5379,6 +5447,33 @@ mod tests {
         assert_eq!(packet.bytes, vec![1; 4]);
         assert_eq!(transport.stats().packets_sent, 1);
         assert_eq!(transport.stats().packets_received, 1);
+    }
+
+    #[test]
+    fn in_memory_station_queues_allocate_lazily_and_retain_peak_capacity() {
+        let target = StationId::new(2);
+        let mut transport = InMemoryStationTransport::default();
+        transport.register_station(target);
+        assert_eq!(transport.retained_queue_capacity(), 0);
+
+        for _ in 0..8 {
+            transport
+                .send_station(station_packet(1))
+                .expect("burst packet should send");
+        }
+        let peak = transport
+            .queued_capacity(target)
+            .expect("station should remain registered");
+        assert!(peak >= 8);
+        for _ in 0..8 {
+            assert!(
+                transport
+                    .try_recv_station(target)
+                    .expect("receive should work")
+                    .is_some()
+            );
+        }
+        assert_eq!(transport.queued_capacity(target), Some(peak));
     }
 
     #[test]

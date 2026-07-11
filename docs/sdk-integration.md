@@ -54,6 +54,14 @@ Create capacities and ownership explicitly before accepting traffic:
 Do not rely on default limits without checking that they fit the embedding
 application's resource budget.
 
+In-memory Client and Station transport registration starts with zero retained
+packet slots and grows each bounded queue only as traffic arrives. Drained
+queues retain their peak capacity for later bursts. Use `queued_capacity` for a
+specific endpoint and `retained_queue_capacity` for aggregate host metrics;
+the configured queue maximum remains a backpressure boundary, not an eager
+per-endpoint allocation. Applications should still choose limits from their
+worst acceptable backlog and payload budget.
+
 ## Per-Tick Order
 
 ### 1. Validate Before SectorSync

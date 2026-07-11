@@ -903,6 +903,31 @@ does not show a latency improvement. The portable benefit is removal of
 per-datagram owned payload allocation for immediate consumers, not a claim that
 UDP syscall latency decreases.
 
+## In-Memory Queue Capacity Measurement
+
+`InMemoryTransportHub` and `InMemoryStationTransport` register empty queues
+without reserving their configured packet maximum. Queues grow on demand,
+retain reached capacity after draining, and continue to reject packets at the
+same explicit queue limit. Per-endpoint `queued_capacity` and aggregate
+`retained_queue_capacity` expose retained packet slots without estimating heap
+bytes from allocator-specific details.
+
+Run the guarded multi-room capacity workload with:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example in_memory_queue_capacity
+```
+
+The default workload models 100 rooms with ten Client queues and one Station
+queue each, a 4,096-packet bound, and an eight-packet burst per target. It
+delivered all 8,800 packets and retained 8,800 queue slots. Reserving every
+configured maximum at registration would retain 4,509,696 slots, so lazy
+registration avoided 4,500,896 slots (99.805%) on this workload. A zero-burst
+run retains zero slots. Guards cap rooms, clients/room, stations/room, queue
+limits, and bursts unless `--allow-heavy` is present; output includes room
+latency percentiles, exact queue/packet conservation, guard metadata,
+capacity/workload/lazy/time verdicts, and `benchmark_ok=true`.
+
 ## Replication Receive Visitor Measurement
 
 `ReplicationReceiveBridge::pump_visit` consumes transport packets, validates
