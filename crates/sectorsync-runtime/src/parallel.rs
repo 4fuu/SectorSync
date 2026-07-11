@@ -97,6 +97,7 @@ pub struct ParallelReplicationScratch {
     lanes: Vec<ReplicationScratch>,
     batches: Vec<ReplicationBatchScratch>,
     active_batches: usize,
+    active_lanes: usize,
 }
 
 impl ParallelReplicationScratch {
@@ -106,12 +107,18 @@ impl ParallelReplicationScratch {
             lanes: Vec::new(),
             batches: Vec::new(),
             active_batches: 0,
+            active_lanes: 0,
         }
     }
 
     /// Number of worker scratch lanes currently retained.
     pub fn lanes(&self) -> usize {
         self.lanes.len()
+    }
+
+    /// Number of logical lane partitions used by the completed planning call.
+    pub const fn active_lanes(&self) -> usize {
+        self.active_lanes
     }
 
     /// Number of Station batch output slots retained for later calls.
@@ -146,6 +153,14 @@ fn partition_bounds(items: usize, partitions: usize, partition: usize) -> Range<
     let start = partition * base + partition.min(remainder);
     let len = base + usize::from(partition < remainder);
     start..start + len
+}
+
+fn chunked_logical_lanes(items: usize, retained_lanes: usize) -> usize {
+    if retained_lanes == 0 {
+        0
+    } else {
+        items.div_ceil(items.div_ceil(retained_lanes))
+    }
 }
 
 /// Ordered station results and merged aggregate statistics.
@@ -246,6 +261,7 @@ impl ReplicationThreadPool {
     {
         let lanes = self.threads.min(batches.len());
         scratch.prepare_lanes(lanes);
+        scratch.active_lanes = lanes;
         let partitioned = self.pool.install(|| {
             scratch
                 .lanes
@@ -285,6 +301,7 @@ impl ReplicationThreadPool {
     ) -> ParallelReplicationResult {
         let lanes = self.threads.min(batches.len());
         scratch.prepare_lanes(lanes);
+        scratch.active_lanes = lanes;
         let partitioned = self.pool.install(|| {
             scratch
                 .lanes
@@ -327,6 +344,7 @@ impl ReplicationThreadPool {
         let lanes = self.threads.min(batches.len());
         scratch.prepare_lanes(lanes);
         scratch.prepare_output(batches.len());
+        scratch.active_lanes = chunked_logical_lanes(batches.len(), lanes);
         if lanes != 0 {
             let chunk_size = batches.len().div_ceil(lanes);
             self.pool.install(|| {
@@ -364,6 +382,7 @@ impl ReplicationThreadPool {
         let lanes = self.threads.min(batches.len());
         scratch.prepare_lanes(lanes);
         scratch.prepare_output(batches.len());
+        scratch.active_lanes = chunked_logical_lanes(batches.len(), lanes);
         if lanes != 0 {
             let chunk_size = batches.len().div_ceil(lanes);
             self.pool.install(|| {
@@ -415,6 +434,7 @@ mod tests {
         assert_eq!(partition_bounds(10, 3, 0), 0..4);
         assert_eq!(partition_bounds(10, 3, 1), 4..7);
         assert_eq!(partition_bounds(10, 3, 2), 7..10);
+        assert_eq!(chunked_logical_lanes(5, 4), 3);
     }
 
     #[test]

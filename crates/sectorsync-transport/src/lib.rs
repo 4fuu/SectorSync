@@ -14,6 +14,7 @@ use sectorsync_core::prelude::{ClientId, StationId, Tick};
 const HASHED_BOUNDED_SET_MIN_CAPACITY: usize = 256;
 const HASHED_ENDPOINT_MAP_MIN_ENTRIES: usize = 2_048;
 const IN_MEMORY_BATCH_LOCK_PACKETS: usize = 64;
+const RETRY_DEADLINE_COMPACTION_MULTIPLE: usize = 4;
 
 #[derive(Clone, Debug)]
 enum AdaptiveEndpointMap<K, V> {
@@ -1723,6 +1724,7 @@ impl std::error::Error for InMemoryTransportError {}
 #[derive(Clone, Debug)]
 struct InMemoryTransportClient {
     remote_addr: SocketAddr,
+    registration_token: u64,
     queue: VecDeque<InboundPacket>,
 }
 
@@ -1732,6 +1734,7 @@ struct InMemoryTransportInner {
     clients: AdaptiveEndpointMap<ClientId, InMemoryTransportClient>,
     addr_to_client: HashMap<SocketAddr, ClientId>,
     stats: InMemoryTransportStats,
+    next_registration_token: u64,
 }
 
 /// Shared bounded in-memory client packet hub.
@@ -1760,6 +1763,7 @@ impl InMemoryTransportHub {
                 clients: AdaptiveEndpointMap::new(),
                 addr_to_client: HashMap::new(),
                 stats: InMemoryTransportStats::default(),
+                next_registration_token: 1,
             })),
         }
     }
@@ -1771,10 +1775,13 @@ impl InMemoryTransportHub {
         remote_addr: SocketAddr,
     ) -> Result<Option<SocketAddr>, InMemoryTransportError> {
         let mut inner = self.lock_inner()?;
+        let registration_token = inner.next_registration_token;
+        inner.next_registration_token = inner.next_registration_token.wrapping_add(1).max(1);
         let old_addr = inner.clients.insert(
             client_id,
             InMemoryTransportClient {
                 remote_addr,
+                registration_token,
                 queue: VecDeque::new(),
             },
         );
@@ -1803,8 +1810,15 @@ impl InMemoryTransportHub {
     /// Returns an endpoint handle for a client that should already be
     /// registered.
     pub fn endpoint_for_registered(&self, client_id: ClientId) -> InMemoryTransportEndpoint {
+        let registration_token = self.lock_inner().ok().and_then(|inner| {
+            inner
+                .clients
+                .get(&client_id)
+                .map(|client| client.registration_token)
+        });
         InMemoryTransportEndpoint {
             local_client_id: client_id,
+            registration_token,
             hub: self.clone(),
         }
     }
@@ -1888,6 +1902,7 @@ impl Default for InMemoryTransportHub {
 #[derive(Clone, Debug)]
 pub struct InMemoryTransportEndpoint {
     local_client_id: ClientId,
+    registration_token: Option<u64>,
     hub: InMemoryTransportHub,
 }
 
@@ -1900,15 +1915,17 @@ impl InMemoryTransportEndpoint {
     /// Returns the local endpoint address.
     pub fn local_addr(&self) -> Result<Option<SocketAddr>, InMemoryTransportError> {
         let inner = self.hub.lock_inner()?;
-        Ok(inner
-            .clients
-            .get(&self.local_client_id)
-            .map(|client| client.remote_addr))
+        let client = inner.clients.get(&self.local_client_id);
+        if client.map(|client| client.registration_token) != self.registration_token {
+            return Err(InMemoryTransportError::MissingLocal(self.local_client_id));
+        }
+        Ok(client.map(|client| client.remote_addr))
     }
 
     fn send_locked(
         inner: &mut InMemoryTransportInner,
         local_client_id: ClientId,
+        registration_token: Option<u64>,
         packet: OutboundPacket,
     ) -> Result<(), InMemoryTransportError> {
         let actual = packet.bytes.len();
@@ -1925,6 +1942,7 @@ impl InMemoryTransportEndpoint {
         let source_addr = inner
             .clients
             .get(&local_client_id)
+            .filter(|client| Some(client.registration_token) == registration_token)
             .ok_or(InMemoryTransportError::MissingLocal(local_client_id))?
             .remote_addr;
         let target = inner
@@ -1954,7 +1972,12 @@ impl TransportSink for InMemoryTransportEndpoint {
 
     fn send(&mut self, packet: OutboundPacket) -> Result<(), Self::Error> {
         let mut inner = self.hub.lock_inner()?;
-        Self::send_locked(&mut inner, self.local_client_id, packet)
+        Self::send_locked(
+            &mut inner,
+            self.local_client_id,
+            self.registration_token,
+            packet,
+        )
     }
 
     fn send_batch(&mut self, batch: PacketBatch) -> Result<(), Self::Error> {
@@ -1965,7 +1988,12 @@ impl TransportSink for InMemoryTransportEndpoint {
                 let Some(packet) = packets.next() else {
                     return Ok(());
                 };
-                Self::send_locked(&mut inner, self.local_client_id, packet)?;
+                Self::send_locked(
+                    &mut inner,
+                    self.local_client_id,
+                    self.registration_token,
+                    packet,
+                )?;
             }
         }
         Ok(())
@@ -1980,6 +2008,7 @@ impl TransportReceiver for InMemoryTransportEndpoint {
         let local = inner
             .clients
             .get_mut(&self.local_client_id)
+            .filter(|client| Some(client.registration_token) == self.registration_token)
             .ok_or(InMemoryTransportError::MissingLocal(self.local_client_id))?;
         let Some(packet) = local.queue.pop_front() else {
             return Ok(None);
@@ -2434,8 +2463,32 @@ impl ReliableClientSender {
             .is_some();
         if removed {
             self.stats.acks_received = self.stats.acks_received.saturating_add(1);
+            self.compact_retry_deadlines_if_stale();
         }
         removed
+    }
+
+    fn compact_retry_deadlines_if_stale(&mut self) {
+        if self.retry_deadlines.len()
+            > self
+                .in_flight
+                .len()
+                .saturating_mul(RETRY_DEADLINE_COMPACTION_MULTIPLE)
+        {
+            self.retry_deadlines = self
+                .in_flight
+                .values()
+                .map(|packet| {
+                    Reverse((
+                        packet
+                            .last_sent_tick
+                            .saturating_add(self.config.retry_after_ticks),
+                        packet.peer_client,
+                        packet.sequence,
+                    ))
+                })
+                .collect();
+        }
     }
 
     /// Retries due in-flight packets.
@@ -3243,8 +3296,32 @@ impl ReliableStationSender {
             .is_some();
         if removed {
             self.stats.acks_received = self.stats.acks_received.saturating_add(1);
+            self.compact_retry_deadlines_if_stale();
         }
         removed
+    }
+
+    fn compact_retry_deadlines_if_stale(&mut self) {
+        if self.retry_deadlines.len()
+            > self
+                .in_flight
+                .len()
+                .saturating_mul(RETRY_DEADLINE_COMPACTION_MULTIPLE)
+        {
+            self.retry_deadlines = self
+                .in_flight
+                .values()
+                .map(|packet| {
+                    Reverse((
+                        packet
+                            .last_sent_tick
+                            .saturating_add(self.config.retry_after_ticks),
+                        packet.target_station,
+                        packet.sequence,
+                    ))
+                })
+                .collect();
+        }
     }
 
     /// Retries due in-flight packets.
@@ -6510,5 +6587,91 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn reliable_ack_churn_compacts_client_and_station_deadlines() {
+        let peer = ClientId::new(2);
+        let mut client_transport = FakeTransport::default();
+        let mut client = ReliableClientSender::default();
+        for tick in 0..100 {
+            let sequence = client
+                .send(
+                    &mut client_transport,
+                    OutboundPacket {
+                        client_id: peer,
+                        bytes: vec![1],
+                    },
+                    tick,
+                )
+                .expect("send succeeds");
+            assert!(client.acknowledge(peer, sequence));
+            assert!(client.retry_deadlines.len() <= RETRY_DEADLINE_COMPACTION_MULTIPLE);
+        }
+
+        let source = StationId::new(1);
+        let target = StationId::new(2);
+        let mut station_transport = InMemoryStationTransport::default();
+        station_transport.register_station(target);
+        let mut station = ReliableStationSender::default();
+        for tick in 0..100 {
+            let sequence = station
+                .send(
+                    &mut station_transport,
+                    StationOutboundPacket {
+                        source_station: source,
+                        target_station: target,
+                        bytes: vec![1],
+                    },
+                    tick,
+                )
+                .expect("send succeeds");
+            assert!(station.acknowledge(target, sequence));
+            assert!(station.retry_deadlines.len() <= RETRY_DEADLINE_COMPACTION_MULTIPLE);
+        }
+    }
+
+    #[test]
+    fn stale_in_memory_endpoint_does_not_revive_after_reregistration() {
+        let hub = InMemoryTransportHub::default();
+        let id = ClientId::new(1);
+        let peer_id = ClientId::new(2);
+        let mut stale = hub.endpoint(id, memory_addr(24001)).expect("register old");
+        let mut peer = hub
+            .endpoint(peer_id, memory_addr(24002))
+            .expect("register peer");
+        let stale_clone = stale.clone();
+        hub.unregister_client(id).expect("unregister old");
+        let mut current = hub.endpoint(id, memory_addr(24003)).expect("register new");
+
+        assert!(
+            matches!(stale.local_addr(), Err(InMemoryTransportError::MissingLocal(found)) if found == id)
+        );
+        assert!(
+            matches!(stale.send(OutboundPacket { client_id: peer_id, bytes: vec![1] }), Err(InMemoryTransportError::MissingLocal(found)) if found == id)
+        );
+        assert!(
+            matches!(stale.try_recv(), Err(InMemoryTransportError::MissingLocal(found)) if found == id)
+        );
+        assert!(
+            matches!(stale_clone.local_addr(), Err(InMemoryTransportError::MissingLocal(found)) if found == id)
+        );
+        peer.send(OutboundPacket {
+            client_id: id,
+            bytes: vec![7],
+        })
+        .expect("new endpoint receives");
+        assert_eq!(
+            current.local_addr().expect("current valid"),
+            Some(memory_addr(24003))
+        );
+        assert_eq!(
+            current
+                .try_recv()
+                .expect("receive current")
+                .expect("packet")
+                .bytes,
+            vec![7]
+        );
     }
 }

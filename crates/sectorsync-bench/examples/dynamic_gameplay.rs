@@ -412,7 +412,9 @@ fn run(
 fn collect_room_stats(rooms: &[Room], stats: &mut Stats) {
     for room in rooms {
         stats.world_checksum = stats.world_checksum.wrapping_add(room_checksum(room));
-        stats.tracker_records = stats.tracker_records.saturating_add(room.tracker.len());
+        stats.tracker_records = stats
+            .tracker_records
+            .saturating_add(room.tracker.stats().sent_records);
         stats.tracker_acks = stats
             .tracker_acks
             .saturating_add(room.tracker.stats().acked_records);
@@ -992,9 +994,10 @@ fn benchmark_ok(config: Config, stats: &Stats) -> bool {
         && stats.encoded_bytes == stats.decoded_bytes
         && stats.packet_oversize == 0
         && stats.viewer_plans == stats.packets_sent
-        && stats.selected_entities >= stats.encoded_entities
+        && stats.selected_entities == stats.encoded_entities
+        && stats.skipped_entities_by_frame_bytes == 0
         && stats.encoded_entities > 0
-        && stats.tracker_acks >= stats.tracker_records
+        && stats.tracker_acks == stats.tracker_records
         && stats.rooms_destroyed == expected_recreates
         && stats.rooms_created == config.rooms.saturating_add(expected_recreates)
         && stats.endpoints_unregistered == expected_endpoints
@@ -1119,7 +1122,12 @@ fn print_thresholds(
         "threshold_transport_conservation_ok={}",
         stats.packets_sent == stats.packets_received && stats.encoded_bytes == stats.decoded_bytes
     );
-    println!("threshold_packet_budget_ok={}", stats.packet_oversize == 0);
+    println!(
+        "threshold_packet_budget_ok={}",
+        stats.packet_oversize == 0
+            && stats.selected_entities == stats.encoded_entities
+            && stats.skipped_entities_by_frame_bytes == 0
+    );
     println!(
         "threshold_compact_components_ok={}",
         stats.registered_component_columns == config.rooms.saturating_mul(3)

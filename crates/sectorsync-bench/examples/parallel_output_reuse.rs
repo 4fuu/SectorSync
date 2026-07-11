@@ -149,7 +149,7 @@ fn main() {
         && stats.ticks_completed == config.ticks
         && !stats.time_budget_exhausted
         && stats.selected_checksum > 0
-        && stats.active_scratch_lanes == stats.pool_threads.min(config.rooms)
+        && stats.active_scratch_lanes == expected_active_lanes(stats.pool_threads, config.rooms)
         && output_path_ok;
 
     println!("SectorSync parallel output reuse benchmark");
@@ -184,7 +184,7 @@ fn main() {
     println!("threshold_output_path_ok={output_path_ok}");
     println!(
         "threshold_lane_utilization_ok={}",
-        stats.active_scratch_lanes == stats.pool_threads.min(config.rooms)
+        stats.active_scratch_lanes == expected_active_lanes(stats.pool_threads, config.rooms)
     );
     println!(
         "threshold_workload_completed_ok={}",
@@ -309,9 +309,18 @@ fn run(world: &World, config: Config) -> RunStats {
     stats.retained_batch_slots = scratch.retained_batch_slots();
     stats.retained_entity_capacity = scratch.retained_entity_capacity();
     stats.pool_threads = pool.threads();
-    stats.active_scratch_lanes = scratch.lanes();
+    stats.active_scratch_lanes = scratch.active_lanes();
     stats.time_budget_exhausted |= started.elapsed() >= time_budget;
     stats
+}
+
+fn expected_active_lanes(pool_threads: usize, batches: usize) -> usize {
+    let lanes = pool_threads.min(batches);
+    if lanes == 0 {
+        0
+    } else {
+        batches.div_ceil(batches.div_ceil(lanes))
+    }
 }
 
 #[allow(
