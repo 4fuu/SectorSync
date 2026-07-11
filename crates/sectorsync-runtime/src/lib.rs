@@ -14,9 +14,9 @@ use sectorsync_core::prelude::{
     ComponentStore, EntityHandle, EntityId, EventQueueError, EventQueueLimits, EventQueues,
     GatewayError, GatewaySessionTable, HandoffTransfer, HotspotDecision, HotspotPlanner,
     HotspotSeverity, HotspotThresholds, NodeId, OwnerEpoch, PolicyTable, PushOutcome,
-    ReplicationBudget, ReplicationPlan, ReplicationPlanner, RuntimeBarrier, RuntimeUpgradeHook,
-    SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
-    StationLoadSample, StationSnapshot, Tick, ViewerQuery, VisibilityFilter,
+    ReplicationBudget, ReplicationPlan, ReplicationPlanner, ReplicationScratch, RuntimeBarrier,
+    RuntimeUpgradeHook, SnapshotVersion, SplitProposal, Station, StationError, StationEvent,
+    StationId, StationLoadSample, StationSnapshot, Tick, ViewerQuery, VisibilityFilter,
 };
 use sectorsync_transport::{
     OutboundPacket, StationOutboundPacket, StationTransportReceiver, StationTransportSink,
@@ -136,6 +136,7 @@ impl<E> From<BinaryEncodeError> for ReplicationTransportError<E> {
 pub struct ReplicationTransportBridge {
     config: ReplicationTransportConfig,
     builder: ReplicationFrameBuilder,
+    planning_scratch: Option<ReplicationScratch>,
     stats: ReplicationTransportStats,
 }
 
@@ -145,6 +146,7 @@ impl ReplicationTransportBridge {
         Self {
             config,
             builder,
+            planning_scratch: None,
             stats: ReplicationTransportStats {
                 viewers_planned: 0,
                 frames_skipped_empty: 0,
@@ -191,13 +193,14 @@ impl ReplicationTransportBridge {
         T: TransportSink,
         F: VisibilityFilter,
     {
-        let plan = ReplicationPlanner::plan_for_viewer(
+        let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
             station,
             index,
             policies,
             viewer,
             filter,
             self.config.budget,
+            self.planning_scratch.get_or_insert_default(),
         );
         self.send_plan(
             transport,
@@ -229,7 +232,7 @@ impl ReplicationTransportBridge {
         F: VisibilityFilter,
         L: Fn(EntityHandle) -> Option<Tick>,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_with_cadence(
+        let plan = ReplicationPlanner::plan_for_viewer_with_cadence_and_scratch(
             station,
             index,
             policies,
@@ -237,6 +240,7 @@ impl ReplicationTransportBridge {
             filter,
             self.config.budget,
             last_sent,
+            self.planning_scratch.get_or_insert_default(),
         );
         self.send_plan(
             transport,
@@ -266,13 +270,14 @@ impl ReplicationTransportBridge {
         T: TransportSink,
         F: VisibilityFilter,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_prioritized(
+        let plan = ReplicationPlanner::plan_for_viewer_prioritized_with_scratch(
             station,
             index,
             policies,
             viewer,
             filter,
             self.config.budget,
+            self.planning_scratch.get_or_insert_default(),
         );
         self.send_plan(
             transport,
@@ -304,7 +309,7 @@ impl ReplicationTransportBridge {
         F: VisibilityFilter,
         L: Fn(EntityHandle) -> Option<Tick>,
     {
-        let plan = ReplicationPlanner::plan_for_viewer_prioritized_with_cadence(
+        let plan = ReplicationPlanner::plan_for_viewer_prioritized_with_cadence_and_scratch(
             station,
             index,
             policies,
@@ -312,6 +317,7 @@ impl ReplicationTransportBridge {
             filter,
             self.config.budget,
             last_sent,
+            self.planning_scratch.get_or_insert_default(),
         );
         self.send_plan(
             transport,
@@ -353,10 +359,16 @@ impl ReplicationTransportBridge {
             .entities_skipped_by_cadence
             .saturating_add(plan.stats.skipped_by_cadence);
 
-        let build =
-            self.builder
-                .build(client_id, server_tick, station, plan, components, selection);
-        let build_stats = build.stats;
+        let mut bytes = Vec::new();
+        let build_stats = self.builder.encode_binary_into(
+            client_id,
+            server_tick,
+            station,
+            plan,
+            components,
+            selection,
+            &mut bytes,
+        )?;
         self.stats.entities_encoded = self
             .stats
             .entities_encoded
@@ -366,13 +378,11 @@ impl ReplicationTransportBridge {
             .components_encoded
             .saturating_add(build_stats.encoded_components);
 
-        if build.frame.entities.is_empty() && !self.config.send_empty_frames {
+        if build_stats.encoded_entities == 0 && !self.config.send_empty_frames {
             self.stats.frames_skipped_empty = self.stats.frames_skipped_empty.saturating_add(1);
             return Ok(replication_report(client_id, plan, build_stats, 0, false));
         }
 
-        let mut bytes = Vec::new();
-        BinaryFrameEncoder.encode_replication(&build.frame, &mut bytes)?;
         let byte_len = bytes.len();
         transport
             .send(OutboundPacket { client_id, bytes })
@@ -4465,6 +4475,7 @@ mod tests {
         assert_eq!(bridge.stats().frames_sent, 1);
         assert_eq!(bridge.stats().entities_selected, 1);
         assert_eq!(bridge.stats().components_encoded, 1);
+        assert!(bridge.planning_scratch.is_some());
     }
 
     #[test]

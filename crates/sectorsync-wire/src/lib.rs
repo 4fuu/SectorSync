@@ -225,6 +225,116 @@ impl ReplicationFrameBuilder {
             stats,
         }
     }
+
+    /// Builds and appends one binary replication frame directly into `out`.
+    ///
+    /// This preserves the same limits, dirty-component filtering, statistics,
+    /// and wire shape as [`Self::build`] followed by [`BinaryFrameEncoder`],
+    /// without allocating an intermediate entity/component delta tree or
+    /// cloning component payloads. Existing bytes in `out` are retained.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_binary_into(
+        &self,
+        client_id: ClientId,
+        server_tick: Tick,
+        station: &Station,
+        plan: &ReplicationPlan,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+        out: &mut Vec<u8>,
+    ) -> Result<ReplicationFrameBuildStats, BinaryEncodeError> {
+        let mut stats = ReplicationFrameBuildStats {
+            planned_entities: plan.entities.len(),
+            ..ReplicationFrameBuildStats::default()
+        };
+        let mut estimated_payload_bytes = 0_usize;
+
+        out.push(FrameKind::Replication as u8);
+        out.extend_from_slice(&client_id.get().to_le_bytes());
+        out.extend_from_slice(&server_tick.get().to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(plan.entities.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        let estimated_payload_offset = out.len();
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        let entity_count_offset = out.len();
+        out.extend_from_slice(&0_u32.to_le_bytes());
+
+        for handle in &plan.entities {
+            if stats.encoded_entities >= self.limits.max_entity_deltas {
+                stats.skipped_entities_by_limit += 1;
+                continue;
+            }
+            let Some(entity) = station.get(*handle) else {
+                continue;
+            };
+
+            let entity_start = out.len();
+            out.extend_from_slice(&entity.id.get().to_le_bytes());
+            out.extend_from_slice(&entity.role.owner_epoch().get().to_le_bytes());
+            let component_count_offset = out.len();
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            let mut component_count = 0_usize;
+
+            for component_id in &selection.component_ids {
+                if component_count >= self.limits.max_components_per_entity {
+                    stats.skipped_components_by_limit += 1;
+                    continue;
+                }
+                let Some(blob) = components.get_blob(*component_id, *handle) else {
+                    continue;
+                };
+                if !blob.dirty {
+                    continue;
+                }
+                if blob.bytes.len() > self.limits.max_component_bytes {
+                    stats.skipped_components_by_size += 1;
+                    continue;
+                }
+
+                out.extend_from_slice(&component_id.get().to_le_bytes());
+                out.extend_from_slice(&blob.version.to_le_bytes());
+                out.push(0);
+                write_bytes("replication.component.bytes", &blob.bytes, out)?;
+                estimated_payload_bytes = estimated_payload_bytes
+                    .saturating_add(2 + 8 + 1 + 4)
+                    .saturating_add(blob.bytes.len());
+                component_count += 1;
+            }
+
+            if component_count == 0 {
+                out.truncate(entity_start);
+                continue;
+            }
+
+            let component_count =
+                u16::try_from(component_count).map_err(|_| BinaryEncodeError::TooManyItems {
+                    field: "replication.entity.components",
+                    actual: component_count,
+                })?;
+            out[component_count_offset..component_count_offset + 2]
+                .copy_from_slice(&component_count.to_le_bytes());
+            stats.encoded_components += usize::from(component_count);
+            stats.encoded_entities += 1;
+            estimated_payload_bytes = estimated_payload_bytes.saturating_add(8 + 8 + 2);
+        }
+
+        let encoded_entities =
+            u32::try_from(stats.encoded_entities).map_err(|_| BinaryEncodeError::TooManyItems {
+                field: "replication.entities",
+                actual: stats.encoded_entities,
+            })?;
+        out[estimated_payload_offset..estimated_payload_offset + 4].copy_from_slice(
+            &u32::try_from(estimated_payload_bytes)
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out[entity_count_offset..entity_count_offset + 4]
+            .copy_from_slice(&encoded_entities.to_le_bytes());
+        Ok(stats)
+    }
 }
 
 /// Command acknowledgement frame.
@@ -1272,5 +1382,34 @@ mod tests {
         assert_eq!(build.stats.encoded_components, 1);
         assert_eq!(build.frame.entities[0].entity_id, EntityId::new(10));
         assert_eq!(build.frame.entities[0].components[0].version, 3);
+
+        let mut materialized_bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_replication(&build.frame, &mut materialized_bytes)
+            .expect("materialized frame should encode");
+        let mut direct_bytes = Vec::new();
+        let direct_stats = ReplicationFrameBuilder::new(ReplicationFrameLimits {
+            max_entity_deltas: 8,
+            max_components_per_entity: 4,
+            max_component_bytes: 64,
+        })
+        .encode_binary_into(
+            ClientId::new(5),
+            Tick::new(9),
+            &station,
+            &ReplicationPlan {
+                entities: vec![handle],
+                stats: sectorsync_core::prelude::ReplicationStats::default(),
+            },
+            &components,
+            &ComponentSelection {
+                component_ids: vec![ComponentId::new(1)],
+            },
+            &mut direct_bytes,
+        )
+        .expect("plan should encode directly");
+
+        assert_eq!(direct_stats, build.stats);
+        assert_eq!(direct_bytes, materialized_bytes);
     }
 }
