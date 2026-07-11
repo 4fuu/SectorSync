@@ -542,6 +542,34 @@ so no latency improvement is claimed. Acceptance is based on exact full-field
 equivalence, removed nested allocation paths, retained-capacity tests, and the
 executable borrowed `split_migration` flow.
 
+## Gateway Expiry Scan Measurement
+
+`GatewaySessionTable::expire_disconnected` now uses one `BTreeMap::retain` pass.
+Connected sessions and disconnected sessions at or inside the grace boundary
+remain; stale sessions are removed in place and counted from the map length
+delta. The isolated benchmark compares this production algorithm shape with the
+previous collect-client-ids then remove-each pattern:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example gateway_expiry_scan
+cargo run --release -q -p sectorsync-bench --example gateway_expiry_scan -- --collect-remove
+```
+
+Map snapshot cloning occurs outside the measured operation interval. The
+default workload scans 5,000 sessions 500 times with connected, grace-boundary,
+and expired records. Guards cap 20,000 sessions, 100 calls per tick, and 20
+ticks without `--allow-heavy`; total execution has a 10-second budget. Output
+includes expired/remaining conservation counts, temporary-id collection count,
+operation p50/p95/p99/max, guard metadata, path/workload verdicts, and
+`benchmark_ok`.
+
+Five alternating release A/B runs expired and retained `1,250,000` records each.
+The retain path created zero temporary id collections; the comparison created
+500 per run. Median operation p99 was 0.080 ms for retain versus 0.241 ms for
+collect/remove, about a 67% reduction on this development host. Core tests cover
+connected sessions, the exact grace boundary, stale removal, repeated expiry,
+and cumulative statistics; the benchmark test compares final maps exactly.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

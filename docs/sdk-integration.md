@@ -74,6 +74,12 @@ The pipeline validates generic session generation, sequence/replay state,
 per-tick admission limits, station route metadata, queue presence, and barrier
 ingress policy. It stamps `received_at` and returns an ACK report.
 
+Call `GatewaySessionTable::expire_disconnected` at an application-controlled
+maintenance cadence. Expiry performs one allocation-free ordered-map scan,
+retains connected sessions and sessions exactly at the grace boundary, and
+increments expiration statistics only for removed records. Account/session
+credential lifecycle remains external.
+
 For multi-node delivery, resolve `DeploymentRouteTable` metadata and send the
 stamped envelope through `CommandDispatchTransportBridge`. External service
 discovery decides where the node endpoint is; SectorSync only validates route

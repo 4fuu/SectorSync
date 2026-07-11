@@ -87,15 +87,21 @@ fn main() {
         station_two_applied,
         vec![CommandId::new(2), CommandId::new(3), CommandId::new(4)]
     );
+    let route_epoch = gateway
+        .route(client_id)
+        .expect("route should exist")
+        .route_epoch;
+    gateway
+        .disconnect(client_id, Tick::new(15))
+        .expect("client should disconnect");
+    assert_eq!(gateway.expire_disconnected(Tick::new(19)), 1);
 
     println!(
-        "gateway_session sessions={} generation={} route_epoch={} admitted={} rate_limited={} station_one_applied={} station_two_applied={}",
+        "gateway_session sessions={} expired={} generation={} route_epoch={} admitted={} rate_limited={} station_one_applied={} station_two_applied={}",
         gateway.len(),
+        gateway.stats().sessions_expired,
         reconnected.route.generation,
-        gateway
-            .route(client_id)
-            .expect("route should exist")
-            .route_epoch,
+        route_epoch,
         gateway.stats().commands_admitted,
         gateway.stats().commands_rejected_rate_limit,
         station_one_applied.len(),

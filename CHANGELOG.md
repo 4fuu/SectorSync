@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Gateway disconnected-session expiry now removes stale records in one
+  allocation-free ordered-map retain scan instead of collecting client ids and
+  performing a second removal pass.
 - Split scheduling now supports fully reusable nested output slots for hotspot
   decisions and actions, plus borrowed execution/cooldown APIs, avoiding fresh
   reason and proposal buffers in steady-state passes.

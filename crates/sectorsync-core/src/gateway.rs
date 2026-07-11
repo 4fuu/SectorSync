@@ -419,22 +419,16 @@ impl GatewaySessionTable {
     /// Removes disconnected sessions whose grace window has expired.
     pub fn expire_disconnected(&mut self, now: Tick) -> usize {
         let grace = self.config.reconnect_grace_ticks;
-        let expired = self
-            .sessions
-            .iter()
-            .filter_map(|(client_id, session)| match session.state {
-                GatewaySessionState::Connected => None,
-                GatewaySessionState::Disconnected { since } => {
-                    (now.get().saturating_sub(since.get()) > grace).then_some(*client_id)
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for client_id in &expired {
-            self.sessions.remove(client_id);
-        }
-        self.stats.sessions_expired = self.stats.sessions_expired.saturating_add(expired.len());
-        expired.len()
+        let before = self.sessions.len();
+        self.sessions.retain(|_, session| match session.state {
+            GatewaySessionState::Connected => true,
+            GatewaySessionState::Disconnected { since } => {
+                now.get().saturating_sub(since.get()) <= grace
+            }
+        });
+        let expired = before - self.sessions.len();
+        self.stats.sessions_expired = self.stats.sessions_expired.saturating_add(expired);
+        expired
     }
 
     /// Changes the target station for a connected client.
@@ -688,6 +682,35 @@ mod tests {
         assert_eq!(table.expire_disconnected(Tick::new(19)), 1);
         assert_eq!(table.len(), 0);
         assert_eq!(table.stats().sessions_expired, 1);
+    }
+
+    #[test]
+    fn expiry_retains_connected_and_grace_boundary_sessions() {
+        let mut table = GatewaySessionTable::new(GatewayConfig {
+            max_sessions: 4,
+            reconnect_grace_ticks: 3,
+            max_commands_per_tick: 4,
+        });
+        for client in 1..=3 {
+            table
+                .connect(ClientId::new(client), StationId::new(1), Tick::new(10))
+                .expect("session should connect");
+        }
+        table
+            .disconnect(ClientId::new(2), Tick::new(12))
+            .expect("boundary session disconnects");
+        table
+            .disconnect(ClientId::new(3), Tick::new(11))
+            .expect("expired session disconnects");
+
+        assert_eq!(table.expire_disconnected(Tick::new(15)), 1);
+        assert!(table.session(ClientId::new(1)).is_some());
+        assert!(table.session(ClientId::new(2)).is_some());
+        assert!(table.session(ClientId::new(3)).is_none());
+        assert_eq!(table.stats().sessions_expired, 1);
+        assert_eq!(table.expire_disconnected(Tick::new(16)), 1);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.stats().sessions_expired, 2);
     }
 
     #[test]
