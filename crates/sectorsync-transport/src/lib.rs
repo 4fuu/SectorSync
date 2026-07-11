@@ -2,7 +2,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -2330,7 +2331,7 @@ struct InFlightReliableClientPacket {
 /// Caller-owned reusable storage for reliable client retry scans.
 #[derive(Clone, Debug, Default)]
 pub struct ReliableClientRetryScratch {
-    due_keys: Vec<(ClientId, u64)>,
+    due_entries: Vec<(u64, ClientId, u64)>,
 }
 
 impl ReliableClientRetryScratch {
@@ -2341,7 +2342,7 @@ impl ReliableClientRetryScratch {
 
     /// Due-key capacity retained across retry passes.
     pub fn retained_key_capacity(&self) -> usize {
-        self.due_keys.capacity()
+        self.due_entries.capacity()
     }
 }
 
@@ -2352,6 +2353,7 @@ pub struct ReliableClientSender {
     next_sequence: BTreeMap<ClientId, u64>,
     in_flight: BTreeMap<(ClientId, u64), InFlightReliableClientPacket>,
     in_flight_by_peer: BTreeMap<ClientId, usize>,
+    retry_deadlines: BinaryHeap<Reverse<(u64, ClientId, u64)>>,
     stats: ReliableClientStats,
 }
 
@@ -2363,6 +2365,7 @@ impl ReliableClientSender {
             next_sequence: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             in_flight_by_peer: BTreeMap::new(),
+            retry_deadlines: BinaryHeap::new(),
             stats: ReliableClientStats::default(),
         }
     }
@@ -2419,6 +2422,7 @@ impl ReliableClientSender {
                 attempts: 1,
             },
         );
+        self.schedule_retry(packet.client_id, sequence, now_tick);
         self.stats.data_sent = self.stats.data_sent.saturating_add(1);
         Ok(sequence)
     }
@@ -2454,37 +2458,55 @@ impl ReliableClientSender {
         now_tick: u64,
         scratch: &mut ReliableClientRetryScratch,
     ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
-        scratch.due_keys.clear();
-        scratch
-            .due_keys
-            .extend(self.in_flight.iter().filter_map(|(key, packet)| {
-                let due =
-                    now_tick.saturating_sub(packet.last_sent_tick) >= self.config.retry_after_ticks;
-                due.then_some(*key)
-            }));
+        scratch.due_entries.clear();
+        while let Some(Reverse((deadline, peer, sequence))) = self.retry_deadlines.peek().copied() {
+            if deadline > now_tick {
+                break;
+            }
+            self.retry_deadlines.pop();
+            scratch.due_entries.push((deadline, peer, sequence));
+        }
         let mut report = ReliableRetryReport::default();
 
-        for key in &scratch.due_keys {
-            let Some(packet) = self.in_flight.get(key) else {
+        for (entry_index, (deadline, peer, sequence)) in scratch.due_entries.iter().enumerate() {
+            let key = (*peer, *sequence);
+            let Some(packet) = self.in_flight.get(&key) else {
                 continue;
             };
+            if packet
+                .last_sent_tick
+                .saturating_add(self.config.retry_after_ticks)
+                != *deadline
+            {
+                continue;
+            }
+            report.examined = report.examined.saturating_add(1);
             if packet.attempts >= self.config.max_attempts {
-                self.remove_in_flight(key);
+                self.remove_in_flight(&key);
                 self.stats.timed_out = self.stats.timed_out.saturating_add(1);
                 report.timed_out = report.timed_out.saturating_add(1);
                 continue;
             }
 
-            Self::send_data_frame(
+            if let Err(error) = Self::send_data_frame(
                 transport,
                 packet.peer_client,
                 packet.sequence,
                 &packet.payload,
-            )?;
-            if let Some(stored) = self.in_flight.get_mut(key) {
+            ) {
+                self.retry_deadlines.extend(
+                    scratch.due_entries[entry_index..]
+                        .iter()
+                        .copied()
+                        .map(Reverse),
+                );
+                return Err(error);
+            }
+            if let Some(stored) = self.in_flight.get_mut(&key) {
                 stored.last_sent_tick = now_tick;
                 stored.attempts = stored.attempts.saturating_add(1);
             }
+            self.schedule_retry(*peer, *sequence, now_tick);
             self.stats.retries_sent = self.stats.retries_sent.saturating_add(1);
             report.retried = report.retried.saturating_add(1);
         }
@@ -2515,6 +2537,14 @@ impl ReliableClientSender {
             let count = self.in_flight_by_peer.entry(key.0).or_insert(0);
             *count = count.saturating_add(1);
         }
+    }
+
+    fn schedule_retry(&mut self, peer: ClientId, sequence: u64, sent_tick: u64) {
+        self.retry_deadlines.push(Reverse((
+            sent_tick.saturating_add(self.config.retry_after_ticks),
+            peer,
+            sequence,
+        )));
     }
 
     fn remove_in_flight(&mut self, key: &(ClientId, u64)) -> Option<InFlightReliableClientPacket> {
@@ -3093,7 +3123,7 @@ struct InFlightReliableStationPacket {
 /// Caller-owned reusable storage for reliable station retry scans.
 #[derive(Clone, Debug, Default)]
 pub struct ReliableStationRetryScratch {
-    due_keys: Vec<(StationId, u64)>,
+    due_entries: Vec<(u64, StationId, u64)>,
 }
 
 impl ReliableStationRetryScratch {
@@ -3104,13 +3134,15 @@ impl ReliableStationRetryScratch {
 
     /// Due-key capacity retained across retry passes.
     pub fn retained_key_capacity(&self) -> usize {
-        self.due_keys.capacity()
+        self.due_entries.capacity()
     }
 }
 
 /// Retry pass report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReliableRetryReport {
+    /// Current deadline entries examined during this pass.
+    pub examined: usize,
     /// Packets resent.
     pub retried: usize,
     /// Packets dropped after exhausting attempts.
@@ -3124,6 +3156,7 @@ pub struct ReliableStationSender {
     next_sequence: BTreeMap<StationId, u64>,
     in_flight: BTreeMap<(StationId, u64), InFlightReliableStationPacket>,
     in_flight_by_target: BTreeMap<StationId, usize>,
+    retry_deadlines: BinaryHeap<Reverse<(u64, StationId, u64)>>,
     stats: ReliableStationStats,
 }
 
@@ -3135,6 +3168,7 @@ impl ReliableStationSender {
             next_sequence: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             in_flight_by_target: BTreeMap::new(),
+            retry_deadlines: BinaryHeap::new(),
             stats: ReliableStationStats::default(),
         }
     }
@@ -3197,6 +3231,7 @@ impl ReliableStationSender {
                 attempts: 1,
             },
         );
+        self.schedule_retry(packet.target_station, sequence, now_tick);
         self.stats.data_sent = self.stats.data_sent.saturating_add(1);
         Ok(sequence)
     }
@@ -3232,38 +3267,57 @@ impl ReliableStationSender {
         now_tick: u64,
         scratch: &mut ReliableStationRetryScratch,
     ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
-        scratch.due_keys.clear();
-        scratch
-            .due_keys
-            .extend(self.in_flight.iter().filter_map(|(key, packet)| {
-                let due =
-                    now_tick.saturating_sub(packet.last_sent_tick) >= self.config.retry_after_ticks;
-                due.then_some(*key)
-            }));
+        scratch.due_entries.clear();
+        while let Some(Reverse((deadline, target, sequence))) = self.retry_deadlines.peek().copied()
+        {
+            if deadline > now_tick {
+                break;
+            }
+            self.retry_deadlines.pop();
+            scratch.due_entries.push((deadline, target, sequence));
+        }
         let mut report = ReliableRetryReport::default();
 
-        for key in &scratch.due_keys {
-            let Some(packet) = self.in_flight.get(key) else {
+        for (entry_index, (deadline, target, sequence)) in scratch.due_entries.iter().enumerate() {
+            let key = (*target, *sequence);
+            let Some(packet) = self.in_flight.get(&key) else {
                 continue;
             };
+            if packet
+                .last_sent_tick
+                .saturating_add(self.config.retry_after_ticks)
+                != *deadline
+            {
+                continue;
+            }
+            report.examined = report.examined.saturating_add(1);
             if packet.attempts >= self.config.max_attempts {
-                self.remove_in_flight(key);
+                self.remove_in_flight(&key);
                 self.stats.timed_out = self.stats.timed_out.saturating_add(1);
                 report.timed_out = report.timed_out.saturating_add(1);
                 continue;
             }
 
-            Self::send_data_frame(
+            if let Err(error) = Self::send_data_frame(
                 transport,
                 packet.source_station,
                 packet.target_station,
                 packet.sequence,
                 &packet.payload,
-            )?;
-            if let Some(stored) = self.in_flight.get_mut(key) {
+            ) {
+                self.retry_deadlines.extend(
+                    scratch.due_entries[entry_index..]
+                        .iter()
+                        .copied()
+                        .map(Reverse),
+                );
+                return Err(error);
+            }
+            if let Some(stored) = self.in_flight.get_mut(&key) {
                 stored.last_sent_tick = now_tick;
                 stored.attempts = stored.attempts.saturating_add(1);
             }
+            self.schedule_retry(*target, *sequence, now_tick);
             self.stats.retries_sent = self.stats.retries_sent.saturating_add(1);
             report.retried = report.retried.saturating_add(1);
         }
@@ -3294,6 +3348,14 @@ impl ReliableStationSender {
             let count = self.in_flight_by_target.entry(key.0).or_insert(0);
             *count = count.saturating_add(1);
         }
+    }
+
+    fn schedule_retry(&mut self, target: StationId, sequence: u64, sent_tick: u64) {
+        self.retry_deadlines.push(Reverse((
+            sent_tick.saturating_add(self.config.retry_after_ticks),
+            target,
+            sequence,
+        )));
     }
 
     fn remove_in_flight(
@@ -5484,6 +5546,7 @@ mod tests {
         let retry = client
             .retry_due_with_scratch(&mut client_transport, 2, &mut retry_scratch)
             .expect("retry should send");
+        assert_eq!(retry.examined, 1);
         assert_eq!(retry.retried, 1);
         assert_eq!(retry.timed_out, 0);
         assert_eq!(client.sender.stats().retries_sent, 1);
@@ -6005,6 +6068,7 @@ mod tests {
         let retry = first
             .retry_due_with_scratch(&mut transport, 2, &mut retry_scratch)
             .expect("retry should send");
+        assert_eq!(retry.examined, 1);
         assert_eq!(retry.retried, 1);
         assert_eq!(retry.timed_out, 0);
         assert_eq!(first.sender.stats().retries_sent, 1);

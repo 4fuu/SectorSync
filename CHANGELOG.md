@@ -26,6 +26,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Point entities now store their single spatial cell inline, and component
   columns use compact sorted storage so memory scales with registered columns
   rather than the largest `ComponentId`.
+- Reliable Client/Station retry senders now index retry deadlines instead of
+  scanning every in-flight packet on each poll, and split target selection uses
+  the aligned decision array without repeated Station-id scans.
 
 ### Changed
 

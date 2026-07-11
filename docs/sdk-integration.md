@@ -128,8 +128,9 @@ when the embedding control plane actually needs ordered stale IDs.
 
 For reliable Client or Station links, retain `ReliableClientRetryScratch` or
 `ReliableStationRetryScratch` and call `retry_due_with_scratch` on the endpoint.
-The scratch stores only the deterministic due-key scan and may be shared across
-non-overlapping endpoint calls. Reliable senders encode stored payload slices
+The sender indexes retry deadlines; non-due polls inspect only the earliest
+deadline. Scratch retains entries due in the current pass and may be shared
+across non-overlapping endpoint calls. Reliable senders encode stored payload slices
 directly into the owned transport packet and do not clone the in-flight payload.
 The compatibility `retry_due` API remains appropriate for occasional retries.
 Transport failure leaves attempts unchanged; timeout and retry order remain

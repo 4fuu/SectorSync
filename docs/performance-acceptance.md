@@ -617,6 +617,10 @@ same storage owns hotspot cell candidates and the pending proposal. Borrowed
 views can be executed or recorded into cooldown state without materializing an
 owned schedule:
 
+Decisions remain aligned with input samples. Source severity and target
+severity are read by index during planning, and the current target comparison
+key is retained, avoiding repeated Station-id scans inside the target loop.
+
 ```powershell
 cargo run --release -q -p sectorsync-bench --example split_schedule_reuse
 cargo run --release -q -p sectorsync-bench --example split_schedule_reuse -- --fresh-output
@@ -765,8 +769,15 @@ verify guard enforcement and cross-path checksums.
 append borrowed payloads directly to the final wire buffer. Reliable senders use
 these paths for initial sends and retries, avoiding the temporary owned-frame
 payload copy. `ReliableClientRetryScratch` and `ReliableStationRetryScratch`
-retain due-key scan capacity; endpoint `retry_due_with_scratch` methods expose
+retain due-entry capacity; endpoint `retry_due_with_scratch` methods expose
 the reusable path while existing `retry_due` methods remain compatible.
+
+Deadline indexing is covered separately by the fixed smoke-safe
+`reliable_retry` workload. It keeps 1,024 packets in flight, performs 32
+non-due polls, then advances to the common deadline. The measured run examined
+zero entries during non-due polls and exactly 1,024 at the deadline, retrying
+all of them in 113 microseconds on the development host. The work-count verdict,
+not host timing, proves polling no longer scans the complete window.
 
 Run the isolated encoding and real Station sender comparisons with:
 

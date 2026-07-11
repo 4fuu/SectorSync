@@ -3986,16 +3986,11 @@ impl SplitScheduler {
             HotspotPlanner::evaluate_into(sample, self.config.thresholds, decision);
         }
 
-        for source in samples {
+        for (source_index, source) in samples.iter().enumerate() {
             if scratch.active_actions >= self.config.max_actions_per_pass {
                 break;
             }
-            let Some(source_decision) = scratch.decisions[..scratch.active_decisions]
-                .iter()
-                .find(|decision| decision.station_id == source.station_id)
-            else {
-                continue;
-            };
+            let source_decision = &scratch.decisions[source_index];
             if source_decision.severity != HotspotSeverity::Hot {
                 continue;
             }
@@ -4211,6 +4206,7 @@ impl Default for SplitScheduler {
 #[derive(Clone, Copy, Debug, Default)]
 struct SplitTargetSelection<'a> {
     target: Option<&'a StationLoadSample>,
+    target_key: Option<(u8, u64, u32)>,
     considered_targets: usize,
     rejected_by_severity: usize,
     rejected_by_capacity: usize,
@@ -4227,16 +4223,14 @@ fn select_split_target<'a>(
     let mut selection = SplitTargetSelection::default();
     let source_score = station_load_score(source);
 
-    for target in samples {
+    for (target, decision) in samples.iter().zip(decisions) {
         if target.station_id == source.station_id {
             continue;
         }
         selection.considered_targets += 1;
 
-        let severity = decisions
-            .iter()
-            .find(|decision| decision.station_id == target.station_id)
-            .map_or(HotspotSeverity::Normal, |decision| decision.severity);
+        debug_assert_eq!(decision.station_id, target.station_id);
+        let severity = decision.severity;
         if severity == HotspotSeverity::Hot
             || (severity == HotspotSeverity::Warm && !config.allow_warm_targets)
         {
@@ -4261,19 +4255,12 @@ fn select_split_target<'a>(
             target_score,
             target.station_id.get(),
         );
-        let current_key = selection.target.map(|current| {
-            let current_severity = decisions
-                .iter()
-                .find(|decision| decision.station_id == current.station_id)
-                .map_or(HotspotSeverity::Normal, |decision| decision.severity);
-            (
-                severity_rank(current_severity),
-                station_load_score(current),
-                current.station_id.get(),
-            )
-        });
-        if current_key.is_none_or(|current_key| target_key < current_key) {
+        if selection
+            .target_key
+            .is_none_or(|current_key| target_key < current_key)
+        {
             selection.target = Some(target);
+            selection.target_key = Some(target_key);
         }
     }
 
