@@ -11,8 +11,8 @@ use sectorsync_core::prelude::{
     ComponentStore, ComponentSyncMode, EntityHandle, EntityId, EventId, EventKind, EventPriority,
     EventQueueLimits, GatewayConfig, GatewaySessionTable, GridSpec, InstanceId, NodeId, PolicyId,
     PolicyTable, Position3, RangeOnlyVisibility, ReplicationBatchScratch, ReplicationBudget,
-    ReplicationPlanner, ReplicationScratch, ReplicationTracker, ReplicationTrackerConfig, Station,
-    StationConfig, StationEvent, StationId, Tick, ViewerQuery,
+    ReplicationPlan, ReplicationPlanner, ReplicationScratch, ReplicationTracker,
+    ReplicationTrackerConfig, Station, StationConfig, StationEvent, StationId, Tick, ViewerQuery,
 };
 use sectorsync_runtime::EventRouter;
 use sectorsync_transport::{
@@ -782,14 +782,7 @@ fn replicate_room(
     stats: &mut Stats,
 ) {
     let viewers = room_viewers(room);
-    room.dirty_generations.fill(u32::MAX);
-    for handle in &room.dirty_handles {
-        let index = usize::try_from(handle.index()).expect("handle index fits usize");
-        if room.dirty_generations.len() <= index {
-            room.dirty_generations.resize(index + 1, u32::MAX);
-        }
-        room.dirty_generations[index] = handle.generation();
-    }
+    prepare_dirty_generations(room);
     let dirty_generations = &room.dirty_generations;
     let plans = ReplicationPlanner::plan_for_viewers_work_bounded_into(
         &room.station,
@@ -812,51 +805,96 @@ fn replicate_room(
         .unexamined_after_budget
         .saturating_add(plans.stats.unexamined_after_budget);
 
+    let mut io = ReplicationRoomIo {
+        station: &room.station,
+        components: &room.components,
+        server_transport: &mut room.server_transport,
+        tracker: &mut room.tracker,
+    };
     for (viewer, plan) in viewers.iter().zip(plans.plans) {
-        let capacity =
-            builder.sampled_binary_capacity_hint(&room.station, plan, &room.components, selection);
-        let mut bytes = Vec::with_capacity(capacity);
-        let build = builder
-            .encode_binary_bounded_into(
-                viewer.client_id,
-                room.station.tick(),
-                &room.station,
-                plan,
-                &room.components,
-                selection,
-                MAX_PACKET_BYTES,
-                &mut bytes,
-            )
-            .expect("guarded replication frame should encode");
-        stats.encoded_entities = stats
-            .encoded_entities
-            .saturating_add(build.encoded_entities);
-        stats.encoded_components = stats
-            .encoded_components
-            .saturating_add(build.encoded_components);
-        stats.skipped_entities_by_frame_bytes = stats
-            .skipped_entities_by_frame_bytes
-            .saturating_add(build.skipped_entities_by_frame_bytes);
-        if bytes.len() > MAX_PACKET_BYTES {
-            stats.packet_oversize = stats.packet_oversize.saturating_add(1);
-            continue;
-        }
-        let byte_len = bytes.len();
-        room.server_transport
-            .send(OutboundPacket {
-                client_id: viewer.client_id,
-                bytes,
-            })
-            .expect("guarded in-memory packet should send");
-        room.tracker
-            .record_plan_sent(viewer.client_id, plan, room.station.tick())
-            .expect("guarded tracker should retain plan");
-        room.tracker
-            .acknowledge_plan(viewer.client_id, plan, room.station.tick());
-        stats.packets_sent = stats.packets_sent.saturating_add(1);
-        stats.encoded_bytes = stats.encoded_bytes.saturating_add(byte_len);
+        send_replication_plan(&mut io, viewer, plan, selection, builder, stats);
     }
 
+    receive_replication_packets(room, stats);
+
+    room.dirty_handles
+        .sort_unstable_by_key(|handle| (handle.index(), handle.generation()));
+    room.dirty_handles.dedup();
+    for handle in room.dirty_handles.drain(..) {
+        room.components.clear_dirty_for_entity(handle);
+    }
+}
+
+fn prepare_dirty_generations(room: &mut Room) {
+    room.dirty_generations.fill(u32::MAX);
+    for handle in &room.dirty_handles {
+        let index = usize::try_from(handle.index()).expect("handle index fits usize");
+        if room.dirty_generations.len() <= index {
+            room.dirty_generations.resize(index + 1, u32::MAX);
+        }
+        room.dirty_generations[index] = handle.generation();
+    }
+}
+
+struct ReplicationRoomIo<'a> {
+    station: &'a Station,
+    components: &'a ComponentStore,
+    server_transport: &'a mut InMemoryTransportEndpoint,
+    tracker: &'a mut ReplicationTracker,
+}
+
+fn send_replication_plan(
+    io: &mut ReplicationRoomIo<'_>,
+    viewer: &ViewerQuery,
+    plan: &ReplicationPlan,
+    selection: &ComponentSelection,
+    builder: ReplicationFrameBuilder,
+    stats: &mut Stats,
+) {
+    let capacity = builder.sampled_binary_capacity_hint(io.station, plan, io.components, selection);
+    let mut bytes = Vec::with_capacity(capacity);
+    let build = builder
+        .encode_binary_bounded_into(
+            viewer.client_id,
+            io.station.tick(),
+            io.station,
+            plan,
+            io.components,
+            selection,
+            MAX_PACKET_BYTES,
+            &mut bytes,
+        )
+        .expect("guarded replication frame should encode");
+    stats.encoded_entities = stats
+        .encoded_entities
+        .saturating_add(build.encoded_entities);
+    stats.encoded_components = stats
+        .encoded_components
+        .saturating_add(build.encoded_components);
+    stats.skipped_entities_by_frame_bytes = stats
+        .skipped_entities_by_frame_bytes
+        .saturating_add(build.skipped_entities_by_frame_bytes);
+    if bytes.len() > MAX_PACKET_BYTES {
+        stats.packet_oversize = stats.packet_oversize.saturating_add(1);
+        return;
+    }
+    let byte_len = bytes.len();
+    io.server_transport
+        .send(OutboundPacket {
+            client_id: viewer.client_id,
+            bytes,
+        })
+        .expect("guarded in-memory packet should send");
+    io.tracker
+        .record_plan_sent(viewer.client_id, plan, io.station.tick())
+        .expect("guarded tracker should retain plan");
+    io.tracker
+        .acknowledge_plan(viewer.client_id, plan, io.station.tick());
+    stats.packets_sent = stats.packets_sent.saturating_add(1);
+    stats.encoded_bytes = stats.encoded_bytes.saturating_add(byte_len);
+}
+
+fn receive_replication_packets(room: &mut Room, stats: &mut Stats) {
     for player in &mut room.players {
         while let Some(packet) = player
             .transport
@@ -883,13 +921,6 @@ fn replicate_room(
             stats.packets_received = stats.packets_received.saturating_add(1);
             stats.decoded_bytes = stats.decoded_bytes.saturating_add(packet.bytes.len());
         }
-    }
-
-    room.dirty_handles
-        .sort_unstable_by_key(|handle| (handle.index(), handle.generation()));
-    room.dirty_handles.dedup();
-    for handle in room.dirty_handles.drain(..) {
-        room.components.clear_dirty_for_entity(handle);
     }
 }
 
