@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Replication wire decoding now offers fully validated borrowed frame, entity,
+  component, and payload views for immediate allocation-free consumption while
+  retaining the compatible owned `RuntimeFrame` decoder.
 - Packet security opening now supports borrowed envelope decoding and
   caller-owned plaintext scratch, removing per-packet payload/tag parsing
   allocations and allowing high-rate receive paths to retain plaintext output.

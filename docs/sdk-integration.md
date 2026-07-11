@@ -186,6 +186,16 @@ On the receive side, `ReplicationReceiveBridge` validates expected packet
 source and frame target before returning decoded frames. Applying those frames
 to a client world remains an external client responsibility.
 
+High-throughput adapters that apply a frame immediately can instead call
+`BinaryFrameDecoder::decode_replication_ref`. The validated
+`ReplicationFrameRef`, `EntityDeltaRef`, and `ComponentDeltaRef` iterators
+borrow all nested storage and component bytes from the input packet, avoiding
+decoder-owned collections and payload copies. The views cannot outlive or be
+mutated independently of that packet. Use `FrameDecoder::decode` or
+`ReplicationFrameRef::to_owned` when frames must be queued, retained, or moved
+across that lifetime boundary. Source/target validation and application of
+component semantics remain caller responsibilities on this low-level path.
+
 Only clear dirty state after the integration's chosen delivery/ACK contract
 confirms it. `ReplicationTracker` provides bounded send/ACK bookkeeping but does
 not invent that protocol.

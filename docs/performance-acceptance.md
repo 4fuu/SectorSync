@@ -789,6 +789,36 @@ cover borrowed offsets and limits, owned/scratch output equality, repeated
 pointer/capacity retention, key-ring opening, replay order, and authenticated
 failure behavior.
 
+## Borrowed Replication Decode Measurement
+
+`BinaryFrameDecoder::decode_replication_ref` validates the complete wire frame
+and exposes exact-size borrowed entity and component iterators. Component bytes
+remain slices of the immutable input packet. The compatible `FrameDecoder`
+path materializes the same data as owned nested Vecs for retention or transfer.
+
+Compare immediate borrowed consumption with owned materialization using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example replication_decode_borrowed
+cargo run --release -q -p sectorsync-bench --example replication_decode_borrowed -- --owned
+```
+
+The default workload decodes 100 frames per tick for ten ticks. Each frame has
+64 entities, four components per entity, and 64 payload bytes per component.
+Individual guards cap 500 frames per tick, 256 entities, eight components,
+1 KiB component payloads, and 20 ticks; a composite guard additionally limits
+decoded payload work to 64 MiB without `--allow-heavy`. Execution has a
+10-second budget.
+
+Five alternating release A/B runs each decoded 1,000 frames, 64,000 entities,
+256,000 components, and `16,384,000` payload bytes with a `46,080,000`
+checksum. Borrowed decoding materialized zero owned frames; the comparison
+materialized 1,000 owned nested frames. Median tick p99 was 0.795 ms borrowed
+versus 2.793 ms owned, about a 72% reduction on this development host. Timings
+are local evidence; identical workload/checksum, complete validation, borrowed
+payload pointers, and zero owned materializations are the portable acceptance
+signals.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

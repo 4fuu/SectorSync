@@ -79,6 +79,161 @@ pub struct ComponentDelta {
     pub bytes: Vec<u8>,
 }
 
+/// Borrowed replication frame decoded directly from immutable wire bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicationFrameRef<'a> {
+    /// Target client.
+    pub client_id: ClientId,
+    /// Server tick represented by this frame.
+    pub server_tick: Tick,
+    /// Number of entity updates reported by the sender.
+    pub entity_count: u32,
+    /// Estimated payload bytes before transport overhead.
+    pub estimated_payload_bytes: u32,
+    encoded_entities: &'a [u8],
+    encoded_entity_count: usize,
+}
+
+impl<'a> ReplicationFrameRef<'a> {
+    /// Number of concrete entity deltas encoded in this frame.
+    pub const fn encoded_entity_count(self) -> usize {
+        self.encoded_entity_count
+    }
+
+    /// Iterates concrete entity deltas without allocating.
+    pub fn entities(self) -> EntityDeltaRefIter<'a> {
+        EntityDeltaRefIter {
+            cursor: Cursor::new(self.encoded_entities),
+            remaining: self.encoded_entity_count,
+        }
+    }
+
+    /// Materializes the compatible owned frame shape.
+    pub fn to_owned(self) -> ReplicationFrame {
+        ReplicationFrame {
+            client_id: self.client_id,
+            server_tick: self.server_tick,
+            entity_count: self.entity_count,
+            estimated_payload_bytes: self.estimated_payload_bytes,
+            entities: self.entities().map(EntityDeltaRef::to_owned).collect(),
+        }
+    }
+}
+
+/// Borrowed entity delta inside a [`ReplicationFrameRef`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntityDeltaRef<'a> {
+    /// Entity being updated.
+    pub entity_id: EntityId,
+    /// Owner epoch observed by the sender.
+    pub owner_epoch: OwnerEpoch,
+    encoded_components: &'a [u8],
+    encoded_component_count: usize,
+}
+
+impl<'a> EntityDeltaRef<'a> {
+    /// Number of component deltas encoded for this entity.
+    pub const fn encoded_component_count(self) -> usize {
+        self.encoded_component_count
+    }
+
+    /// Iterates component deltas without allocating or copying payload bytes.
+    pub fn components(self) -> ComponentDeltaRefIter<'a> {
+        ComponentDeltaRefIter {
+            cursor: Cursor::new(self.encoded_components),
+            remaining: self.encoded_component_count,
+        }
+    }
+
+    /// Materializes the compatible owned entity delta shape.
+    pub fn to_owned(self) -> EntityDelta {
+        EntityDelta {
+            entity_id: self.entity_id,
+            owner_epoch: self.owner_epoch,
+            components: self.components().map(ComponentDeltaRef::to_owned).collect(),
+        }
+    }
+}
+
+/// Borrowed component delta inside an [`EntityDeltaRef`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentDeltaRef<'a> {
+    /// Component id.
+    pub component_id: ComponentId,
+    /// Component version.
+    pub version: u64,
+    /// Runtime-defined flags.
+    pub flags: u8,
+    /// Encoded component bytes borrowed from the input frame.
+    pub bytes: &'a [u8],
+}
+
+impl ComponentDeltaRef<'_> {
+    /// Materializes the compatible owned component delta shape.
+    pub fn to_owned(self) -> ComponentDelta {
+        ComponentDelta {
+            component_id: self.component_id,
+            version: self.version,
+            flags: self.flags,
+            bytes: self.bytes.to_vec(),
+        }
+    }
+}
+
+/// Exact-size iterator over validated borrowed entity deltas.
+#[derive(Clone, Debug)]
+pub struct EntityDeltaRefIter<'a> {
+    cursor: Cursor<'a>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for EntityDeltaRefIter<'a> {
+    type Item = EntityDeltaRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let entity = decode_entity_ref(&mut self.cursor)
+            .expect("ReplicationFrameRef validates all entity bytes before iteration");
+        self.remaining -= 1;
+        Some(entity)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for EntityDeltaRefIter<'_> {}
+
+/// Exact-size iterator over validated borrowed component deltas.
+#[derive(Clone, Debug)]
+pub struct ComponentDeltaRefIter<'a> {
+    cursor: Cursor<'a>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for ComponentDeltaRefIter<'a> {
+    type Item = ComponentDeltaRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let component = decode_component_ref(&mut self.cursor)
+            .expect("ReplicationFrameRef validates all component bytes before iteration");
+        self.remaining -= 1;
+        Some(component)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ComponentDeltaRefIter<'_> {}
+
 /// Limits used by `ReplicationFrameBuilder`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicationFrameLimits {
@@ -757,6 +912,41 @@ impl core::fmt::Display for BinaryDecodeError {
 
 impl std::error::Error for BinaryDecodeError {}
 
+/// Error produced by borrowed replication-frame decoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicationFrameRefDecodeError {
+    /// Binary framing or field validation failed.
+    Binary(BinaryDecodeError),
+    /// The input was a valid known frame kind other than replication.
+    UnexpectedFrameKind(FrameKind),
+}
+
+impl core::fmt::Display for ReplicationFrameRefDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Binary(error) => error.fmt(f),
+            Self::UnexpectedFrameKind(actual) => {
+                write!(f, "expected Replication frame, found {actual:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplicationFrameRefDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Binary(error) => Some(error),
+            Self::UnexpectedFrameKind(_) => None,
+        }
+    }
+}
+
+impl From<BinaryDecodeError> for ReplicationFrameRefDecodeError {
+    fn from(value: BinaryDecodeError) -> Self {
+        Self::Binary(value)
+    }
+}
+
 /// Binary encode error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BinaryEncodeError {
@@ -795,6 +985,26 @@ impl std::error::Error for BinaryEncodeError {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinaryFrameDecoder;
 
+impl BinaryFrameDecoder {
+    /// Decodes and fully validates one replication frame while borrowing all
+    /// entity/component storage and component payload bytes from `input`.
+    pub fn decode_replication_ref<'a>(
+        &mut self,
+        input: &'a [u8],
+    ) -> Result<ReplicationFrameRef<'a>, ReplicationFrameRefDecodeError> {
+        let mut cursor = Cursor::new(input);
+        let kind_byte = cursor.read_u8()?;
+        let kind = FrameKind::from_byte(kind_byte)
+            .ok_or(BinaryDecodeError::UnknownFrameKind(kind_byte))?;
+        if kind != FrameKind::Replication {
+            return Err(ReplicationFrameRefDecodeError::UnexpectedFrameKind(kind));
+        }
+        let frame = decode_replication_ref(&mut cursor)?;
+        cursor.finish()?;
+        Ok(frame)
+    }
+}
+
 impl FrameDecoder for BinaryFrameDecoder {
     type Error = BinaryDecodeError;
 
@@ -804,41 +1014,9 @@ impl FrameDecoder for BinaryFrameDecoder {
         let kind = FrameKind::from_byte(kind_byte)
             .ok_or(BinaryDecodeError::UnknownFrameKind(kind_byte))?;
         let frame = match kind {
-            FrameKind::Replication => RuntimeFrame::Replication(ReplicationFrame {
-                client_id: ClientId::new(cursor.read_u64()?),
-                server_tick: Tick::new(cursor.read_u64()?),
-                entity_count: cursor.read_u32()?,
-                estimated_payload_bytes: cursor.read_u32()?,
-                entities: {
-                    let entity_delta_count = cursor.read_u32()? as usize;
-                    let mut entities = Vec::with_capacity(entity_delta_count);
-                    for _ in 0..entity_delta_count {
-                        let entity_id = EntityId::new(cursor.read_u64()?);
-                        let owner_epoch = OwnerEpoch::new(cursor.read_u64()?);
-                        let component_count = cursor.read_u16()? as usize;
-                        let mut components = Vec::with_capacity(component_count);
-                        for _ in 0..component_count {
-                            let component_id = ComponentId::new(cursor.read_u16()?);
-                            let version = cursor.read_u64()?;
-                            let flags = cursor.read_u8()?;
-                            let byte_len = cursor.read_u32()? as usize;
-                            let bytes = cursor.read_bytes(byte_len)?;
-                            components.push(ComponentDelta {
-                                component_id,
-                                version,
-                                flags,
-                                bytes,
-                            });
-                        }
-                        entities.push(EntityDelta {
-                            entity_id,
-                            owner_epoch,
-                            components,
-                        });
-                    }
-                    entities
-                },
-            }),
+            FrameKind::Replication => {
+                RuntimeFrame::Replication(decode_replication_ref(&mut cursor)?.to_owned())
+            }
             FrameKind::CommandAck => RuntimeFrame::CommandAck(CommandAckFrame {
                 client_id: ClientId::new(cursor.read_u64()?),
                 command_id: CommandId::new(cursor.read_u64()?),
@@ -1133,6 +1311,63 @@ fn decode_event_kind(cursor: &mut Cursor<'_>) -> Result<EventKind, BinaryDecodeE
     }
 }
 
+fn decode_replication_ref<'a>(
+    cursor: &mut Cursor<'a>,
+) -> Result<ReplicationFrameRef<'a>, BinaryDecodeError> {
+    let client_id = ClientId::new(cursor.read_u64()?);
+    let server_tick = Tick::new(cursor.read_u64()?);
+    let entity_count = cursor.read_u32()?;
+    let estimated_payload_bytes = cursor.read_u32()?;
+    let encoded_entity_count = cursor.read_u32()? as usize;
+    let entities_start = cursor.offset;
+    for _ in 0..encoded_entity_count {
+        decode_entity_ref(cursor)?;
+    }
+    let encoded_entities = &cursor.input[entities_start..cursor.offset];
+    Ok(ReplicationFrameRef {
+        client_id,
+        server_tick,
+        entity_count,
+        estimated_payload_bytes,
+        encoded_entities,
+        encoded_entity_count,
+    })
+}
+
+fn decode_entity_ref<'a>(cursor: &mut Cursor<'a>) -> Result<EntityDeltaRef<'a>, BinaryDecodeError> {
+    let entity_id = EntityId::new(cursor.read_u64()?);
+    let owner_epoch = OwnerEpoch::new(cursor.read_u64()?);
+    let encoded_component_count = cursor.read_u16()? as usize;
+    let components_start = cursor.offset;
+    for _ in 0..encoded_component_count {
+        decode_component_ref(cursor)?;
+    }
+    let encoded_components = &cursor.input[components_start..cursor.offset];
+    Ok(EntityDeltaRef {
+        entity_id,
+        owner_epoch,
+        encoded_components,
+        encoded_component_count,
+    })
+}
+
+fn decode_component_ref<'a>(
+    cursor: &mut Cursor<'a>,
+) -> Result<ComponentDeltaRef<'a>, BinaryDecodeError> {
+    let component_id = ComponentId::new(cursor.read_u16()?);
+    let version = cursor.read_u64()?;
+    let flags = cursor.read_u8()?;
+    let byte_len = cursor.read_u32()? as usize;
+    let bytes = cursor.read_slice(byte_len)?;
+    Ok(ComponentDeltaRef {
+        component_id,
+        version,
+        flags,
+        bytes,
+    })
+}
+
+#[derive(Clone, Debug)]
 struct Cursor<'a> {
     input: &'a [u8],
     offset: usize,
@@ -1174,8 +1409,12 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, BinaryDecodeError> {
+        Ok(self.read_slice(len)?.to_vec())
+    }
+
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], BinaryDecodeError> {
         self.require(len)?;
-        let bytes = self.input[self.offset..self.offset + len].to_vec();
+        let bytes = &self.input[self.offset..self.offset + len];
         self.offset += len;
         Ok(bytes)
     }
@@ -1217,12 +1456,20 @@ mod tests {
             entities: vec![EntityDelta {
                 entity_id: EntityId::new(100),
                 owner_epoch: OwnerEpoch::new(2),
-                components: vec![ComponentDelta {
-                    component_id: ComponentId::new(1),
-                    version: 9,
-                    flags: 0,
-                    bytes: vec![1, 2, 3, 4],
-                }],
+                components: vec![
+                    ComponentDelta {
+                        component_id: ComponentId::new(1),
+                        version: 9,
+                        flags: 0,
+                        bytes: vec![1, 2, 3, 4],
+                    },
+                    ComponentDelta {
+                        component_id: ComponentId::new(2),
+                        version: 10,
+                        flags: 1,
+                        bytes: vec![5, 6],
+                    },
+                ],
             }],
         };
         let mut encoder = BinaryFrameEncoder;
@@ -1231,10 +1478,77 @@ mod tests {
             .encode_replication(&frame, &mut bytes)
             .expect("encoder is infallible");
 
+        let borrowed = BinaryFrameDecoder
+            .decode_replication_ref(&bytes)
+            .expect("borrowed decode should work");
+        assert_eq!(borrowed.client_id, frame.client_id);
+        assert_eq!(borrowed.server_tick, frame.server_tick);
+        assert_eq!(borrowed.encoded_entity_count(), 1);
+        let mut entities = borrowed.entities();
+        assert_eq!(entities.len(), 1);
+        let entity = entities.next().expect("entity should be borrowed");
+        assert_eq!(entity.entity_id, frame.entities[0].entity_id);
+        assert_eq!(entity.encoded_component_count(), 2);
+        let mut components = entity.components();
+        assert_eq!(components.len(), 2);
+        let first = components.next().expect("component should be borrowed");
+        assert_eq!(first.bytes, frame.entities[0].components[0].bytes);
+        let input_start = bytes.as_ptr() as usize;
+        let input_end = input_start.saturating_add(bytes.len());
+        let payload_start = first.bytes.as_ptr() as usize;
+        assert!(payload_start >= input_start);
+        assert!(payload_start.saturating_add(first.bytes.len()) <= input_end);
+        assert_eq!(borrowed.to_owned(), frame);
+
         let decoded = BinaryFrameDecoder
             .decode(&bytes)
             .expect("decode should work");
         assert_eq!(decoded, RuntimeFrame::Replication(frame));
+    }
+
+    #[test]
+    fn borrowed_replication_decode_rejects_wrong_kind_truncation_and_trailing_bytes() {
+        assert_eq!(
+            BinaryFrameDecoder.decode_replication_ref(&[FrameKind::CommandAck as u8]),
+            Err(ReplicationFrameRefDecodeError::UnexpectedFrameKind(
+                FrameKind::CommandAck
+            ))
+        );
+
+        let frame = ReplicationFrame {
+            client_id: ClientId::new(9),
+            server_tick: Tick::new(42),
+            entity_count: 1,
+            estimated_payload_bytes: 1,
+            entities: vec![EntityDelta {
+                entity_id: EntityId::new(100),
+                owner_epoch: OwnerEpoch::new(2),
+                components: vec![ComponentDelta {
+                    component_id: ComponentId::new(1),
+                    version: 9,
+                    flags: 0,
+                    bytes: vec![1],
+                }],
+            }],
+        };
+        let mut bytes = Vec::new();
+        BinaryFrameEncoder
+            .encode_replication(&frame, &mut bytes)
+            .expect("frame should encode");
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            BinaryFrameDecoder.decode_replication_ref(truncated),
+            Err(ReplicationFrameRefDecodeError::Binary(
+                BinaryDecodeError::Truncated { .. }
+            ))
+        ));
+        bytes.push(0xff);
+        assert_eq!(
+            BinaryFrameDecoder.decode_replication_ref(&bytes),
+            Err(ReplicationFrameRefDecodeError::Binary(
+                BinaryDecodeError::TrailingBytes(1)
+            ))
+        );
     }
 
     #[test]

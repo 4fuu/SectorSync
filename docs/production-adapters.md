@@ -68,6 +68,14 @@ insecure reversible test cipher to prove both hooks. `secure_key_rotation`
 demonstrates active/retiring/revoked key-id metadata. Neither example is a
 cryptographic recommendation.
 
+Client adapters that consume replication packets synchronously may use
+`BinaryFrameDecoder::decode_replication_ref` to avoid nested frame allocations.
+Borrowed component bytes are valid only while the immutable input packet is
+alive; queueing, cross-thread ownership transfer, or deferred application
+requires an owned frame or application-owned copy. The specialized decoder
+validates the complete frame before exposing iterators but does not interpret
+game component schemas or update the client world.
+
 The explicit `PlaintextPacketCipher` is only appropriate when another trusted
 layer already provides confidentiality or for tests that need authentication
 framing alone.

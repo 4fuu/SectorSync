@@ -31,6 +31,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Reusable typed-component encoding scratch and in-place blob byte updates.
 - Dense replication frames use bounded dirty-data sampling to reduce output
   buffer growth, while sparse frames conservatively retain normal allocation.
+- Replication receivers can iterate fully validated borrowed entity/component
+  views without materializing nested owned frame or payload buffers.
 - Bounded command, event, client packet, and station packet queues.
 - Gateway session expiry uses one allocation-free ordered-map retain scan.
 - Deployment stale-node marking updates state and route epochs in one
@@ -172,6 +174,8 @@ Representative integration flows:
 ```bash
 cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example replication_bridge
+cargo run -p sectorsync-bench --release --example replication_decode_borrowed
+cargo run -p sectorsync-bench --release --example replication_decode_borrowed -- --owned
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example load_sampling
 cargo run -p sectorsync-bench --release --example load_sampling_reuse
