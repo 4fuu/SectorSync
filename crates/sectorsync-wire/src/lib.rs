@@ -4,8 +4,8 @@
 
 use sectorsync_core::prelude::{
     BarrierId, BarrierState, ClientId, CommandEnvelope, CommandId, CommandPriority, ComponentId,
-    ComponentStore, EntityId, EventId, EventKind, EventPriority, OwnerEpoch, ReplicationPlan,
-    Station, StationEvent, StationId, Tick,
+    ComponentStore, EntityHandle, EntityId, EventId, EventKind, EventPriority, OwnerEpoch,
+    ReplicationPlan, Station, StationEvent, StationId, Tick,
 };
 
 /// Runtime frame kind.
@@ -141,9 +141,123 @@ pub struct ReplicationFrameBuilder {
 }
 
 impl ReplicationFrameBuilder {
+    const BINARY_HEADER_BYTES: usize = 1 + 8 + 8 + 4 + 4 + 4;
+    const BINARY_ENTITY_METADATA_BYTES: usize = 8 + 8 + 2;
+    const BINARY_COMPONENT_METADATA_BYTES: usize = 2 + 8 + 1 + 4;
+
     /// Creates a frame builder with explicit limits.
     pub const fn new(limits: ReplicationFrameLimits) -> Self {
         Self { limits }
+    }
+
+    /// Returns a bounded initial byte-capacity hint for direct binary encoding.
+    ///
+    /// The planner estimate supplements fixed wire metadata and is clamped by
+    /// the active entity, component, and component-byte limits. The result is a
+    /// hint rather than an encoded-size guarantee because dirty/missing
+    /// components are resolved during encoding.
+    pub fn binary_capacity_hint(
+        &self,
+        plan: &ReplicationPlan,
+        selection: &ComponentSelection,
+    ) -> usize {
+        let entities = plan.entities.len().min(self.limits.max_entity_deltas);
+        let components = selection
+            .component_ids
+            .len()
+            .min(self.limits.max_components_per_entity);
+        let fixed_bytes =
+            Self::BINARY_HEADER_BYTES.saturating_add(entities.saturating_mul(
+                Self::BINARY_ENTITY_METADATA_BYTES.saturating_add(
+                    components.saturating_mul(Self::BINARY_COMPONENT_METADATA_BYTES),
+                ),
+            ));
+        let maximum_payload_bytes = entities
+            .saturating_mul(components)
+            .saturating_mul(self.limits.max_component_bytes);
+        fixed_bytes.saturating_add(plan.stats.estimated_bytes.min(maximum_payload_bytes))
+    }
+
+    /// Returns a dense-dirty-data initial capacity hint from at most four
+    /// uniformly distributed entities in `plan`.
+    ///
+    /// Sampling avoids a full metadata prepass. If any sample has no encodable
+    /// dirty component, this conservatively returns zero and lets the output
+    /// buffer grow normally. Nonzero estimates remain bounded by active limits.
+    pub fn sampled_binary_capacity_hint(
+        &self,
+        station: &Station,
+        plan: &ReplicationPlan,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+    ) -> usize {
+        const MAX_SAMPLES: usize = 4;
+        let candidates = plan.entities.len();
+        let samples = candidates.min(MAX_SAMPLES);
+        if samples == 0 {
+            return 0;
+        }
+        let denominator = samples.saturating_mul(2);
+        let mut sampled_bytes = 0_usize;
+        for sample in 0..samples {
+            let numerator = sample.saturating_mul(2).saturating_add(1);
+            let index = numerator.saturating_mul(candidates) / denominator;
+            let entity_bytes = self.binary_entity_bytes(
+                station,
+                plan.entities[index.min(candidates - 1)],
+                components,
+                selection,
+            );
+            if entity_bytes == 0 {
+                return 0;
+            }
+            sampled_bytes = sampled_bytes.saturating_add(entity_bytes);
+        }
+        let estimated_entity_bytes = sampled_bytes.saturating_mul(candidates).div_ceil(samples);
+        let maximum_entities = candidates.min(self.limits.max_entity_deltas);
+        let maximum_components = selection
+            .component_ids
+            .len()
+            .min(self.limits.max_components_per_entity);
+        let maximum_entity_bytes = Self::BINARY_ENTITY_METADATA_BYTES.saturating_add(
+            maximum_components.saturating_mul(
+                Self::BINARY_COMPONENT_METADATA_BYTES
+                    .saturating_add(self.limits.max_component_bytes),
+            ),
+        );
+        Self::BINARY_HEADER_BYTES.saturating_add(
+            estimated_entity_bytes.min(maximum_entities.saturating_mul(maximum_entity_bytes)),
+        )
+    }
+
+    fn binary_entity_bytes(
+        &self,
+        station: &Station,
+        handle: EntityHandle,
+        components: &ComponentStore,
+        selection: &ComponentSelection,
+    ) -> usize {
+        if station.get(handle).is_none() {
+            return 0;
+        }
+        let mut bytes = Self::BINARY_ENTITY_METADATA_BYTES;
+        let mut encoded_components = 0_usize;
+        for component_id in &selection.component_ids {
+            if encoded_components >= self.limits.max_components_per_entity {
+                break;
+            }
+            let Some(blob) = components.get_blob(*component_id, handle) else {
+                continue;
+            };
+            if !blob.dirty || blob.bytes.len() > self.limits.max_component_bytes {
+                continue;
+            }
+            bytes = bytes
+                .saturating_add(Self::BINARY_COMPONENT_METADATA_BYTES)
+                .saturating_add(blob.bytes.len());
+            encoded_components += 1;
+        }
+        if encoded_components == 0 { 0 } else { bytes }
     }
 
     /// Builds a frame from a station plan and component store.
@@ -1359,23 +1473,25 @@ mod tests {
             )
             .expect("typed component should encode");
 
-        let build = ReplicationFrameBuilder::new(ReplicationFrameLimits {
+        let builder = ReplicationFrameBuilder::new(ReplicationFrameLimits {
             max_entity_deltas: 8,
             max_components_per_entity: 4,
             max_component_bytes: 64,
-        })
-        .build(
+        });
+        let plan = ReplicationPlan {
+            entities: vec![handle],
+            stats: sectorsync_core::prelude::ReplicationStats::default(),
+        };
+        let selection = ComponentSelection {
+            component_ids: vec![ComponentId::new(1)],
+        };
+        let build = builder.build(
             ClientId::new(5),
             Tick::new(9),
             &station,
-            &ReplicationPlan {
-                entities: vec![handle],
-                stats: sectorsync_core::prelude::ReplicationStats::default(),
-            },
+            &plan,
             &components,
-            &ComponentSelection {
-                component_ids: vec![ComponentId::new(1)],
-            },
+            &selection,
         );
 
         assert_eq!(build.stats.encoded_entities, 1);
@@ -1388,28 +1504,118 @@ mod tests {
             .encode_replication(&build.frame, &mut materialized_bytes)
             .expect("materialized frame should encode");
         let mut direct_bytes = Vec::new();
-        let direct_stats = ReplicationFrameBuilder::new(ReplicationFrameLimits {
-            max_entity_deltas: 8,
-            max_components_per_entity: 4,
-            max_component_bytes: 64,
-        })
-        .encode_binary_into(
-            ClientId::new(5),
-            Tick::new(9),
-            &station,
-            &ReplicationPlan {
-                entities: vec![handle],
-                stats: sectorsync_core::prelude::ReplicationStats::default(),
-            },
-            &components,
-            &ComponentSelection {
-                component_ids: vec![ComponentId::new(1)],
-            },
-            &mut direct_bytes,
-        )
-        .expect("plan should encode directly");
+        let direct_stats = builder
+            .encode_binary_into(
+                ClientId::new(5),
+                Tick::new(9),
+                &station,
+                &plan,
+                &components,
+                &selection,
+                &mut direct_bytes,
+            )
+            .expect("plan should encode directly");
 
         assert_eq!(direct_stats, build.stats);
         assert_eq!(direct_bytes, materialized_bytes);
+        assert_eq!(
+            builder.sampled_binary_capacity_hint(&station, &plan, &components, &selection),
+            direct_bytes.len()
+        );
+    }
+
+    #[test]
+    fn binary_capacity_hint_is_bounded_by_active_builder_limits() {
+        let builder = ReplicationFrameBuilder::new(ReplicationFrameLimits {
+            max_entity_deltas: 2,
+            max_components_per_entity: 2,
+            max_component_bytes: 32,
+        });
+        let plan = ReplicationPlan {
+            entities: vec![
+                EntityHandle::new(1, 0),
+                EntityHandle::new(2, 0),
+                EntityHandle::new(3, 0),
+            ],
+            stats: sectorsync_core::prelude::ReplicationStats {
+                estimated_bytes: usize::MAX,
+                ..sectorsync_core::prelude::ReplicationStats::default()
+            },
+        };
+        let selection = ComponentSelection {
+            component_ids: vec![
+                ComponentId::new(1),
+                ComponentId::new(2),
+                ComponentId::new(3),
+            ],
+        };
+
+        let fixed_bytes = 29 + 2 * (18 + 2 * 15);
+        let maximum_payload_bytes = 2 * 2 * 32;
+        assert_eq!(
+            builder.binary_capacity_hint(&plan, &selection),
+            fixed_bytes + maximum_payload_bytes
+        );
+    }
+
+    #[test]
+    fn sampled_capacity_hint_falls_back_when_any_sample_has_no_dirty_data() {
+        use sectorsync_core::prelude::{
+            Bounds, ComponentDescriptor, ComponentMigrationMode, ComponentSyncMode, InstanceId,
+            NodeId, PolicyId, Position3, ReplicationStats, StationConfig, U32LeCodec,
+        };
+
+        let mut station = Station::new(StationConfig {
+            station_id: StationId::new(1),
+            node_id: NodeId::new(1),
+            instance_id: InstanceId::new(1),
+            tick_rate_hz: 20,
+        });
+        let descriptor = ComponentDescriptor::sparse_blob(
+            ComponentId::new(1),
+            "health",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let mut components = ComponentStore::default();
+        let mut handles = Vec::new();
+        for entity in 0_u64..4 {
+            let handle = station
+                .spawn_owned(
+                    EntityId::new(entity),
+                    Position3::new(0.0, 0.0, 0.0),
+                    Bounds::Point,
+                    PolicyId::new(1),
+                )
+                .expect("entity ids are unique");
+            if entity < 3 {
+                components
+                    .set_typed(&descriptor, handle, 1, &U32LeCodec, &100)
+                    .expect("component should fit");
+            }
+            handles.push(handle);
+        }
+        let plan = ReplicationPlan {
+            entities: handles,
+            stats: ReplicationStats {
+                selected: 4,
+                estimated_bytes: 128,
+                ..ReplicationStats::default()
+            },
+        };
+        let selection = ComponentSelection {
+            component_ids: vec![ComponentId::new(1)],
+        };
+
+        assert_eq!(
+            ReplicationFrameBuilder::default().sampled_binary_capacity_hint(
+                &station,
+                &plan,
+                &components,
+                &selection,
+            ),
+            0
+        );
     }
 }

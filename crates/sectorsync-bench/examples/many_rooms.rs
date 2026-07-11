@@ -7,8 +7,8 @@ use sectorsync_core::prelude::{
     Bounds, CellIndex, CellIndexUpdate, ClientId, CompiledSyncPolicy, ComponentDescriptor,
     ComponentId, ComponentMigrationMode, ComponentStore, ComponentSyncMode, EntityHandle, EntityId,
     GridSpec, InstanceId, NodeId, PolicyId, PolicyTable, Position3, ReplicationBatchScratch,
-    ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station, StationConfig, StationId,
-    ViewerQuery,
+    ReplicationBudget, ReplicationPlan, ReplicationPlanner, ReplicationScratch, Station,
+    StationConfig, StationId, ViewerQuery,
 };
 use sectorsync_wire::{ComponentSelection, ReplicationFrameBuilder, ReplicationFrameLimits};
 
@@ -53,6 +53,13 @@ enum ComponentUpdateMode {
     ForceReplace,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FrameCapacityMode {
+    #[default]
+    Hint,
+    Growth,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Config {
     rooms: usize,
@@ -66,6 +73,7 @@ struct Config {
     dirty_percent: usize,
     component_update_percent: usize,
     component_update_mode: ComponentUpdateMode,
+    frame_capacity_mode: FrameCapacityMode,
     moving_percent: usize,
     movement_pattern: MovementPattern,
     index_update_mode: IndexUpdateMode,
@@ -91,6 +99,7 @@ impl Default for Config {
             dirty_percent: DEFAULT_DIRTY_PERCENT,
             component_update_percent: 0,
             component_update_mode: ComponentUpdateMode::InPlace,
+            frame_capacity_mode: FrameCapacityMode::Hint,
             moving_percent: 0,
             movement_pattern: MovementPattern::SameCell,
             index_update_mode: IndexUpdateMode::SameCellFastPath,
@@ -124,6 +133,11 @@ impl Config {
                 ComponentUpdateMode::ForceReplace
             } else {
                 ComponentUpdateMode::InPlace
+            },
+            frame_capacity_mode: if args.iter().any(|arg| arg == "--no-frame-capacity-hint") {
+                FrameCapacityMode::Growth
+            } else {
+                FrameCapacityMode::Hint
             },
             ..Self::default()
         };
@@ -275,6 +289,9 @@ struct Stats {
     component_updates: usize,
     component_updates_in_place: usize,
     component_updates_replaced: usize,
+    frame_capacity_hint_bytes: usize,
+    frame_capacity_bytes: usize,
+    frame_capacity_slack_bytes: usize,
     ticks_completed: usize,
     time_budget_exhausted: bool,
 }
@@ -301,6 +318,7 @@ struct Verdicts {
     retained_capacity: Check,
     movement: Check,
     component_updates: Check,
+    frame_capacity: Check,
 }
 
 impl Verdicts {
@@ -309,6 +327,7 @@ impl Verdicts {
             && self.retained_capacity.passed()
             && self.movement.passed()
             && self.component_updates.passed()
+            && self.frame_capacity.passed()
     }
 }
 
@@ -354,6 +373,7 @@ fn main() {
         retained_capacity: Check::from_bool(retained_capacity_sufficient(inventory, retained)),
         movement: Check::from_bool(movement_updates_succeeded(config, &stats)),
         component_updates: Check::from_bool(component_updates_succeeded(config, &stats)),
+        frame_capacity: Check::from_bool(frame_capacity_succeeded(config, &stats)),
     };
     let benchmark_ok = verdicts.all() && sweep_p99 <= config.sweep_p99_budget_ms;
 
@@ -392,6 +412,7 @@ fn main() {
     println!("dirty_percent={}", config.dirty_percent);
     println!("dirty_distribution=per-room-scaled");
     print_component_update_config(config);
+    print_frame_capacity_config(config);
     print_movement_config(config);
     println!("preallocate={}", config.preallocate);
     println!("ticks={}", config.ticks);
@@ -411,6 +432,7 @@ fn main() {
     );
     print_movement_stats(&stats);
     print_component_update_stats(&stats);
+    print_frame_capacity_stats(&stats);
     println!("setup_ms={setup_ms:.3}");
     print_latency_stats(&stats, sweep_p99);
     println!("threshold_sweep_ms_p99={:.3}", config.sweep_p99_budget_ms);
@@ -459,6 +481,13 @@ fn print_component_update_config(config: Config) {
     println!(
         "component_update_in_place={}",
         config.component_update_mode == ComponentUpdateMode::InPlace
+    );
+}
+
+fn print_frame_capacity_config(config: Config) {
+    println!(
+        "frame_capacity_hint_enabled={}",
+        config.frame_capacity_mode == FrameCapacityMode::Hint
     );
 }
 
@@ -525,6 +554,16 @@ fn component_updates_succeeded(config: Config, stats: &Stats) -> bool {
     }
 }
 
+fn frame_capacity_succeeded(config: Config, stats: &Stats) -> bool {
+    if stats.viewer_queries == 0 {
+        return stats.frame_capacity_hint_bytes == 0 && stats.frame_capacity_bytes == 0;
+    }
+    match config.frame_capacity_mode {
+        FrameCapacityMode::Hint => stats.frame_capacity_hint_bytes <= stats.frame_capacity_bytes,
+        FrameCapacityMode::Growth => stats.frame_capacity_hint_bytes == 0,
+    }
+}
+
 fn print_movement_stats(stats: &Stats) {
     println!("index_updates={}", stats.index_updates);
     println!("index_updates_inserted={}", stats.index_updates_inserted);
@@ -541,6 +580,18 @@ fn print_component_update_stats(stats: &Stats) {
     println!(
         "component_updates_replaced={}",
         stats.component_updates_replaced
+    );
+}
+
+fn print_frame_capacity_stats(stats: &Stats) {
+    println!(
+        "frame_capacity_hint_bytes={}",
+        stats.frame_capacity_hint_bytes
+    );
+    println!("frame_capacity_bytes={}", stats.frame_capacity_bytes);
+    println!(
+        "frame_capacity_slack_bytes={}",
+        stats.frame_capacity_slack_bytes
     );
 }
 
@@ -564,6 +615,10 @@ fn print_verdicts(verdicts: Verdicts) {
     println!(
         "threshold_component_updates_ok={}",
         verdicts.component_updates.passed()
+    );
+    println!(
+        "threshold_frame_capacity_ok={}",
+        verdicts.frame_capacity.passed()
     );
 }
 
@@ -865,31 +920,15 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
                     stats.selected_entities.saturating_add(batch.stats.selected);
                 let encoding_start = Instant::now();
                 for (viewer, plan) in work.viewers.iter().zip(batch.plans) {
-                    let mut bytes = Vec::new();
-                    let build_stats = replication
-                        .builder
-                        .encode_binary_into(
-                            viewer.client_id,
-                            work.station.tick(),
-                            &work.station,
-                            plan,
-                            &work.components,
-                            &replication.selection,
-                            &mut bytes,
-                        )
-                        .expect("guarded benchmark frame should encode");
-                    stats.encoded_entities = stats
-                        .encoded_entities
-                        .saturating_add(build_stats.encoded_entities);
-                    stats.encoded_components = stats
-                        .encoded_components
-                        .saturating_add(build_stats.encoded_components);
-                    if build_stats.encoded_entities == 0 {
-                        stats.frames_skipped_empty = stats.frames_skipped_empty.saturating_add(1);
-                    } else {
-                        stats.encoded_frames = stats.encoded_frames.saturating_add(1);
-                        stats.encoded_bytes = stats.encoded_bytes.saturating_add(bytes.len());
-                    }
+                    encode_viewer(
+                        &replication,
+                        viewer,
+                        plan,
+                        &work.station,
+                        &work.components,
+                        config.frame_capacity_mode,
+                        &mut stats,
+                    );
                 }
                 encoding_elapsed = encoding_elapsed.saturating_add(encoding_start.elapsed());
                 stats.batch_plan_slots_max = stats
@@ -913,6 +952,58 @@ fn run(rooms: &mut [Room], config: Config) -> Stats {
         stats.time_budget_exhausted |= started.elapsed() >= time_budget;
     }
     stats
+}
+
+fn encode_viewer(
+    replication: &ReplicationWorkload,
+    viewer: &ViewerQuery,
+    plan: &ReplicationPlan,
+    station: &Station,
+    components: &ComponentStore,
+    capacity_mode: FrameCapacityMode,
+    stats: &mut Stats,
+) {
+    let capacity_hint = match capacity_mode {
+        FrameCapacityMode::Hint => replication.builder.sampled_binary_capacity_hint(
+            station,
+            plan,
+            components,
+            &replication.selection,
+        ),
+        FrameCapacityMode::Growth => 0,
+    };
+    let mut bytes = Vec::with_capacity(capacity_hint);
+    stats.frame_capacity_hint_bytes = stats
+        .frame_capacity_hint_bytes
+        .saturating_add(capacity_hint);
+    let build_stats = replication
+        .builder
+        .encode_binary_into(
+            viewer.client_id,
+            station.tick(),
+            station,
+            plan,
+            components,
+            &replication.selection,
+            &mut bytes,
+        )
+        .expect("guarded benchmark frame should encode");
+    stats.frame_capacity_bytes = stats.frame_capacity_bytes.saturating_add(bytes.capacity());
+    stats.frame_capacity_slack_bytes = stats
+        .frame_capacity_slack_bytes
+        .saturating_add(bytes.capacity().saturating_sub(bytes.len()));
+    stats.encoded_entities = stats
+        .encoded_entities
+        .saturating_add(build_stats.encoded_entities);
+    stats.encoded_components = stats
+        .encoded_components
+        .saturating_add(build_stats.encoded_components);
+    if build_stats.encoded_entities == 0 {
+        stats.frames_skipped_empty = stats.frames_skipped_empty.saturating_add(1);
+    } else {
+        stats.encoded_frames = stats.encoded_frames.saturating_add(1);
+        stats.encoded_bytes = stats.encoded_bytes.saturating_add(bytes.len());
+    }
 }
 
 fn create_replication_workload(component_bytes: usize) -> ReplicationWorkload {
@@ -1106,6 +1197,37 @@ mod tests {
     }
 
     #[test]
+    fn frame_capacity_hint_is_enabled_by_default_and_can_be_disabled_for_comparison() {
+        assert_eq!(
+            Config::default().frame_capacity_mode,
+            FrameCapacityMode::Hint
+        );
+        let config = Config::from_args(["--no-frame-capacity-hint".to_owned()].into_iter());
+        assert_eq!(config.frame_capacity_mode, FrameCapacityMode::Growth);
+    }
+
+    #[test]
+    fn frame_capacity_comparison_records_growth_without_hints() {
+        let config = Config {
+            rooms: 1,
+            min_players: 1,
+            max_players: 1,
+            players_per_station: 1,
+            entities_per_player: 2,
+            frame_capacity_mode: FrameCapacityMode::Growth,
+            ticks: 1,
+            sweep_p99_budget_ms: f64::MAX,
+            ..Config::default()
+        };
+        let mut rooms = create_rooms(config);
+        let stats = run(&mut rooms, config);
+
+        assert_eq!(stats.frame_capacity_hint_bytes, 0);
+        assert!(stats.frame_capacity_bytes > 0);
+        assert!(frame_capacity_succeeded(config, &stats));
+    }
+
+    #[test]
     fn component_update_workload_records_in_place_updates() {
         let config = Config {
             rooms: 1,
@@ -1171,6 +1293,8 @@ mod tests {
         assert_eq!(stats.index_updates_inserted, 2);
         assert_eq!(stats.index_updates_unchanged, 0);
         assert_eq!(stats.index_updates_relocated, 0);
+        assert!(stats.frame_capacity_hint_bytes > 0);
+        assert!(frame_capacity_succeeded(config, &stats));
         assert!(movement_updates_succeeded(config, &stats));
     }
 

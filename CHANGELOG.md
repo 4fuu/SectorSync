@@ -36,6 +36,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 - Multi-cell sphere/AABB index updates now compare retained membership directly
   in deterministic grid order and allocate a new cell list only when membership
   actually changes.
+- Replication packet encoding now uses a builder-limited, four-entity dirty-data
+  sample to pre-size dense frames while conservatively falling back to normal
+  buffer growth for sparse or empty frames.
 
 ## [2026.7.10] - 2026-07-10
 

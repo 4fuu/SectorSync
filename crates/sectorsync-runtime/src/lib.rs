@@ -60,6 +60,8 @@ pub struct ReplicationTransportStats {
     pub frames_sent: usize,
     /// Bytes sent through client transport.
     pub bytes_sent: usize,
+    /// Initial packet byte capacity requested from bounded wire hints.
+    pub packet_capacity_hint_bytes: usize,
     /// Entities selected by AOI planning.
     pub entities_selected: usize,
     /// Entities skipped by replication planner budget.
@@ -152,6 +154,7 @@ impl ReplicationTransportBridge {
                 frames_skipped_empty: 0,
                 frames_sent: 0,
                 bytes_sent: 0,
+                packet_capacity_hint_bytes: 0,
                 entities_selected: 0,
                 entities_skipped_by_budget: 0,
                 entities_skipped_by_cadence: 0,
@@ -359,7 +362,14 @@ impl ReplicationTransportBridge {
             .entities_skipped_by_cadence
             .saturating_add(plan.stats.skipped_by_cadence);
 
-        let mut bytes = Vec::new();
+        let capacity_hint = self
+            .builder
+            .sampled_binary_capacity_hint(station, plan, components, selection);
+        let mut bytes = Vec::with_capacity(capacity_hint);
+        self.stats.packet_capacity_hint_bytes = self
+            .stats
+            .packet_capacity_hint_bytes
+            .saturating_add(capacity_hint);
         let build_stats = self.builder.encode_binary_into(
             client_id,
             server_tick,
@@ -4475,6 +4485,7 @@ mod tests {
         assert_eq!(bridge.stats().frames_sent, 1);
         assert_eq!(bridge.stats().entities_selected, 1);
         assert_eq!(bridge.stats().components_encoded, 1);
+        assert!(bridge.stats().packet_capacity_hint_bytes >= report.bytes_sent);
         assert!(bridge.planning_scratch.is_some());
     }
 

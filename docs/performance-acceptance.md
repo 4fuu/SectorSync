@@ -290,6 +290,25 @@ versus 9.855 ms with replacement, median sweep p99 was 29.158 ms versus
 component phase improved in every run; whole-sweep figures also include normal
 planning and encoding variance.
 
+Frame output capacity can be compared with `--no-frame-capacity-hint`. The
+default path samples at most four uniformly distributed planned entities and
+pre-sizes only when every sample contains encodable dirty data. Otherwise the
+hint is zero and the output uses normal `Vec` growth. Output includes
+`frame_capacity_hint_enabled`, cumulative `frame_capacity_hint_bytes`,
+`frame_capacity_bytes`, `frame_capacity_slack_bytes`, and
+`threshold_frame_capacity_ok`.
+
+In the 500-room, 4-10 player, 16-entities-per-player, 32-byte component shape at
+100% dirty density, five alternating release A/B runs reported median encoding
+p99 of 10.547 ms with sampling versus 12.442 ms without it, median sweep p99 of
+20.815 ms versus 22.967 ms, and median total time of 142.309 ms versus
+166.244 ms. Both paths emitted 105,630,128 bytes; cumulative output-buffer
+capacity was 105,630,128 bytes with hints versus 153,370,624 bytes through
+growth, eliminating 47,740,496 bytes of cumulative slack. At 10% and 0% dirty
+density the conservative gate returned zero hints and retained the same buffer
+capacities as the comparison path. These cumulative values describe allocation
+pressure across the run, not simultaneous resident memory.
+
 This workload does not include gameplay logic, room creation/destruction churn,
 idle-room scheduling, command/event pumps, kernel networking, persistence, or
 matchmaking. Treat it as evidence for active-room spatial planning and encoding,

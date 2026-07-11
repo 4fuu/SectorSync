@@ -114,6 +114,13 @@ planned repeatedly. Explicit parallel integrations retain at most one planning
 scratch lane per configured worker. Cadence and priority state must remain
 explicit.
 
+`ReplicationTransportBridge` also requests a bounded initial packet capacity
+when up to four uniformly sampled entities all contain encodable dirty data.
+Sparse or empty samples return a zero hint and retain normal `Vec` growth. Direct
+wire integrations can use `ReplicationFrameBuilder::sampled_binary_capacity_hint`
+before `encode_binary_into`; the planner-only `binary_capacity_hint` is available
+when component storage is not accessible.
+
 On the receive side, `ReplicationReceiveBridge` validates expected packet
 source and frame target before returning decoded frames. Applying those frames
 to a client world remains an external client responsibility.

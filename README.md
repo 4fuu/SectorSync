@@ -25,6 +25,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Reusable caller-owned query and replication scratch buffers.
 - Explicit Station, spatial-index, and component-column capacity reservation.
 - Reusable typed-component encoding scratch and in-place blob byte updates.
+- Dense replication frames use bounded dirty-data sampling to reduce output
+  buffer growth, while sparse frames conservatively retain normal allocation.
 - Bounded command, event, client packet, and station packet queues.
 - Binary command, acknowledgement, replication, barrier, dispatch, and station
   event frames.
@@ -231,6 +233,8 @@ Use `--moving-percent` to exercise indexed entity movement;
 movement, while `--force-index-reinsert` exists only for an old-path A/B
 comparison. Use `--component-update-percent` to exercise repeated component
 writes; `--force-component-replace` is its allocation/replacement comparison.
+`--no-frame-capacity-hint` disables dense-frame output capacity hints for an
+A/B comparison.
 This measures spatial planning and wire encoding, not gameplay, matchmaking,
 room lifecycle, persistence, or network capacity.
 
