@@ -928,6 +928,32 @@ limits, and bursts unless `--allow-heavy` is present; output includes room
 latency percentiles, exact queue/packet conservation, guard metadata,
 capacity/workload/lazy/time verdicts, and `benchmark_ok=true`.
 
+## In-Memory Batch Send Measurement
+
+`InMemoryTransportEndpoint::send_batch` processes packets under bounded
+64-packet lock segments. This amortizes shared Hub locking without allowing an
+arbitrarily large caller batch to monopolize the Hub. Packet validation and
+enqueue order match repeated `send` calls: the first error stops processing,
+retains the successful prefix, and leaves the suffix untouched.
+
+Compare bounded batch locking with per-packet sends using:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example in_memory_batch_send
+cargo run --release -q -p sectorsync-bench --example in_memory_batch_send -- --per-packet
+```
+
+The default workload prebuilds 100 batches of 1,000 eight-byte packets so
+outbound packet construction stays outside the timed send interval. Target
+queue growth remains part of both measured paths. Seven release runs reduced
+median batch p50 from 0.022 ms per-packet to 0.016 ms segmented, about 27%, while
+the structural expected lock count fell from 100,000 to 1,600. Both modes enqueue exactly
+100,000 packets and 800,000 payload bytes. Guards cap batches, packets/batch,
+payload bytes, total packets, and aggregate payload work unless
+`--allow-heavy` is present; output includes latency percentiles, send/expected-lock
+counts, queue and byte conservation, guard metadata, workload/call/time
+verdicts, and `benchmark_ok=true`.
+
 ## In-Memory Endpoint Lookup Measurement
 
 Client and Station in-memory transport registries use ordered maps below 2,048

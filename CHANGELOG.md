@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- In-memory Client batch sends now reuse one shared-state lock for bounded
+  64-packet segments instead of locking once per packet, preserving ordered
+  partial commits while preventing unbounded lock hold times.
 - In-memory Client sends now validate target capacity and enqueue through one
   mutable endpoint lookup instead of probing the same target map twice per
   packet; error ordering, backpressure, and statistics remain unchanged.

@@ -73,6 +73,11 @@ Client packet sends use one mutable target lookup for both queue-limit
 validation and enqueueing. Missing-target, queue-full, and packet-size errors
 retain their existing ordering, and successful packet/byte counters advance
 only after the packet enters the target queue.
+`InMemoryTransportEndpoint::send_batch` acquires shared Hub state once per
+bounded 64-packet segment rather than once per packet. Large batches yield the
+lock between segments so receive and other senders can progress. Packets remain
+ordered; the first failure returns immediately, retains the successfully queued
+prefix and its statistics, and does not process the remaining suffix.
 
 ## Per-Tick Order
 

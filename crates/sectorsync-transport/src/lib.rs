@@ -12,6 +12,7 @@ use sectorsync_core::prelude::{ClientId, StationId, Tick};
 
 const HASHED_BOUNDED_SET_MIN_CAPACITY: usize = 256;
 const HASHED_ENDPOINT_MAP_MIN_ENTRIES: usize = 2_048;
+const IN_MEMORY_BATCH_LOCK_PACKETS: usize = 64;
 
 #[derive(Clone, Debug)]
 enum AdaptiveEndpointMap<K, V> {
@@ -1875,14 +1876,13 @@ impl InMemoryTransportEndpoint {
             .get(&self.local_client_id)
             .map(|client| client.remote_addr))
     }
-}
 
-impl TransportSink for InMemoryTransportEndpoint {
-    type Error = InMemoryTransportError;
-
-    fn send(&mut self, packet: OutboundPacket) -> Result<(), Self::Error> {
+    fn send_locked(
+        inner: &mut InMemoryTransportInner,
+        local_client_id: ClientId,
+        packet: OutboundPacket,
+    ) -> Result<(), InMemoryTransportError> {
         let actual = packet.bytes.len();
-        let mut inner = self.hub.lock_inner()?;
         let limits = inner.limits;
         if actual > limits.max_packet_bytes {
             inner.stats.packets_rejected_bytes =
@@ -1895,8 +1895,8 @@ impl TransportSink for InMemoryTransportEndpoint {
 
         let source_addr = inner
             .clients
-            .get(&self.local_client_id)
-            .ok_or(InMemoryTransportError::MissingLocal(self.local_client_id))?
+            .get(&local_client_id)
+            .ok_or(InMemoryTransportError::MissingLocal(local_client_id))?
             .remote_addr;
         let target = inner
             .clients
@@ -1910,12 +1910,35 @@ impl TransportSink for InMemoryTransportEndpoint {
             });
         }
         target.queue.push_back(InboundPacket {
-            client_id: Some(self.local_client_id),
+            client_id: Some(local_client_id),
             remote_addr: source_addr,
             bytes: packet.bytes,
         });
         inner.stats.packets_sent = inner.stats.packets_sent.saturating_add(1);
         inner.stats.bytes_sent = inner.stats.bytes_sent.saturating_add(actual);
+        Ok(())
+    }
+}
+
+impl TransportSink for InMemoryTransportEndpoint {
+    type Error = InMemoryTransportError;
+
+    fn send(&mut self, packet: OutboundPacket) -> Result<(), Self::Error> {
+        let mut inner = self.hub.lock_inner()?;
+        Self::send_locked(&mut inner, self.local_client_id, packet)
+    }
+
+    fn send_batch(&mut self, batch: PacketBatch) -> Result<(), Self::Error> {
+        let mut packets = batch.packets.into_iter().peekable();
+        while packets.peek().is_some() {
+            let mut inner = self.hub.lock_inner()?;
+            for _ in 0..IN_MEMORY_BATCH_LOCK_PACKETS {
+                let Some(packet) = packets.next() else {
+                    return Ok(());
+                };
+                Self::send_locked(&mut inner, self.local_client_id, packet)?;
+            }
+        }
         Ok(())
     }
 }
@@ -5117,6 +5140,52 @@ mod tests {
                 .expect("capacity should read"),
             Some(peak)
         );
+    }
+
+    #[test]
+    fn in_memory_transport_batch_preserves_ordered_partial_commit() {
+        let source_id = ClientId::new(7);
+        let target_id = ClientId::new(0);
+        let hub = InMemoryTransportHub::new(ClientTransportLimits {
+            max_queued_packets_per_client: 65,
+            max_packet_bytes: 4,
+        });
+        let mut source = hub
+            .endpoint(source_id, memory_addr(20007))
+            .expect("source should register");
+        hub.endpoint(target_id, memory_addr(20000))
+            .expect("target should register");
+        let mut batch = PacketBatch::new();
+        for byte in 0..66_u8 {
+            batch.push(OutboundPacket {
+                client_id: target_id,
+                bytes: vec![byte],
+            });
+        }
+
+        assert_eq!(
+            source.send_batch(batch),
+            Err(InMemoryTransportError::QueueFull {
+                client_id: target_id,
+                capacity: 65,
+            })
+        );
+        let mut target = hub.endpoint_for_registered(target_id);
+        for byte in 0..65_u8 {
+            assert_eq!(
+                target
+                    .try_recv()
+                    .expect("receive should work")
+                    .expect("successful prefix should commit")
+                    .bytes,
+                vec![byte]
+            );
+        }
+        assert!(target.try_recv().expect("receive should work").is_none());
+        let stats = hub.stats().expect("stats should read");
+        assert_eq!(stats.packets_sent, 65);
+        assert_eq!(stats.bytes_sent, 65);
+        assert_eq!(stats.packets_rejected_full, 1);
     }
 
     #[test]
