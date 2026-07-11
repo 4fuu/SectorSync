@@ -40,6 +40,8 @@ strict Clippy, rustdoc, and a guarded performance acceptance runner.
 - Tick-boundary barriers for freeze, snapshot, upgrade, and resume workflows.
 - Runtime load sampling, conservative hotspot splitting, migration, and
   deterministic station scheduling.
+- Load-aware Station scheduling supports caller-owned score/candidate scratch
+  and deterministic top-k selection when the advancement budget is small.
 - Guarded smoke benchmarks with machine-readable latency, bandwidth, queue,
   scheduler, and scratch-capacity fields.
 
@@ -153,6 +155,9 @@ cargo run -p sectorsync-bench --example sdk_flow
 cargo run -p sectorsync-bench --example replication_bridge
 cargo run -p sectorsync-bench --example client_bridge
 cargo run -p sectorsync-bench --example load_sampling
+cargo run -p sectorsync-bench --example load_scheduler
+cargo run -p sectorsync-bench --release --example station_schedule_reuse
+cargo run -p sectorsync-bench --release --example station_schedule_reuse -- --fresh-output
 cargo run -p sectorsync-bench --example split_migration
 cargo run -p sectorsync-bench --example barrier_upgrade
 cargo run -p sectorsync-bench --example secure_command_ingress

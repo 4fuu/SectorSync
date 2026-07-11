@@ -175,6 +175,14 @@ runtime structures plus caller subscriber counts. Feed samples into
 `SplitScheduler` or `StationScheduler`. Keep target capacity, cooldown, action,
 and moved-cell limits explicit.
 
+For repeated load-aware scheduling, retain `StationScheduleScratch` and call
+`plan_loaded_into` or `advance_loaded_into`. The scratch keeps only derived
+Station scores and stateless candidates; the borrowed `StationScheduleView`
+must be consumed before the next call. Duplicate samples preserve existing
+last-value-wins behavior. When the advancement budget is less than half the
+Station count, the scheduler partitions and sorts only the deterministic top-k;
+larger budgets use full sorting.
+
 Execute ownership changes through `CellMigrationExecutor` or
 `EntityMigrationExecutor` so target ghosts are prewarmed, owner commit is
 single-authority, source ghosts survive the handoff window, and both spatial

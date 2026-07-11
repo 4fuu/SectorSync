@@ -450,6 +450,37 @@ the removed intermediate allocation paths, exact event-count equivalence, core
 priority/FIFO tests, and retained-capacity test rather than a host-specific
 latency delta.
 
+## Station Schedule Scratch Measurement
+
+`StationScheduleScratch` retains the Station-to-score hash table and candidate
+array across load-aware scheduling calls. `plan_loaded_into` and
+`advance_loaded_into` return a borrowed ordered view. When the selected budget
+is less than half the Station count, the scheduler uses the same total ordering
+as before to partition top-k and sort only the selected prefix; at or above half
+it uses full sorting:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example station_schedule_reuse
+cargo run --release -q -p sectorsync-bench --example station_schedule_reuse -- --fresh-output
+```
+
+The default workload contains 512 Stations, a selection limit of 16, 100 calls
+per tick, and 20 ticks. Without `--allow-heavy`, guards cap 2,000 Stations, 200
+calls per tick, and 30 ticks; the limit is always clamped to the active Station
+count and execution has a 10-second budget. Output includes the partition-path
+flag, exact selection checksum, fresh-output count, retained score/candidate
+capacity, latency percentiles, guard metadata, workload/path verdicts, and
+`benchmark_ok`.
+
+Five alternating release A/B runs produced the same `8,312,000` checksum. The
+reusable path created zero fresh results and retained score/candidate capacity;
+the comparison created 2,000 fresh scheduler results. Median tick p99 was
+1.764 ms with reuse versus 3.206 ms with fresh storage, about a 45% reduction on
+this development host. Core tests compare partition output with full sorting at
+zero, small, half, full, and oversized budget edges. A `limit=400` run reports
+`top_k_partition_applied=false` and the same `5,255,150` checksum for both output
+modes, confirming the high-budget fallback.
+
 ## Optional Heavy Calibration
 
 Medium, large, and manual scales never run implicitly. They require explicit

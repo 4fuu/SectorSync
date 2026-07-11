@@ -10,6 +10,9 @@ SectorSync uses `YYYY.MMDD.REVISION` calendar versions with an unpadded numeric
 
 ### Changed
 
+- Load-aware Station scheduling now offers caller-owned score/candidate scratch
+  and deterministic budgeted top-k selection, while high budgets retain the
+  existing full-sort path and owned APIs remain compatible.
 - Event draining now rotates delayed events in bounded priority queues and
   offers caller-owned ready-output APIs, eliminating delayed and per-Station
   temporary vectors while preserving priority/FIFO order.

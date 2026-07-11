@@ -4,7 +4,9 @@ use sectorsync_core::prelude::{
     CellCoord3, CellLoadSample, InstanceId, NodeId, Station, StationConfig, StationId,
     StationLoadSample,
 };
-use sectorsync_runtime::{StationScheduleConfig, StationScheduler, StationSet};
+use sectorsync_runtime::{
+    StationScheduleConfig, StationScheduleScratch, StationScheduler, StationSet,
+};
 
 fn main() {
     let mut stations = StationSet::default();
@@ -45,23 +47,34 @@ fn main() {
     ];
 
     let mut scheduler = StationScheduler::default();
-    let plan = scheduler.advance_loaded(
-        &mut stations,
-        &samples,
-        StationScheduleConfig {
-            max_station_advances_per_step: 2,
-        },
-    );
-
-    let selected = plan
-        .selected
-        .iter()
-        .map(|candidate| candidate.station_id.get().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut scratch = StationScheduleScratch::new();
+    let (considered, selected_count, advances, selected) = {
+        let plan = scheduler.advance_loaded_into(
+            &mut stations,
+            &samples,
+            StationScheduleConfig {
+                max_station_advances_per_step: 2,
+            },
+            &mut scratch,
+        );
+        let selected = plan
+            .selected
+            .iter()
+            .map(|candidate| candidate.station_id.get().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        (
+            plan.candidates_considered,
+            plan.stations_selected,
+            plan.total_advances,
+            selected,
+        )
+    };
     println!(
-        "load_scheduler considered={} selected={} advances={} station_ids=[{}]",
-        plan.candidates_considered, plan.stations_selected, plan.total_advances, selected
+        "load_scheduler considered={considered} selected={selected_count} advances={advances} \
+         station_ids=[{selected}] score_capacity={} candidate_capacity={}",
+        scratch.score_capacity(),
+        scratch.candidate_capacity()
     );
 }
 

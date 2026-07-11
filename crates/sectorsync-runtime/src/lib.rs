@@ -6,7 +6,7 @@ pub mod deployment;
 #[cfg(feature = "parallel")]
 mod parallel;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sectorsync_core::prelude::{
     BarrierId, BarrierScope, BarrierState, CellCoord3, CellIndex, CellLoadSample, ClientId,
@@ -3764,6 +3764,46 @@ pub struct StationSchedulePlan {
     pub selected: Vec<StationScheduleCandidate>,
 }
 
+/// Borrowed deterministic result from reusable Station scheduling storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationScheduleView<'a> {
+    /// Stations considered by this pass.
+    pub candidates_considered: usize,
+    /// Stations selected by this pass.
+    pub stations_selected: usize,
+    /// Station tick advances requested by this pass.
+    pub total_advances: usize,
+    /// Selected stations in deterministic execution order.
+    pub selected: &'a [StationScheduleCandidate],
+}
+
+/// Caller-owned reusable storage for load-aware Station scheduling.
+///
+/// Storage contains only derived pressure scores and stateless candidates. It
+/// does not retain scheduling decisions, cooldowns, or gameplay state.
+#[derive(Clone, Debug, Default)]
+pub struct StationScheduleScratch {
+    scores: HashMap<StationId, u64>,
+    candidates: Vec<StationScheduleCandidate>,
+}
+
+impl StationScheduleScratch {
+    /// Creates empty scheduling scratch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hash-table capacity retained for sampled Station scores.
+    pub fn score_capacity(&self) -> usize {
+        self.scores.capacity()
+    }
+
+    /// Candidate capacity retained across scheduling passes.
+    pub fn candidate_capacity(&self) -> usize {
+        self.candidates.capacity()
+    }
+}
+
 /// Basic in-process station scheduler.
 #[derive(Clone, Debug, Default)]
 pub struct StationScheduler {
@@ -3787,6 +3827,24 @@ impl StationScheduler {
         samples: &[StationLoadSample],
         config: StationScheduleConfig,
     ) -> StationSchedulePlan {
+        let mut scratch = StationScheduleScratch::default();
+        let view = self.plan_loaded_into(stations, samples, config, &mut scratch);
+        StationSchedulePlan {
+            candidates_considered: view.candidates_considered,
+            stations_selected: view.stations_selected,
+            total_advances: view.total_advances,
+            selected: view.selected.to_vec(),
+        }
+    }
+
+    /// Plans into caller-owned storage and returns a borrowed deterministic top-k view.
+    pub fn plan_loaded_into<'a>(
+        &self,
+        stations: &StationSet,
+        samples: &[StationLoadSample],
+        config: StationScheduleConfig,
+        scratch: &'a mut StationScheduleScratch,
+    ) -> StationScheduleView<'a> {
         let candidates_considered = stations.len();
         let limit = config
             .max_station_advances_per_step
@@ -3796,35 +3854,27 @@ impl StationScheduler {
             .map(|station| station.tick().get())
             .max()
             .unwrap_or(0);
-        let samples_by_station = samples
-            .iter()
-            .map(|sample| (sample.station_id, sample))
-            .collect::<BTreeMap<_, _>>();
-        let mut selected = stations
-            .iter()
-            .map(|station| {
-                let station_id = station.config().station_id;
-                let load_score = samples_by_station
-                    .get(&station_id)
-                    .map_or(0, |sample| station_schedule_score(sample));
-                StationScheduleCandidate {
-                    station_id,
-                    load_score,
-                    tick_lag: max_tick.saturating_sub(station.tick().get()),
-                }
-            })
-            .collect::<Vec<_>>();
+        scratch.scores.clear();
+        scratch.scores.reserve(samples.len());
+        for sample in samples {
+            scratch
+                .scores
+                .insert(sample.station_id, station_schedule_score(sample));
+        }
+        scratch.candidates.clear();
+        scratch.candidates.reserve(candidates_considered);
+        scratch.candidates.extend(stations.iter().map(|station| {
+            let station_id = station.config().station_id;
+            StationScheduleCandidate {
+                station_id,
+                load_score: scratch.scores.get(&station_id).copied().unwrap_or(0),
+                tick_lag: max_tick.saturating_sub(station.tick().get()),
+            }
+        }));
+        prioritize_station_candidates(&mut scratch.candidates, limit);
+        let selected = &scratch.candidates[..limit];
 
-        selected.sort_by(|left, right| {
-            right
-                .load_score
-                .cmp(&left.load_score)
-                .then_with(|| right.tick_lag.cmp(&left.tick_lag))
-                .then_with(|| left.station_id.cmp(&right.station_id))
-        });
-        selected.truncate(limit);
-
-        StationSchedulePlan {
+        StationScheduleView {
             candidates_considered,
             stations_selected: selected.len(),
             total_advances: selected.len(),
@@ -3841,6 +3891,24 @@ impl StationScheduler {
     ) -> StationSchedulePlan {
         let plan = self.plan_loaded(stations, samples, config);
         for candidate in &plan.selected {
+            if let Some(station) = stations.get_mut(candidate.station_id) {
+                station.advance_tick();
+                self.advanced_ticks = self.advanced_ticks.saturating_add(1);
+            }
+        }
+        plan
+    }
+
+    /// Advances a bounded top-k set using reusable caller-owned scheduling storage.
+    pub fn advance_loaded_into<'a>(
+        &mut self,
+        stations: &mut StationSet,
+        samples: &[StationLoadSample],
+        config: StationScheduleConfig,
+        scratch: &'a mut StationScheduleScratch,
+    ) -> StationScheduleView<'a> {
+        let plan = self.plan_loaded_into(stations, samples, config, scratch);
+        for candidate in plan.selected {
             if let Some(station) = stations.get_mut(candidate.station_id) {
                 station.advance_tick();
                 self.advanced_ticks = self.advanced_ticks.saturating_add(1);
@@ -3872,6 +3940,29 @@ impl StationScheduler {
             router.append_ready(station.config().station_id, station.tick(), events)?;
         }
         Ok(())
+    }
+}
+
+fn compare_station_schedule_candidates(
+    left: &StationScheduleCandidate,
+    right: &StationScheduleCandidate,
+) -> core::cmp::Ordering {
+    right
+        .load_score
+        .cmp(&left.load_score)
+        .then_with(|| right.tick_lag.cmp(&left.tick_lag))
+        .then_with(|| left.station_id.cmp(&right.station_id))
+}
+
+fn prioritize_station_candidates(candidates: &mut [StationScheduleCandidate], limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if limit.saturating_mul(2) < candidates.len() {
+        candidates.select_nth_unstable_by(limit, compare_station_schedule_candidates);
+        candidates[..limit].sort_by(compare_station_schedule_candidates);
+    } else {
+        candidates.sort_by(compare_station_schedule_candidates);
     }
 }
 
@@ -5586,6 +5677,81 @@ mod tests {
             stations.get(StationId::new(3)).expect("station").tick(),
             Tick::new(1)
         );
+    }
+
+    #[test]
+    fn station_scheduler_top_k_matches_full_sort_for_budget_edges() {
+        let candidates = (0_u32..257)
+            .map(|index| StationScheduleCandidate {
+                station_id: StationId::new(index),
+                load_score: u64::from(index.wrapping_mul(37) % 23),
+                tick_lag: u64::from(index.wrapping_mul(19) % 11),
+            })
+            .collect::<Vec<_>>();
+
+        for requested in [0, 1, 7, 64, 128, 129, 256, 257, 300] {
+            let limit = requested.min(candidates.len());
+            let mut expected = candidates.clone();
+            expected.sort_by(compare_station_schedule_candidates);
+            expected.truncate(limit);
+            let mut actual = candidates.clone();
+            prioritize_station_candidates(&mut actual, limit);
+
+            assert_eq!(&actual[..limit], expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn station_schedule_scratch_reuses_capacity_and_last_sample_wins() {
+        let mut stations = StationSet::default();
+        for station_id in 1..=8 {
+            stations.push(station(station_id, 10));
+        }
+        let samples = [
+            StationLoadSample {
+                station_id: StationId::new(3),
+                owned_entities: 1,
+                ..StationLoadSample::default()
+            },
+            StationLoadSample {
+                station_id: StationId::new(3),
+                owned_entities: 500,
+                ..StationLoadSample::default()
+            },
+        ];
+        let scheduler = StationScheduler::default();
+        let mut scratch = StationScheduleScratch::new();
+
+        {
+            let plan = scheduler.plan_loaded_into(
+                &stations,
+                &samples,
+                StationScheduleConfig {
+                    max_station_advances_per_step: 2,
+                },
+                &mut scratch,
+            );
+            assert_eq!(plan.candidates_considered, 8);
+            assert_eq!(plan.selected[0].station_id, StationId::new(3));
+            assert_eq!(
+                plan.selected[0].load_score,
+                station_schedule_score(&samples[1])
+            );
+        }
+        let score_capacity = scratch.score_capacity();
+        let candidate_capacity = scratch.candidate_capacity();
+
+        let plan = scheduler.plan_loaded_into(
+            &stations,
+            &samples[..1],
+            StationScheduleConfig {
+                max_station_advances_per_step: 1,
+            },
+            &mut scratch,
+        );
+        assert_eq!(plan.selected.len(), 1);
+        assert_eq!(scratch.score_capacity(), score_capacity);
+        assert_eq!(scratch.candidate_capacity(), candidate_capacity);
     }
 
     #[test]
