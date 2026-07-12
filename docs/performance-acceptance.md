@@ -421,6 +421,46 @@ These focused A/B runs isolate one algorithm, lookup, ownership, or allocation
 choice. Their percentages must not be added together or treated as whole-SDK
 speedups.
 
+### Batch AOI Candidate Reuse Measurement
+
+The configured batch planner quantizes each viewer sphere to the exact cell
+range used by `CellIndex`. Within one call, it queries the first occurrence of
+a repeated range and reuses that ordered candidate slice for later viewers.
+Unique ranges are never copied, cache entries are caller-owned and retained by
+`ReplicationBatchScratch`, and the product executor bounds active entries to 64
+by default. Visibility, eligibility, cadence, priority, and byte/entity budgets
+still run independently for every viewer.
+
+Run guarded dense and sparse comparisons with reuse enabled and disabled:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example batch_aoi_reuse -- `
+  --shape=identical --layout=dense
+cargo run --release -q -p sectorsync-bench --example batch_aoi_reuse -- `
+  --shape=identical --layout=dense --no-query-reuse
+cargo run --release -q -p sectorsync-bench --example batch_aoi_reuse -- `
+  --shape=partial --layout=sparse
+cargo run --release -q -p sectorsync-bench --example batch_aoi_reuse -- `
+  --shape=unique --layout=dense
+```
+
+Shapes cover identical ranges, paired partial overlap, mixed repeated/unique
+ranges, and fully unique quantized ranges. Guards cap 4,000 entities, 500
+viewers, and 30 calls without `--allow-heavy`; execution also has a 10-second
+budget. Machine-readable output includes unique/reused range counts, actual
+grid/occupied queries and scanned cells, retained cache capacity, deterministic
+output checksums, latency percentiles, and `benchmark_ok`.
+
+With 4,000 entities, 500 identical-range viewers, and 20 calls, five
+alternating release A/B runs produced identical outputs. Reuse performed 20
+occupied-cell queries versus 10,000 with reuse disabled. Median call p99 was
+1.209 ms versus 3.838 ms, about a 68.5% reduction on this development host.
+The fully unique shape reports zero reused ranges and equal query counts; a
+sample was effectively neutral at 0.325 ms versus 0.318 ms, so no unique-range
+latency improvement is claimed. Output equality, zero reuse for unique ranges,
+bounded retained capacity, reduced query work for repeated ranges, and
+`benchmark_ok=true` are the portable acceptance signals.
+
 ### Multi-Cell Bounds Update Measurement
 
 The guarded `multi_cell_bounds` benchmark covers repeated sphere updates whose

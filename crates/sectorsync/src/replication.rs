@@ -115,6 +115,8 @@ pub struct ReplicationExecutorConfig {
     pub budget: ReplicationBudget,
     /// Whether a valid empty frame should still be sent.
     pub send_empty_frames: bool,
+    /// Maximum repeated quantized AOI ranges cached within one batch call.
+    pub max_cached_query_ranges: usize,
 }
 
 impl ReplicationExecutorConfig {
@@ -124,6 +126,7 @@ impl ReplicationExecutorConfig {
             mode: ReplicationSelectionMode::Throughput,
             budget,
             send_empty_frames: false,
+            max_cached_query_ranges: 64,
         }
     }
 
@@ -133,6 +136,7 @@ impl ReplicationExecutorConfig {
             mode: ReplicationSelectionMode::Prioritized,
             budget,
             send_empty_frames: false,
+            max_cached_query_ranges: 64,
         }
     }
 
@@ -140,6 +144,13 @@ impl ReplicationExecutorConfig {
     #[must_use]
     pub const fn with_empty_frames(mut self, send: bool) -> Self {
         self.send_empty_frames = send;
+        self
+    }
+
+    /// Bounds within-call candidate reuse for repeated quantized AOI ranges.
+    #[must_use]
+    pub const fn with_cached_query_ranges(mut self, max_ranges: usize) -> Self {
+        self.max_cached_query_ranges = max_ranges;
         self
     }
 }
@@ -295,6 +306,18 @@ pub struct ReplicationExecutorStats {
     pub batch_plan_slots_max: usize,
     /// Maximum total entity capacity retained by batch plans.
     pub batch_entity_capacity_max: usize,
+    /// Distinct quantized AOI ranges observed across batch calls.
+    pub unique_query_ranges: usize,
+    /// Viewer queries served from within-call candidate reuse.
+    pub reused_query_ranges: usize,
+    /// Grid cells probed by configured batch planning.
+    pub grid_cells_probed: usize,
+    /// Occupied cells scanned by configured batch planning.
+    pub occupied_cells_scanned: usize,
+    /// Maximum retained repeated-range cache entries.
+    pub query_cache_slots_max: usize,
+    /// Maximum candidate capacity retained across query cache entries.
+    pub query_cache_candidate_capacity_max: usize,
 }
 
 /// Result of one viewer replication operation.
@@ -335,6 +358,14 @@ pub struct ReplicationBatchReport {
     pub encoded_components: usize,
     /// Encoded wire bytes submitted successfully.
     pub bytes_sent: usize,
+    /// Distinct quantized AOI ranges in this batch.
+    pub unique_query_ranges: usize,
+    /// Viewer queries served from within-call candidate reuse.
+    pub reused_query_ranges: usize,
+    /// Grid cells probed while producing this batch.
+    pub grid_cells_probed: usize,
+    /// Occupied cells scanned while producing this batch.
+    pub occupied_cells_scanned: usize,
 }
 
 impl ReplicationBatchReport {
@@ -351,6 +382,42 @@ impl ReplicationBatchReport {
             .encoded_components
             .saturating_add(report.encoded_components);
         self.bytes_sent = self.bytes_sent.saturating_add(report.bytes_sent);
+    }
+}
+
+fn record_batch_query_stats(
+    stats: &mut ReplicationExecutorStats,
+    batch: sectorsync_core::replication::ReplicationBatchStats,
+) {
+    stats.unique_query_ranges = stats
+        .unique_query_ranges
+        .saturating_add(batch.unique_query_ranges);
+    stats.reused_query_ranges = stats
+        .reused_query_ranges
+        .saturating_add(batch.reused_query_ranges);
+    stats.grid_cells_probed = stats
+        .grid_cells_probed
+        .saturating_add(batch.grid_cells_probed);
+    stats.occupied_cells_scanned = stats
+        .occupied_cells_scanned
+        .saturating_add(batch.occupied_cells_scanned);
+    stats.query_cache_slots_max = stats
+        .query_cache_slots_max
+        .max(batch.query_cache_capacity_max);
+    stats.query_cache_candidate_capacity_max = stats
+        .query_cache_candidate_capacity_max
+        .max(batch.query_cache_candidate_capacity_max);
+}
+
+fn batch_report_from_stats(
+    stats: sectorsync_core::replication::ReplicationBatchStats,
+) -> ReplicationBatchReport {
+    ReplicationBatchReport {
+        unique_query_ranges: stats.unique_query_ranges,
+        reused_query_ranges: stats.reused_query_ranges,
+        grid_cells_probed: stats.grid_cells_probed,
+        occupied_cells_scanned: stats.occupied_cells_scanned,
+        ..ReplicationBatchReport::default()
     }
 }
 
@@ -520,6 +587,7 @@ impl ReplicationExecutor {
             visibility,
             self.config.budget,
             self.config.mode,
+            self.config.max_cached_query_ranges,
             |viewer, handle, entity| eligibility.allows(station_id, viewer, handle, entity),
             |viewer, handle| last_sent.last_sent(station_id, viewer, handle),
             &mut self.scratch,
@@ -530,8 +598,9 @@ impl ReplicationExecutor {
             .stats
             .batch_entity_capacity_max
             .max(view.plans.iter().map(|plan| plan.entities.capacity()).sum());
+        record_batch_query_stats(&mut self.stats, view.stats);
 
-        let mut report = ReplicationBatchReport::default();
+        let mut report = batch_report_from_stats(view.stats);
         for (viewer, plan) in viewers.iter().zip(view.plans) {
             match send_plan(
                 self.config,
@@ -708,6 +777,7 @@ impl ParallelReplicationExecutor {
             visibility,
             self.config.budget,
             self.config.mode,
+            self.config.max_cached_query_ranges,
             |station_id, viewer, handle, entity| {
                 eligibility.allows(station_id, viewer, handle, entity)
             },
@@ -724,7 +794,21 @@ impl ParallelReplicationExecutor {
 
         let mut report = ReplicationBatchReport::default();
         for (batch, output) in batches.iter().zip(view.batches) {
-            for (viewer, plan) in batch.viewers.iter().zip(output.view().plans) {
+            let output_view = output.view();
+            record_batch_query_stats(&mut self.stats, output_view.stats);
+            report.unique_query_ranges = report
+                .unique_query_ranges
+                .saturating_add(output_view.stats.unique_query_ranges);
+            report.reused_query_ranges = report
+                .reused_query_ranges
+                .saturating_add(output_view.stats.reused_query_ranges);
+            report.grid_cells_probed = report
+                .grid_cells_probed
+                .saturating_add(output_view.stats.grid_cells_probed);
+            report.occupied_cells_scanned = report
+                .occupied_cells_scanned
+                .saturating_add(output_view.stats.occupied_cells_scanned);
+            for (viewer, plan) in batch.viewers.iter().zip(output_view.plans) {
                 match send_plan(
                     self.config,
                     self.builder,
@@ -1030,6 +1114,9 @@ mod tests {
         ));
         assert!(executor.stats().batch_plan_slots_max >= 2);
         assert!(executor.stats().batch_entity_capacity_max >= 2);
+        assert_eq!(executor.stats().unique_query_ranges, 1);
+        assert_eq!(executor.stats().reused_query_ranges, 1);
+        assert_eq!(executor.stats().query_cache_slots_max, 1);
     }
 
     #[test]

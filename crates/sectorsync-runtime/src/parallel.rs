@@ -274,6 +274,7 @@ impl ReplicationThreadPool {
         filter: &F,
         budget: ReplicationBudget,
         mode: ReplicationSelectionMode,
+        max_cached_query_ranges: usize,
         eligible: E,
         last_sent: L,
         scratch: &'a mut ParallelReplicationScratch,
@@ -306,6 +307,7 @@ impl ReplicationThreadPool {
                                 filter,
                                 budget,
                                 mode,
+                                max_cached_query_ranges,
                                 |viewer, handle, entity| {
                                     eligible(station_id, viewer, handle, entity)
                                 },

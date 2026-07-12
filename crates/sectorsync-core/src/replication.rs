@@ -10,6 +10,7 @@ use crate::ids::{ClientId, EntityHandle, Tick};
 use crate::interest::RangeOnlyVisibility;
 use crate::interest::{ViewerQuery, VisibilityFilter};
 use crate::policy::{CompiledSyncPolicy, PolicyTable};
+use crate::spatial::{Bounds, CellCoord3};
 use crate::spatial_index::{CellIndex, CellQueryScratch, CellQueryStats, CellQueryStrategy};
 use crate::station::Station;
 
@@ -163,20 +164,22 @@ pub struct ReplicationBatchStats {
     pub matching_cell_capacity_max: usize,
     /// Largest retained priority candidate capacity.
     pub priority_capacity_max: usize,
+    /// Distinct quantized AOI ranges observed in the batch.
+    pub unique_query_ranges: usize,
+    /// Viewer queries served from a within-call candidate cache.
+    pub reused_query_ranges: usize,
+    /// Candidate handles copied into reusable repeated-range cache entries.
+    pub cached_candidate_handles: usize,
+    /// Query-range cache entries retained for later batch calls.
+    pub query_cache_capacity_max: usize,
+    /// Candidate-handle capacity retained across query cache entries.
+    pub query_cache_candidate_capacity_max: usize,
 }
 
 impl ReplicationBatchStats {
     fn record(&mut self, plan: &ReplicationPlan, scratch: &ReplicationScratch) {
+        self.record_plan(plan, scratch);
         self.viewers = self.viewers.saturating_add(1);
-        self.candidates = self.candidates.saturating_add(plan.stats.candidates);
-        self.considered = self.considered.saturating_add(plan.stats.considered);
-        self.selected = self.selected.saturating_add(plan.stats.selected);
-        self.unexamined_after_budget = self
-            .unexamined_after_budget
-            .saturating_add(plan.stats.unexamined_after_budget);
-        self.estimated_bytes = self
-            .estimated_bytes
-            .saturating_add(plan.stats.estimated_bytes);
         let query = scratch.query_stats();
         match query.strategy {
             CellQueryStrategy::Grid => self.grid_queries = self.grid_queries.saturating_add(1),
@@ -191,6 +194,24 @@ impl ReplicationBatchStats {
             .occupied_cells_scanned
             .saturating_add(query.occupied_cells_scanned);
         self.matched_cells = self.matched_cells.saturating_add(query.matched_cells);
+    }
+
+    fn record_reused_query(&mut self, plan: &ReplicationPlan, scratch: &ReplicationScratch) {
+        self.record_plan(plan, scratch);
+        self.viewers = self.viewers.saturating_add(1);
+        self.reused_query_ranges = self.reused_query_ranges.saturating_add(1);
+    }
+
+    fn record_plan(&mut self, plan: &ReplicationPlan, scratch: &ReplicationScratch) {
+        self.candidates = self.candidates.saturating_add(plan.stats.candidates);
+        self.considered = self.considered.saturating_add(plan.stats.considered);
+        self.selected = self.selected.saturating_add(plan.stats.selected);
+        self.unexamined_after_budget = self
+            .unexamined_after_budget
+            .saturating_add(plan.stats.unexamined_after_budget);
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(plan.stats.estimated_bytes);
         self.candidate_capacity_max = self
             .candidate_capacity_max
             .max(scratch.candidate_capacity());
@@ -229,7 +250,33 @@ impl ReplicationBatchStats {
             .matching_cell_capacity_max
             .max(other.matching_cell_capacity_max);
         self.priority_capacity_max = self.priority_capacity_max.max(other.priority_capacity_max);
+        self.unique_query_ranges = self
+            .unique_query_ranges
+            .saturating_add(other.unique_query_ranges);
+        self.reused_query_ranges = self
+            .reused_query_ranges
+            .saturating_add(other.reused_query_ranges);
+        self.cached_candidate_handles = self
+            .cached_candidate_handles
+            .saturating_add(other.cached_candidate_handles);
+        self.query_cache_capacity_max = self
+            .query_cache_capacity_max
+            .max(other.query_cache_capacity_max);
+        self.query_cache_candidate_capacity_max = self
+            .query_cache_candidate_capacity_max
+            .max(other.query_cache_candidate_capacity_max);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BatchQueryKey {
+    min: CellCoord3,
+    max: CellCoord3,
+}
+
+#[derive(Clone, Debug)]
+struct CachedBatchQuery {
+    handles: Vec<EntityHandle>,
 }
 
 /// Ordered plans and aggregate statistics produced for a viewer batch.
@@ -260,31 +307,23 @@ pub struct ReplicationBatchScratch {
     plans: Vec<ReplicationPlan>,
     active_plans: usize,
     stats: ReplicationBatchStats,
+    query_counts: HashMap<BatchQueryKey, usize>,
+    query_cache_index: HashMap<BatchQueryKey, usize>,
+    query_cache: Vec<CachedBatchQuery>,
+    active_query_cache: usize,
 }
 
 impl ReplicationBatchScratch {
     /// Creates empty batch output storage.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             plans: Vec::new(),
             active_plans: 0,
-            stats: ReplicationBatchStats {
-                viewers: 0,
-                candidates: 0,
-                considered: 0,
-                selected: 0,
-                unexamined_after_budget: 0,
-                estimated_bytes: 0,
-                grid_queries: 0,
-                occupied_queries: 0,
-                grid_cells_probed: 0,
-                occupied_cells_scanned: 0,
-                matched_cells: 0,
-                candidate_capacity_max: 0,
-                dedup_capacity_max: 0,
-                matching_cell_capacity_max: 0,
-                priority_capacity_max: 0,
-            },
+            stats: ReplicationBatchStats::default(),
+            query_counts: HashMap::new(),
+            query_cache_index: HashMap::new(),
+            query_cache: Vec::new(),
+            active_query_cache: 0,
         }
     }
 
@@ -296,6 +335,19 @@ impl ReplicationBatchScratch {
     /// Total selected-entity capacity retained across all plan slots.
     pub fn retained_entity_capacity(&self) -> usize {
         self.plans.iter().map(|plan| plan.entities.capacity()).sum()
+    }
+
+    /// Query-range cache entries retained for later configured batch calls.
+    pub fn retained_query_cache_slots(&self) -> usize {
+        self.query_cache.len()
+    }
+
+    /// Candidate-handle capacity retained across query-range cache entries.
+    pub fn retained_query_cache_candidate_capacity(&self) -> usize {
+        self.query_cache
+            .iter()
+            .map(|entry| entry.handles.capacity())
+            .sum()
     }
 
     /// Returns the active result from the most recent planning call.
@@ -312,6 +364,72 @@ impl ReplicationBatchScratch {
         }
         self.active_plans = plans;
         self.stats = ReplicationBatchStats::default();
+        self.query_counts.clear();
+        self.query_cache_index.clear();
+        self.active_query_cache = 0;
+    }
+
+    fn prepare_query_ranges(&mut self, index: &CellIndex, viewers: &[ViewerQuery]) {
+        for viewer in viewers {
+            let key = batch_query_key(index, viewer);
+            let count = self.query_counts.entry(key).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        self.stats.unique_query_ranges = self.query_counts.len();
+    }
+
+    fn query_repeats(&self, key: BatchQueryKey) -> bool {
+        self.query_counts.get(&key).is_some_and(|count| *count > 1)
+    }
+
+    fn cached_query(&self, key: BatchQueryKey) -> Option<usize> {
+        self.query_cache_index.get(&key).copied()
+    }
+
+    fn cache_query(
+        &mut self,
+        key: BatchQueryKey,
+        handles: &[EntityHandle],
+        max_cached_query_ranges: usize,
+    ) {
+        if self.active_query_cache >= max_cached_query_ranges {
+            return;
+        }
+        let cache_index = self.active_query_cache;
+        if cache_index == self.query_cache.len() {
+            self.query_cache.push(CachedBatchQuery {
+                handles: Vec::new(),
+            });
+        }
+        let entry = &mut self.query_cache[cache_index];
+        entry.handles.clear();
+        entry.handles.extend_from_slice(handles);
+        self.query_cache_index.insert(key, cache_index);
+        self.active_query_cache = self.active_query_cache.saturating_add(1);
+        self.stats.cached_candidate_handles = self
+            .stats
+            .cached_candidate_handles
+            .saturating_add(handles.len());
+    }
+
+    fn record_query_cache_capacity(&mut self) {
+        self.stats.query_cache_capacity_max = self.query_cache.len();
+        self.stats.query_cache_candidate_capacity_max = self
+            .query_cache
+            .iter()
+            .map(|entry| entry.handles.capacity())
+            .sum();
+    }
+}
+
+fn batch_query_key(index: &CellIndex, viewer: &ViewerQuery) -> BatchQueryKey {
+    let aabb = Bounds::Sphere {
+        radius: viewer.radius,
+    }
+    .to_aabb(viewer.position);
+    BatchQueryKey {
+        min: index.grid().cell_at(aabb.min),
+        max: index.grid().cell_at(aabb.max),
     }
 }
 
@@ -759,10 +877,119 @@ impl ReplicationPlanner {
         E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
         L: Fn(&ViewerQuery, EntityHandle) -> Option<Tick>,
     {
+        index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+        let candidates = scratch.cell_query.handles();
+        Self::plan_for_candidates_configured_into(
+            station,
+            candidates,
+            policies,
+            viewer,
+            filter,
+            budget,
+            mode,
+            eligible,
+            last_sent,
+            &mut scratch.prioritized,
+            plan,
+        );
+    }
+
+    /// Plans viewers in input order through the configured reusable kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_viewers_configured_into<'a, F, E, L>(
+        station: &Station,
+        index: &CellIndex,
+        policies: &PolicyTable,
+        viewers: &[ViewerQuery],
+        filter: &F,
+        budget: ReplicationBudget,
+        mode: ReplicationSelectionMode,
+        max_cached_query_ranges: usize,
+        eligible: E,
+        last_sent: L,
+        scratch: &mut ReplicationScratch,
+        batch: &'a mut ReplicationBatchScratch,
+    ) -> ReplicationBatchView<'a>
+    where
+        F: VisibilityFilter,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
+        L: Fn(&ViewerQuery, EntityHandle) -> Option<Tick>,
+    {
+        batch.prepare(viewers.len());
+        batch.prepare_query_ranges(index, viewers);
+        for (viewer_index, viewer) in viewers.iter().enumerate() {
+            let key = batch_query_key(index, viewer);
+            if let Some(cache_index) = batch.cached_query(key) {
+                {
+                    let candidates = &batch.query_cache[cache_index].handles;
+                    let plan = &mut batch.plans[viewer_index];
+                    Self::plan_for_candidates_configured_into(
+                        station,
+                        candidates,
+                        policies,
+                        viewer,
+                        filter,
+                        budget,
+                        mode,
+                        &eligible,
+                        &last_sent,
+                        &mut scratch.prioritized,
+                        plan,
+                    );
+                }
+                batch
+                    .stats
+                    .record_reused_query(&batch.plans[viewer_index], scratch);
+                continue;
+            }
+
+            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
+            if batch.query_repeats(key) {
+                batch.cache_query(key, scratch.cell_query.handles(), max_cached_query_ranges);
+            }
+            {
+                let candidates = scratch.cell_query.handles();
+                let plan = &mut batch.plans[viewer_index];
+                Self::plan_for_candidates_configured_into(
+                    station,
+                    candidates,
+                    policies,
+                    viewer,
+                    filter,
+                    budget,
+                    mode,
+                    &eligible,
+                    &last_sent,
+                    &mut scratch.prioritized,
+                    plan,
+                );
+            }
+            batch.stats.record(&batch.plans[viewer_index], scratch);
+        }
+        batch.record_query_cache_capacity();
+        batch.view()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_for_candidates_configured_into<F, E, L>(
+        station: &Station,
+        candidates: &[EntityHandle],
+        policies: &PolicyTable,
+        viewer: &ViewerQuery,
+        filter: &F,
+        budget: ReplicationBudget,
+        mode: ReplicationSelectionMode,
+        eligible: E,
+        last_sent: L,
+        prioritized: &mut Vec<PrioritizedReplicationCandidate>,
+        plan: &mut ReplicationPlan,
+    ) where
+        F: VisibilityFilter,
+        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
+        L: Fn(&ViewerQuery, EntityHandle) -> Option<Tick>,
+    {
         let tick_rate_hz = station.config().tick_rate_hz;
         let now = station.tick();
-        let candidates =
-            index.query_sphere_into(viewer.position, viewer.radius, &mut scratch.cell_query);
         match mode {
             ReplicationSelectionMode::Throughput => Self::plan_for_candidates_inner_into(
                 station,
@@ -792,7 +1019,7 @@ impl ReplicationPlanner {
                     viewer,
                     filter,
                     budget,
-                    &mut scratch.prioritized,
+                    prioritized,
                     |handle, policy, distance_squared| {
                         ReplicationCadence::should_send(
                             policy,
@@ -807,37 +1034,6 @@ impl ReplicationPlanner {
                 );
             }
         }
-    }
-
-    /// Plans viewers in input order through the configured reusable kernel.
-    #[allow(clippy::too_many_arguments)]
-    pub fn plan_for_viewers_configured_into<'a, F, E, L>(
-        station: &Station,
-        index: &CellIndex,
-        policies: &PolicyTable,
-        viewers: &[ViewerQuery],
-        filter: &F,
-        budget: ReplicationBudget,
-        mode: ReplicationSelectionMode,
-        eligible: E,
-        last_sent: L,
-        scratch: &mut ReplicationScratch,
-        batch: &'a mut ReplicationBatchScratch,
-    ) -> ReplicationBatchView<'a>
-    where
-        F: VisibilityFilter,
-        E: Fn(&ViewerQuery, EntityHandle, &EntityRecord) -> bool,
-        L: Fn(&ViewerQuery, EntityHandle) -> Option<Tick>,
-    {
-        batch.prepare(viewers.len());
-        for (plan, viewer) in batch.plans[..viewers.len()].iter_mut().zip(viewers) {
-            Self::plan_for_viewer_configured_into(
-                station, index, policies, viewer, filter, budget, mode, &eligible, &last_sent,
-                scratch, plan,
-            );
-            batch.stats.record(plan, scratch);
-        }
-        batch.view()
     }
 
     /// Plans a frame for one viewer using the station-local spatial index.
@@ -2332,6 +2528,117 @@ mod tests {
         );
         assert_eq!(plan.entities, vec![low_handle]);
         assert_eq!(plan.stats.skipped_by_cadence, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn configured_batch_reuses_only_repeated_quantized_aoi_ranges() {
+        let mut station = Station::with_capacity(
+            StationConfig {
+                station_id: StationId::new(1),
+                node_id: NodeId::new(1),
+                instance_id: InstanceId::new(1),
+                tick_rate_hz: 20,
+            },
+            64,
+        );
+        let mut index = CellIndex::with_capacity(GridSpec::new(16.0).expect("grid"), 64, 64);
+        let mut policies = PolicyTable::default();
+        policies.set(CompiledSyncPolicy::new(PolicyId::new(1), 20, 20, 128.0));
+        for entity in 0..64_u64 {
+            let lane = u16::try_from(entity % 8).expect("entity lane fits u16");
+            let position = Position3::new(f32::from(lane) * 8.0, 0.0, 0.0);
+            let handle = station
+                .spawn_owned(
+                    EntityId::new(entity + 1),
+                    position,
+                    Bounds::Point,
+                    PolicyId::new(1),
+                )
+                .expect("spawn");
+            index.upsert(handle, position, Bounds::Point);
+        }
+        let viewers = [
+            ViewerQuery {
+                client_id: ClientId::new(1),
+                position: Position3::new(0.0, 0.0, 0.0),
+                radius: 32.0,
+                max_entities: 64,
+            },
+            ViewerQuery {
+                client_id: ClientId::new(2),
+                position: Position3::new(1.0, 0.0, 0.0),
+                radius: 32.0,
+                max_entities: 64,
+            },
+            ViewerQuery {
+                client_id: ClientId::new(3),
+                position: Position3::new(24.0, 0.0, 0.0),
+                radius: 32.0,
+                max_entities: 64,
+            },
+            ViewerQuery {
+                client_id: ClientId::new(4),
+                position: Position3::new(80.0, 0.0, 0.0),
+                radius: 32.0,
+                max_entities: 64,
+            },
+        ];
+        let budget = ReplicationBudget {
+            max_entities: 64,
+            max_bytes: 64 * 32,
+            estimated_entity_bytes: 32,
+        };
+        let mut cached_scratch = ReplicationScratch::default();
+        let mut cached_output = ReplicationBatchScratch::default();
+        let cached = ReplicationPlanner::plan_for_viewers_configured_into(
+            &station,
+            &index,
+            &policies,
+            &viewers,
+            &RangeOnlyVisibility,
+            budget,
+            ReplicationSelectionMode::Throughput,
+            4,
+            |_, _, _| true,
+            |_, _| None,
+            &mut cached_scratch,
+            &mut cached_output,
+        );
+        let cached_plans = cached.plans.to_vec();
+        let cached_stats = cached.stats;
+
+        let mut uncached_scratch = ReplicationScratch::default();
+        let mut uncached_output = ReplicationBatchScratch::default();
+        let uncached = ReplicationPlanner::plan_for_viewers_configured_into(
+            &station,
+            &index,
+            &policies,
+            &viewers,
+            &RangeOnlyVisibility,
+            budget,
+            ReplicationSelectionMode::Throughput,
+            0,
+            |_, _, _| true,
+            |_, _| None,
+            &mut uncached_scratch,
+            &mut uncached_output,
+        );
+
+        assert_eq!(cached_plans, uncached.plans);
+        assert_eq!(cached_stats.unique_query_ranges, 3);
+        assert_eq!(cached_stats.reused_query_ranges, 1);
+        assert_eq!(uncached.stats.reused_query_ranges, 0);
+        assert_eq!(
+            cached_stats.grid_queries + cached_stats.occupied_queries,
+            viewers.len() - 1
+        );
+        assert_eq!(
+            uncached.stats.grid_queries + uncached.stats.occupied_queries,
+            viewers.len()
+        );
+        assert_eq!(cached_output.retained_query_cache_slots(), 1);
+        assert!(cached_output.retained_query_cache_candidate_capacity() >= 1);
     }
 
     #[test]
