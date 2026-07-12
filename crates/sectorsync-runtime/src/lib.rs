@@ -2717,64 +2717,9 @@ impl StationLoadSampler {
         self.config
     }
 
-    /// Samples one station from its storage, optional index, queued event count,
-    /// and caller-provided subscriber estimate.
-    pub fn sample_station(
-        &self,
-        station: &Station,
-        index: Option<&CellIndex>,
-        queued_events: usize,
-        subscribers: usize,
-    ) -> StationLoadSample {
-        let mut sample = StationLoadSample::default();
-        let mut occupancy = Vec::new();
-        self.sample_station_into(
-            station,
-            index,
-            queued_events,
-            subscribers,
-            &mut occupancy,
-            &mut sample,
-        );
-        sample
-    }
-
-    /// Samples every station in deterministic station-set order.
-    ///
-    /// `subscriber_counts` is explicit integration input: `SectorSync` can use it
-    /// for load decisions, but does not own gateway/client/session business state.
-    /// Counts with the same station id are aggregated with saturating arithmetic.
-    /// Because the event router and subscriber input are station-scoped, their
-    /// pressure stays on the station sample instead of being invented per cell.
-    pub fn sample_all(
-        &self,
-        stations: &StationSet,
-        indexes: &StationIndexSet,
-        router: &EventRouter,
-        subscriber_counts: &[(StationId, usize)],
-    ) -> Vec<StationLoadSample> {
-        let subscribers_by_station = station_count_map(subscriber_counts);
-        stations
-            .iter()
-            .map(|station| {
-                let station_id = station.config().station_id;
-                self.sample_station(
-                    station,
-                    indexes.get(station_id),
-                    router.queued_len(station_id).unwrap_or(0),
-                    subscribers_by_station
-                        .get(&station_id)
-                        .copied()
-                        .unwrap_or(0),
-                )
-            })
-            .collect()
-    }
-
     /// Samples every station into caller-owned storage and returns its active prefix.
     ///
-    /// Station order and aggregation semantics match [`Self::sample_all`]. Reusing
-    /// the same scratch retains subscriber, occupancy, station, and per-cell storage.
+    /// Reusing the same scratch retains subscriber, occupancy, station, and per-cell storage.
     pub fn sample_all_into<'a>(
         &self,
         stations: &StationSet,
@@ -2932,15 +2877,6 @@ fn count_station_roles(station: &Station) -> (usize, usize) {
         }
     }
     (owned_entities, ghost_entities)
-}
-
-fn station_count_map(counts: &[(StationId, usize)]) -> BTreeMap<StationId, usize> {
-    let mut map = BTreeMap::new();
-    for (station_id, count) in counts {
-        let entry = map.entry(*station_id).or_insert(0usize);
-        *entry = entry.saturating_add(*count);
-    }
-    map
 }
 
 /// Result of an in-process entity owner migration.
@@ -3435,6 +3371,22 @@ pub struct SplitScheduleView<'a> {
     pub skipped_insufficient_improvement: usize,
 }
 
+impl SplitSchedule {
+    /// Borrows this owned schedule for the canonical execution kernel.
+    pub fn view(&self) -> SplitScheduleView<'_> {
+        SplitScheduleView {
+            decisions: &self.decisions,
+            actions: &self.actions,
+            skipped_no_target: self.skipped_no_target,
+            skipped_no_cells: self.skipped_no_cells,
+            skipped_cooldown: self.skipped_cooldown,
+            skipped_target_severity: self.skipped_target_severity,
+            skipped_target_capacity: self.skipped_target_capacity,
+            skipped_insufficient_improvement: self.skipped_insufficient_improvement,
+        }
+    }
+}
+
 impl From<SplitScheduleView<'_>> for SplitSchedule {
     fn from(view: SplitScheduleView<'_>) -> Self {
         Self {
@@ -3733,61 +3685,8 @@ impl SplitScheduler {
         Self { config }
     }
 
-    /// Plans split actions from station load samples.
-    pub fn plan(&self, samples: &[StationLoadSample]) -> SplitSchedule {
-        let mut scratch = SplitSchedulerScratch::new();
-        self.plan_into(samples, &mut scratch).into()
-    }
-
-    /// Plans into fully reusable caller-owned output and working storage.
+    /// Plans with optional cooldown state into fully reusable caller-owned storage.
     pub fn plan_into<'a>(
-        &self,
-        samples: &[StationLoadSample],
-        scratch: &'a mut SplitSchedulerScratch,
-    ) -> SplitScheduleView<'a> {
-        self.plan_with_state_into(samples, None, Tick::new(0), scratch)
-    }
-
-    /// Plans split actions using reusable hotspot cell candidate storage.
-    pub fn plan_with_scratch(
-        &self,
-        samples: &[StationLoadSample],
-        scratch: &mut HotspotSplitScratch,
-    ) -> SplitSchedule {
-        self.plan_with_state_and_scratch(samples, None, Tick::new(0), scratch)
-    }
-
-    /// Plans split actions using optional cooldown state.
-    pub fn plan_with_state(
-        &self,
-        samples: &[StationLoadSample],
-        state: Option<&SplitSchedulerState>,
-        current_tick: Tick,
-    ) -> SplitSchedule {
-        let mut scratch = SplitSchedulerScratch::new();
-        self.plan_with_state_into(samples, state, current_tick, &mut scratch)
-            .into()
-    }
-
-    /// Plans with optional cooldown state and reusable hotspot candidate storage.
-    pub fn plan_with_state_and_scratch(
-        &self,
-        samples: &[StationLoadSample],
-        state: Option<&SplitSchedulerState>,
-        current_tick: Tick,
-        scratch: &mut HotspotSplitScratch,
-    ) -> SplitSchedule {
-        let mut scheduler_scratch = SplitSchedulerScratch::new();
-        core::mem::swap(&mut scheduler_scratch.hotspot, scratch);
-        let schedule = self
-            .plan_with_state_into(samples, state, current_tick, &mut scheduler_scratch)
-            .into();
-        core::mem::swap(&mut scheduler_scratch.hotspot, scratch);
-        schedule
-    }
-
-    /// Plans with optional cooldown state into fully reusable scheduler storage.
-    pub fn plan_with_state_into<'a>(
         &self,
         samples: &[StationLoadSample],
         state: Option<&SplitSchedulerState>,
@@ -3877,42 +3776,8 @@ impl SplitScheduler {
         scratch.view()
     }
 
-    /// Executes a split schedule by applying ownership updates and migrating entities.
-    pub fn execute(
-        &self,
-        schedule: &SplitSchedule,
-        stations: &mut StationSet,
-        indexes: &mut StationIndexSet,
-        ownership: &mut CellOwnershipTable,
-    ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
-        self.execute_actions(&schedule.actions, stations, indexes, ownership)
-    }
-
-    /// Executes actions directly from a borrowed reusable schedule view.
-    pub fn execute_view(
-        &self,
-        schedule: SplitScheduleView<'_>,
-        stations: &mut StationSet,
-        indexes: &mut StationIndexSet,
-        ownership: &mut CellOwnershipTable,
-    ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
-        self.execute_actions(schedule.actions, stations, indexes, ownership)
-    }
-
-    /// Executes an owned schedule into fully reusable caller-owned storage.
-    pub fn execute_into<'a>(
-        &self,
-        schedule: &SplitSchedule,
-        stations: &mut StationSet,
-        indexes: &mut StationIndexSet,
-        ownership: &mut CellOwnershipTable,
-        scratch: &'a mut SplitScheduleExecutionScratch,
-    ) -> Result<SplitScheduleExecutionView<'a>, SplitScheduleExecutionError> {
-        self.execute_actions_into(&schedule.actions, stations, indexes, ownership, scratch)
-    }
-
     /// Executes a borrowed schedule into fully reusable caller-owned storage.
-    pub fn execute_view_into<'a>(
+    pub fn execute_into<'a>(
         &self,
         schedule: SplitScheduleView<'_>,
         stations: &mut StationSet,
@@ -3966,47 +3831,6 @@ impl SplitScheduler {
         }
 
         Ok(scratch.view())
-    }
-
-    fn execute_actions(
-        &self,
-        actions: &[SplitAction],
-        stations: &mut StationSet,
-        indexes: &mut StationIndexSet,
-        ownership: &mut CellOwnershipTable,
-    ) -> Result<SplitScheduleExecutionReport, SplitScheduleExecutionError> {
-        let mut report = SplitScheduleExecutionReport::default();
-
-        for action in actions {
-            if indexes.get(action.source_station).is_none() {
-                return Err(SplitScheduleExecutionError::MissingSourceIndex(
-                    action.source_station,
-                ));
-            }
-            if indexes.get(action.target_station).is_none() {
-                return Err(SplitScheduleExecutionError::MissingTargetIndex(
-                    action.target_station,
-                ));
-            }
-
-            let update = ownership.apply_split(&action.proposal, action.target_station);
-            let (source_index, target_index) = indexes
-                .get_pair_mut(action.source_station, action.target_station)
-                .expect("indexes were checked above");
-            let migration = CellMigrationExecutor::migrate_cells(
-                stations,
-                source_index,
-                target_index,
-                action.source_station,
-                action.target_station,
-                &update.moved_cells,
-                self.config.ghost_ttl_ticks,
-            )?;
-            report.ownership_updates.push(update);
-            report.cell_migrations.push(migration);
-        }
-
-        Ok(report)
     }
 }
 
@@ -6971,11 +6795,13 @@ mod tests {
 
         assert_eq!(indexes.iter().count(), 1);
         let load_sampler = StationLoadSampler::default();
-        let samples = load_sampler.sample_all(
+        let mut load_scratch = StationLoadSamplerScratch::new();
+        let samples = load_sampler.sample_all_into(
             &stations,
             &indexes,
             &router,
             &[(station_id, 2), (station_id, 3)],
+            &mut load_scratch,
         );
 
         assert_eq!(samples.len(), 1);
@@ -7019,7 +6845,7 @@ mod tests {
             &indexes,
             &router,
             station_id,
-            &samples,
+            samples,
         );
     }
 
@@ -7386,7 +7212,9 @@ mod tests {
             ghost_ttl_ticks: 4,
             ..SplitSchedulerConfig::default()
         });
-        let schedule = scheduler.plan(&samples);
+        let mut planning = SplitSchedulerScratch::new();
+        let schedule =
+            SplitSchedule::from(scheduler.plan_into(&samples, None, Tick::new(0), &mut planning));
         assert_eq!(schedule.actions.len(), 1);
         assert_eq!(schedule.actions[0].target_station, StationId::new(2));
 
@@ -7397,7 +7225,7 @@ mod tests {
         {
             let report = scheduler
                 .execute_into(
-                    &schedule,
+                    schedule.view(),
                     &mut stations,
                     &mut indexes,
                     &mut ownership,
@@ -7438,7 +7266,7 @@ mod tests {
         let empty = SplitSchedule::default();
         let empty_report = scheduler
             .execute_into(
-                &empty,
+                empty.view(),
                 &mut stations,
                 &mut indexes,
                 &mut ownership,
@@ -7482,15 +7310,22 @@ mod tests {
         });
         let mut state = SplitSchedulerState::default();
 
-        let initial = scheduler.plan_with_state(&samples, Some(&state), Tick::new(5));
+        let mut scratch = SplitSchedulerScratch::new();
+        let initial = SplitSchedule::from(scheduler.plan_into(
+            &samples,
+            Some(&state),
+            Tick::new(5),
+            &mut scratch,
+        ));
         assert_eq!(initial.actions.len(), 1);
         state.record_schedule(&initial, Tick::new(5));
 
-        let cooled_down = scheduler.plan_with_state(&samples, Some(&state), Tick::new(8));
+        let cooled_down = scheduler.plan_into(&samples, Some(&state), Tick::new(8), &mut scratch);
         assert!(cooled_down.actions.is_empty());
         assert_eq!(cooled_down.skipped_cooldown, 1);
 
-        let after_cooldown = scheduler.plan_with_state(&samples, Some(&state), Tick::new(16));
+        let after_cooldown =
+            scheduler.plan_into(&samples, Some(&state), Tick::new(16), &mut scratch);
         assert_eq!(after_cooldown.actions.len(), 1);
     }
 
@@ -7506,7 +7341,9 @@ mod tests {
             max_target_score_after_move: 1,
             ..SplitSchedulerConfig::default()
         });
-        let capacity_schedule = capacity_guard.plan(&samples);
+        let mut scratch = SplitSchedulerScratch::new();
+        let capacity_schedule =
+            capacity_guard.plan_into(&samples, None, Tick::new(0), &mut scratch);
         assert!(capacity_schedule.actions.is_empty());
         assert_eq!(capacity_schedule.skipped_target_capacity, 1);
 
@@ -7517,7 +7354,8 @@ mod tests {
             min_score_improvement: u64::MAX,
             ..SplitSchedulerConfig::default()
         });
-        let improvement_schedule = improvement_guard.plan(&samples);
+        let improvement_schedule =
+            improvement_guard.plan_into(&samples, None, Tick::new(0), &mut scratch);
         assert!(improvement_schedule.actions.is_empty());
         assert_eq!(improvement_schedule.skipped_insufficient_improvement, 1);
     }
@@ -7532,11 +7370,12 @@ mod tests {
             max_cells_per_action: 1,
             ..SplitSchedulerConfig::default()
         });
-        let expected = scheduler.plan(&samples);
         let mut scratch = SplitSchedulerScratch::new();
+        let expected =
+            SplitSchedule::from(scheduler.plan_into(&samples, None, Tick::new(0), &mut scratch));
 
         {
-            let view = scheduler.plan_into(&samples, &mut scratch);
+            let view = scheduler.plan_into(&samples, None, Tick::new(0), &mut scratch);
             assert_eq!(SplitSchedule::from(view), expected);
         }
         let decision_slots = scratch.retained_decision_slots();
@@ -7550,7 +7389,7 @@ mod tests {
         assert!(action_cell_capacity > 0);
         assert!(candidate_capacity > 0);
 
-        let reduced = scheduler.plan_into(&samples[1..], &mut scratch);
+        let reduced = scheduler.plan_into(&samples[1..], None, Tick::new(0), &mut scratch);
         assert_eq!(reduced.decisions.len(), 1);
         assert!(reduced.actions.is_empty());
         assert_eq!(scratch.retained_decision_slots(), decision_slots);

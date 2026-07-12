@@ -115,12 +115,8 @@ impl SplitExecutor {
         current_tick: Tick,
     ) -> SplitScheduleView<'a> {
         self.planned_at = current_tick;
-        self.scheduler.plan_with_state_into(
-            samples,
-            Some(&self.state),
-            current_tick,
-            &mut self.planning,
-        )
+        self.scheduler
+            .plan_into(samples, Some(&self.state), current_tick, &mut self.planning)
     }
 
     /// Returns the current planned schedule without executing it.
@@ -136,7 +132,7 @@ impl SplitExecutor {
         ownership: &mut CellOwnershipTable,
     ) -> Result<SplitScheduleExecutionView<'a>, SplitScheduleExecutionError> {
         let schedule = self.planning.view();
-        let result = self.scheduler.execute_view_into(
+        let result = self.scheduler.execute_into(
             schedule,
             stations,
             indexes,

@@ -9,11 +9,11 @@ fn main() {
     let router = EventRouter::default();
 
     let mut sampler = LoadSampler::default();
-    let samples = sampler.sample(&stations, &indexes, &router, &[]);
+    let load = sampler.sample(&stations, &indexes, &router, &[]);
 
     let mut splits = SplitExecutor::default();
-    let schedule = splits.plan(samples, Tick::new(1));
+    let schedule = splits.plan(load, Tick::new(1));
 
-    println!("samples={}", samples.len());
+    println!("samples={}", load.len());
     println!("split_actions={}", schedule.actions.len());
 }

@@ -9,9 +9,8 @@ use sectorsync_core::prelude::{
     SplitProposal, Station, StationConfig, StationId,
 };
 use sectorsync_runtime::{
-    CellOwnershipTable, SplitAction, SplitSchedule, SplitScheduleExecutionReport,
-    SplitScheduleExecutionScratch, SplitScheduler, SplitSchedulerConfig, StationIndexSet,
-    StationSet,
+    CellOwnershipTable, SplitAction, SplitSchedule, SplitScheduleExecutionScratch, SplitScheduler,
+    SplitSchedulerConfig, StationIndexSet, StationSet,
 };
 
 const DEFAULT_ROOMS: usize = 10;
@@ -162,7 +161,7 @@ fn run(config: Config) -> ResultSummary {
         if config.reuse {
             let report = scheduler
                 .execute_into(
-                    schedule,
+                    schedule.view(),
                     &mut stations,
                     &mut indexes,
                     &mut ownership,
@@ -177,12 +176,20 @@ fn run(config: Config) -> ResultSummary {
                 &mut migration_checksum,
             );
         } else {
+            let mut fresh_scratch = SplitScheduleExecutionScratch::new();
             let report = scheduler
-                .execute(schedule, &mut stations, &mut indexes, &mut ownership)
+                .execute_into(
+                    schedule.view(),
+                    &mut stations,
+                    &mut indexes,
+                    &mut ownership,
+                    &mut fresh_scratch,
+                )
                 .expect("owned split execution should complete");
             fresh_execution_reports = fresh_execution_reports.saturating_add(1);
-            consume_owned_report(
-                &report,
+            consume_report(
+                report.ownership_updates,
+                report.cell_migrations,
                 &mut ownership_updates,
                 &mut entities_migrated,
                 &mut migration_checksum,
@@ -252,21 +259,6 @@ fn station(station_id: StationId, room: usize) -> Station {
         ),
         tick_rate_hz: 20,
     })
-}
-
-fn consume_owned_report(
-    report: &SplitScheduleExecutionReport,
-    ownership_updates: &mut usize,
-    entities_migrated: &mut usize,
-    checksum: &mut u64,
-) {
-    consume_report(
-        &report.ownership_updates,
-        &report.cell_migrations,
-        ownership_updates,
-        entities_migrated,
-        checksum,
-    );
 }
 
 fn consume_report(

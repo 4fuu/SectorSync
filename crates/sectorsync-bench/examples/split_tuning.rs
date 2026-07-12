@@ -1,10 +1,12 @@
 //! Deterministic split scheduler calibration scenarios.
 
 use sectorsync_core::prelude::{
-    CellCoord3, CellLoadSample, HotspotSeverity, HotspotSplitScratch, HotspotThresholds, StationId,
-    StationLoadSample, Tick,
+    CellCoord3, CellLoadSample, HotspotSeverity, HotspotThresholds, StationId, StationLoadSample,
+    Tick,
 };
-use sectorsync_runtime::{SplitScheduler, SplitSchedulerConfig, SplitSchedulerState};
+use sectorsync_runtime::{
+    SplitSchedule, SplitScheduler, SplitSchedulerConfig, SplitSchedulerScratch, SplitSchedulerState,
+};
 
 /// Observable result of the smoke-safe split calibration scenarios.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,14 +71,14 @@ pub fn run() -> SplitTuningReport {
         ..SplitSchedulerConfig::default()
     });
     let mut state = SplitSchedulerState::default();
-    let mut split_scratch = HotspotSplitScratch::new();
+    let mut split_scratch = SplitSchedulerScratch::new();
 
-    let first = scheduler.plan_with_state_and_scratch(
+    let first = SplitSchedule::from(scheduler.plan_into(
         &samples,
         Some(&state),
         Tick::new(100),
         &mut split_scratch,
-    );
+    ));
     assert_eq!(first.actions.len(), 1);
     let normal_stations = count_severity(&first, HotspotSeverity::Normal);
     let warm_stations = count_severity(&first, HotspotSeverity::Warm);
@@ -84,36 +86,35 @@ pub fn run() -> SplitTuningReport {
     assert_eq!((normal_stations, warm_stations, hot_stations), (1, 1, 1));
     state.record_schedule(&first, Tick::new(100));
 
-    let cooldown = scheduler.plan_with_state_and_scratch(
-        &samples,
-        Some(&state),
-        Tick::new(105),
-        &mut split_scratch,
-    );
+    let cooldown = scheduler.plan_into(&samples, Some(&state), Tick::new(105), &mut split_scratch);
     assert!(cooldown.actions.is_empty());
     assert_eq!(cooldown.skipped_cooldown, 1);
+    let cooldown_skips = cooldown.skipped_cooldown;
 
-    let capacity = SplitScheduler::new(SplitSchedulerConfig {
+    let capacity_scheduler = SplitScheduler::new(SplitSchedulerConfig {
         thresholds: thresholds(),
         max_actions_per_pass: 1,
         max_cells_per_action: 1,
         max_target_score_after_move: 1,
         ..SplitSchedulerConfig::default()
-    })
-    .plan(&samples);
+    });
+    let capacity = capacity_scheduler.plan_into(&samples, None, Tick::new(0), &mut split_scratch);
     assert!(capacity.actions.is_empty());
     assert_eq!(capacity.skipped_target_capacity, 1);
+    let capacity_skips = capacity.skipped_target_capacity;
 
-    let improvement = SplitScheduler::new(SplitSchedulerConfig {
+    let improvement_scheduler = SplitScheduler::new(SplitSchedulerConfig {
         thresholds: thresholds(),
         max_actions_per_pass: 1,
         max_cells_per_action: 1,
         min_score_improvement: u64::MAX,
         ..SplitSchedulerConfig::default()
-    })
-    .plan(&samples);
+    });
+    let improvement =
+        improvement_scheduler.plan_into(&samples, None, Tick::new(0), &mut split_scratch);
     assert!(improvement.actions.is_empty());
     assert_eq!(improvement.skipped_insufficient_improvement, 1);
+    let improvement_skips = improvement.skipped_insufficient_improvement;
 
     let action = &first.actions[0];
     let source = samples
@@ -132,9 +133,9 @@ pub fn run() -> SplitTuningReport {
         warm_stations,
         hot_stations,
         actions_planned: first.actions.len(),
-        cooldown_skips: cooldown.skipped_cooldown,
-        capacity_skips: capacity.skipped_target_capacity,
-        improvement_skips: improvement.skipped_insufficient_improvement,
+        cooldown_skips,
+        capacity_skips,
+        improvement_skips,
         source_pressure_before: action.source_score,
         source_pressure_after: action
             .source_score

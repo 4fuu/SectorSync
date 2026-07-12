@@ -268,14 +268,16 @@ fn run(workload: &Workload, config: Config) -> RunStats {
                     add_samples(&mut stats, output);
                 }
                 OutputMode::Fresh => {
-                    let output = load_sampler.sample_all(
+                    let mut fresh_scratch = StationLoadSamplerScratch::new();
+                    let output = load_sampler.sample_all_into(
                         &workload.stations,
                         &workload.indexes,
                         &workload.router,
                         &workload.subscriber_counts,
+                        &mut fresh_scratch,
                     );
                     stats.fresh_outputs = stats.fresh_outputs.saturating_add(1);
-                    add_samples(&mut stats, &output);
+                    add_samples(&mut stats, output);
                 }
             }
             stats.calls = stats.calls.saturating_add(1);

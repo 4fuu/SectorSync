@@ -3,12 +3,14 @@
 use sectorsync_core::prelude::{
     Bounds, CellCoord3, CellIndex, CellLoadSample, EntityId, GridSpec, HotspotThresholds,
     InstanceId, NodeId, PolicyId, Position3, Station, StationConfig, StationId, StationLoadSample,
+    Tick,
 };
 use sectorsync_runtime::{
-    CellOwnershipTable, SplitScheduler, SplitSchedulerConfig, SplitSchedulerScratch,
-    StationIndexSet, StationSet,
+    CellOwnershipTable, SplitScheduleExecutionScratch, SplitScheduler, SplitSchedulerConfig,
+    SplitSchedulerScratch, StationIndexSet, StationSet,
 };
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let grid = GridSpec::new(16.0).expect("grid is valid");
     let cell = CellCoord3::new(0, 0, 0);
@@ -76,9 +78,16 @@ fn main() {
         ..SplitSchedulerConfig::default()
     });
     let mut scheduler_scratch = SplitSchedulerScratch::new();
-    let schedule = scheduler.plan_into(&samples, &mut scheduler_scratch);
+    let schedule = scheduler.plan_into(&samples, None, Tick::new(0), &mut scheduler_scratch);
+    let mut execution_scratch = SplitScheduleExecutionScratch::new();
     let report = scheduler
-        .execute_view(schedule, &mut stations, &mut indexes, &mut ownership)
+        .execute_into(
+            schedule,
+            &mut stations,
+            &mut indexes,
+            &mut ownership,
+            &mut execution_scratch,
+        )
         .expect("split schedule should execute");
     let action = schedule
         .actions

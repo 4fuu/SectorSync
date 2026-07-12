@@ -263,10 +263,22 @@ fn run(scheduler: &SplitScheduler, samples: &[StationLoadSample], config: Config
                 break 'ticks;
             }
             let checksum = match config.mode {
-                OutputMode::Reuse => checksum_view(scheduler.plan_into(samples, &mut scratch)),
+                OutputMode::Reuse => checksum_view(scheduler.plan_into(
+                    samples,
+                    None,
+                    sectorsync_core::ids::Tick::new(0),
+                    &mut scratch,
+                )),
                 OutputMode::Fresh => {
                     stats.fresh_outputs = stats.fresh_outputs.saturating_add(1);
-                    checksum_owned(&scheduler.plan(samples))
+                    let mut fresh_scratch = SplitSchedulerScratch::new();
+                    let owned = SplitSchedule::from(scheduler.plan_into(
+                        samples,
+                        None,
+                        sectorsync_core::ids::Tick::new(0),
+                        &mut fresh_scratch,
+                    ));
+                    checksum_owned(&owned)
                 }
             };
             stats.schedule_checksum = stats.schedule_checksum.saturating_add(checksum);
