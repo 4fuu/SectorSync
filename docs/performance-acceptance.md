@@ -721,31 +721,45 @@ executable borrowed `split_migration` flow.
 
 ### Gateway Expiry Scan Measurement
 
-`GatewaySessionTable::expire_disconnected` uses one in-place map `retain` pass.
-Connected sessions and disconnected sessions at or inside the grace boundary
-remain; stale sessions are removed in place and counted from the map length
-delta. The isolated benchmark compares this production algorithm shape with the
-previous collect-client-ids then remove-each pattern:
+`GatewaySessionTable::disconnect` records the first tick after the reconnect
+grace window in a min-deadline heap. Caller-driven `expire_disconnected` pops
+only due entries and verifies the current disconnect tick before removal, so a
+stale entry cannot remove a reconnected session. No timer or background thread
+is created. Repeated reconnects may leave stale entries, but the heap is rebuilt
+from current disconnected sessions when it exceeds twice `max_sessions`.
+
+Compare the production deadline index with the previous full map scan:
 
 ```powershell
-cargo run --release -q -p sectorsync-bench --example gateway_expiry_scan
-cargo run --release -q -p sectorsync-bench --example gateway_expiry_scan -- --collect-remove
+cargo run --release -q -p sectorsync-bench --example gateway_deadline_expiry -- `
+  --sessions=65536 --calls=10 --expired-every=1024
+cargo run --release -q -p sectorsync-bench --example gateway_deadline_expiry -- `
+  --sessions=65536 --calls=10 --expired-every=1024 --full-scan
 ```
 
-Map snapshot cloning occurs outside the measured operation interval. The
-default workload scans 5,000 sessions 500 times with connected, grace-boundary,
-and expired records. Guards cap 20,000 sessions, 100 calls per tick, and 20
-ticks without `--allow-heavy`; total execution has a 10-second budget. Output
-includes expired/remaining conservation counts, temporary-id collection count,
-operation p50/p95/p99/max, guard metadata, path/workload verdicts, and
+Snapshot cloning and result checksum traversal occur outside the measured
+operation. Guards cap 65,536 sessions and 50 calls without `--allow-heavy`;
+execution has a 10-second budget. `--expired-every` controls sparse disconnect
+density and retains one exact-grace-boundary record beside each expired record.
+Output includes expired/remaining conservation, examined entries, stale and
+capacity fields, deterministic checksum, latency percentiles, and
 `benchmark_ok`.
 
-Five alternating release A/B runs expired and retained `1,250,000` records each.
-The retain path created zero temporary id collections; the comparison created
-500 per run. Median operation p99 was 0.080 ms for retain versus 0.241 ms for
-collect/remove, about a 67% reduction on this development host. Core tests cover
-connected sessions, the exact grace boundary, stale removal, repeated expiry,
-and cumulative statistics; the benchmark test compares final maps exactly.
+At 65,536 sessions, 64 expired sessions per call, and ten calls, five
+alternating release A/B runs produced the same `471817112713081856` aggregate
+checksum. The deadline path examined 640 entries versus 655,360 for full scans.
+Median operation p99 was 0.023 ms versus 0.944 ms, about a 97.6% reduction on
+this development host. At 20,000 sessions with 2.5% expired per call, an early
+sample was slower than retain scanning (0.526 ms versus 0.253 ms), while the
+65,536-session form of that density was faster (0.710 ms versus 0.924 ms).
+Therefore the accepted claim is bounded maintenance scaling near the configured
+table limit, not universal latency improvement at every size and churn ratio.
+Exact conservation/checksum equality, due-only work, grace-boundary retention,
+stale-entry safety, bounded compaction, and `benchmark_ok=true` are portable.
+
+The older `gateway_expiry_scan` example remains an algorithm record showing why
+in-place retain was preferable to temporary id collection before deadline
+indexing; it no longer represents the production expiry implementation.
 
 ### Gateway Session Lookup Measurement
 

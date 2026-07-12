@@ -1,6 +1,7 @@
 //! Low-level gateway session and client routing primitives.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::hash::Hash;
 
 use crate::command::{CommandEnvelope, CommandRejectReason};
@@ -70,19 +71,39 @@ impl<K: Copy + Eq + Hash + Ord, V> AdaptiveSessionMap<K, V> {
         }
     }
 
-    fn retain<F>(&mut self, mut keep: F)
-    where
-        F: FnMut(&K, &mut V) -> bool,
-    {
+    fn remove(&mut self, key: &K) -> Option<V> {
         match self {
-            Self::Ordered(entries) => entries.retain(|key, value| keep(key, value)),
-            Self::Hashed(entries) => entries.retain(|key, value| keep(key, value)),
+            Self::Ordered(entries) => entries.remove(key),
+            Self::Hashed(entries) => entries.remove(key),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        match self {
+            Self::Ordered(entries) => SessionMapIter::Ordered(entries.iter()),
+            Self::Hashed(entries) => SessionMapIter::Hashed(entries.iter()),
         }
     }
 
     #[cfg(test)]
     fn is_hashed(&self) -> bool {
         matches!(self, Self::Hashed(_))
+    }
+}
+
+enum SessionMapIter<'a, K, V> {
+    Ordered(std::collections::btree_map::Iter<'a, K, V>),
+    Hashed(std::collections::hash_map::Iter<'a, K, V>),
+}
+
+impl<'a, K, V> Iterator for SessionMapIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Ordered(entries) => entries.next(),
+            Self::Hashed(entries) => entries.next(),
+        }
     }
 }
 
@@ -239,6 +260,12 @@ pub struct GatewayStats {
     pub commands_rejected_replay: usize,
     /// Commands rejected by per-client rate limit.
     pub commands_rejected_rate_limit: usize,
+    /// Due deadline entries examined by expiry maintenance.
+    pub expiry_deadlines_popped: usize,
+    /// Due entries ignored because the session reconnected or disconnected again.
+    pub stale_expiry_deadlines: usize,
+    /// Stale deadline heap compactions performed after bounded growth.
+    pub expiry_deadline_compactions: usize,
 }
 
 /// Gateway/session error.
@@ -340,6 +367,7 @@ impl std::error::Error for GatewayError {}
 pub struct GatewaySessionTable {
     config: GatewayConfig,
     sessions: AdaptiveSessionMap<ClientId, GatewaySession>,
+    expiry_deadlines: BinaryHeap<Reverse<(u64, ClientId, u64)>>,
     stats: GatewayStats,
 }
 
@@ -349,6 +377,7 @@ impl GatewaySessionTable {
         Self {
             config,
             sessions: AdaptiveSessionMap::new(),
+            expiry_deadlines: BinaryHeap::new(),
             stats: GatewayStats::default(),
         }
     }
@@ -501,22 +530,58 @@ impl GatewaySessionTable {
             .ok_or(GatewayError::MissingSession(client_id))?;
         session.last_seen = now;
         session.state = GatewaySessionState::Disconnected { since: now };
+        self.expiry_deadlines.push(Reverse((
+            expiry_deadline(now, self.config.reconnect_grace_ticks),
+            client_id,
+            now.get(),
+        )));
+        self.compact_expiry_deadlines_if_needed();
         Ok(())
     }
 
     /// Removes disconnected sessions whose grace window has expired.
     pub fn expire_disconnected(&mut self, now: Tick) -> usize {
-        let grace = self.config.reconnect_grace_ticks;
-        let before = self.sessions.len();
-        self.sessions.retain(|_, session| match session.state {
-            GatewaySessionState::Connected => true,
-            GatewaySessionState::Disconnected { since } => {
-                now.get().saturating_sub(since.get()) <= grace
+        let mut expired = 0_usize;
+        while self
+            .expiry_deadlines
+            .peek()
+            .is_some_and(|Reverse((deadline, _, _))| *deadline <= now.get())
+        {
+            let Reverse((_, client_id, expected_since)) = self
+                .expiry_deadlines
+                .pop()
+                .expect("peeked deadline remains available");
+            self.stats.expiry_deadlines_popped =
+                self.stats.expiry_deadlines_popped.saturating_add(1);
+            let current_matches = self.sessions.get(&client_id).is_some_and(|session| {
+                matches!(
+                    session.state,
+                    GatewaySessionState::Disconnected { since }
+                        if since.get() == expected_since
+                            && now.get().saturating_sub(since.get())
+                                > self.config.reconnect_grace_ticks
+                )
+            });
+            if current_matches {
+                self.sessions.remove(&client_id);
+                expired = expired.saturating_add(1);
+            } else {
+                self.stats.stale_expiry_deadlines =
+                    self.stats.stale_expiry_deadlines.saturating_add(1);
             }
-        });
-        let expired = before - self.sessions.len();
+        }
         self.stats.sessions_expired = self.stats.sessions_expired.saturating_add(expired);
         expired
+    }
+
+    /// Deadline entries retained for caller-driven expiry maintenance.
+    pub fn expiry_deadline_len(&self) -> usize {
+        self.expiry_deadlines.len()
+    }
+
+    /// Allocated deadline-entry capacity retained by the table.
+    pub fn expiry_deadline_capacity(&self) -> usize {
+        self.expiry_deadlines.capacity()
     }
 
     /// Changes the target station for a connected client.
@@ -660,6 +725,30 @@ impl GatewaySessionTable {
             }
         }
     }
+
+    fn compact_expiry_deadlines_if_needed(&mut self) {
+        let limit = self.config.max_sessions.max(1).saturating_mul(2);
+        if self.expiry_deadlines.len() <= limit {
+            return;
+        }
+        let mut deadlines = BinaryHeap::with_capacity(self.sessions.len());
+        for (client_id, session) in self.sessions.iter() {
+            if let GatewaySessionState::Disconnected { since } = session.state {
+                deadlines.push(Reverse((
+                    expiry_deadline(since, self.config.reconnect_grace_ticks),
+                    *client_id,
+                    since.get(),
+                )));
+            }
+        }
+        self.expiry_deadlines = deadlines;
+        self.stats.expiry_deadline_compactions =
+            self.stats.expiry_deadline_compactions.saturating_add(1);
+    }
+}
+
+const fn expiry_deadline(since: Tick, grace: u64) -> u64 {
+    since.get().saturating_add(grace).saturating_add(1)
 }
 
 impl Default for GatewaySessionTable {
@@ -826,6 +915,65 @@ mod tests {
         assert_eq!(table.expire_disconnected(Tick::new(19)), 1);
         assert_eq!(table.len(), 0);
         assert_eq!(table.stats().sessions_expired, 1);
+    }
+
+    #[test]
+    fn stale_expiry_deadline_cannot_remove_reconnected_session() {
+        let client_id = ClientId::new(7);
+        let mut table = GatewaySessionTable::new(GatewayConfig {
+            max_sessions: 1,
+            reconnect_grace_ticks: 3,
+            max_commands_per_tick: 4,
+        });
+        let connected = table
+            .connect(client_id, StationId::new(1), Tick::new(0))
+            .expect("connect");
+        table
+            .disconnect(client_id, Tick::new(1))
+            .expect("disconnect");
+        table
+            .reconnect(client_id, connected.route.generation, Tick::new(2))
+            .expect("reconnect");
+
+        assert_eq!(table.expire_disconnected(Tick::new(10)), 0);
+        assert!(
+            table
+                .session(client_id)
+                .is_some_and(GatewaySession::is_connected)
+        );
+        assert_eq!(table.stats().expiry_deadlines_popped, 1);
+        assert_eq!(table.stats().stale_expiry_deadlines, 1);
+    }
+
+    #[test]
+    fn repeated_disconnect_deadlines_compact_at_bounded_growth() {
+        let client_id = ClientId::new(7);
+        let mut table = GatewaySessionTable::new(GatewayConfig {
+            max_sessions: 1,
+            reconnect_grace_ticks: 10,
+            max_commands_per_tick: 4,
+        });
+        let generation = table
+            .connect(client_id, StationId::new(1), Tick::new(0))
+            .expect("connect")
+            .route
+            .generation;
+        for tick in 1..=3 {
+            table
+                .disconnect(client_id, Tick::new(tick * 2))
+                .expect("disconnect");
+            table
+                .reconnect(client_id, generation, Tick::new(tick * 2 + 1))
+                .expect("reconnect");
+        }
+
+        assert_eq!(table.stats().expiry_deadline_compactions, 1);
+        assert!(table.expiry_deadline_len() <= table.config().max_sessions);
+        assert!(
+            table
+                .session(client_id)
+                .is_some_and(GatewaySession::is_connected)
+        );
     }
 
     #[test]
