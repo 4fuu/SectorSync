@@ -262,6 +262,14 @@ impl CommandQueues {
         self.barrier_buffer.capacity()
     }
 
+    /// Releases unused retained queue storage without changing queued commands.
+    pub fn reclaim_retained_capacity(&mut self) {
+        self.high.shrink_to_fit();
+        self.normal.shrink_to_fit();
+        self.low.shrink_to_fit();
+        self.barrier_buffer.shrink_to_fit();
+    }
+
     /// Maximum commands retained while a barrier buffers ingress.
     ///
     /// The buffer uses the saturating sum of the three ready-queue limits so
@@ -394,6 +402,22 @@ mod tests {
         assert!(barrier_peak >= 8);
         assert_eq!(queues.clear_barrier_buffer(), 8);
         assert_eq!(queues.barrier_buffer_retained_capacity(), barrier_peak);
+    }
+
+    #[test]
+    fn reclaim_retained_capacity_preserves_queued_order() {
+        let mut queues = CommandQueues::new(CommandQueueLimits::default());
+        queues
+            .push(command(1, CommandPriority::Low), CommandIngress::RUNNING)
+            .expect("low");
+        queues
+            .push(command(2, CommandPriority::High), CommandIngress::RUNNING)
+            .expect("high");
+
+        queues.reclaim_retained_capacity();
+
+        assert_eq!(queues.pop_next().expect("high first").id, CommandId::new(2));
+        assert_eq!(queues.pop_next().expect("low second").id, CommandId::new(1));
     }
 
     #[test]

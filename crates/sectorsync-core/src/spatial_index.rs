@@ -206,6 +206,20 @@ impl CellIndex {
         self.cells.reserve(additional_cells);
     }
 
+    /// Releases unused retained map, bucket, and multi-cell membership storage.
+    pub fn reclaim_retained_capacity(&mut self) {
+        for handles in self.cells.values_mut() {
+            handles.shrink_to_fit();
+        }
+        for membership in self.entity_cells.values_mut() {
+            if let CellMembership::Multiple(cells) = membership {
+                cells.shrink_to_fit();
+            }
+        }
+        self.cells.shrink_to_fit();
+        self.entity_cells.shrink_to_fit();
+    }
+
     /// Indexed-entity entries currently retained without another rehash.
     pub fn entity_capacity(&self) -> usize {
         self.entity_cells.capacity()
@@ -504,6 +518,26 @@ mod tests {
         assert_eq!(
             index.query_sphere(Position3::new(1.0, 2.0, 3.0), 1.0),
             vec![handle]
+        );
+    }
+
+    #[test]
+    fn reclaim_retained_capacity_preserves_queries_and_membership() {
+        let grid = GridSpec::new(10.0).expect("valid grid");
+        let mut index = CellIndex::with_capacity(grid, 64, 64);
+        let handle = EntityHandle::new(1, 0);
+        let position = Position3::new(9.0, 0.0, 0.0);
+        index.upsert(handle, position, Bounds::Sphere { radius: 2.0 });
+        let expected = index.query_sphere(position, 4.0);
+
+        index.reclaim_retained_capacity();
+
+        assert_eq!(index.query_sphere(position, 4.0), expected);
+        assert!(
+            !index
+                .cells_for_handle(handle)
+                .expect("membership")
+                .is_empty()
         );
     }
 

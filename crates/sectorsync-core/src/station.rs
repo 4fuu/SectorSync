@@ -85,6 +85,14 @@ impl Station {
         self.free.reserve(additional);
     }
 
+    /// Releases unused retained storage without changing live handles.
+    pub fn reclaim_retained_capacity(&mut self) {
+        self.records.shrink_to_fit();
+        self.generations.shrink_to_fit();
+        self.free.shrink_to_fit();
+        self.by_id.shrink_to_fit();
+    }
+
     /// Entity record slots currently retained without another allocation.
     pub fn entity_capacity(&self) -> usize {
         self.records.capacity().min(self.generations.capacity())
@@ -658,6 +666,28 @@ mod tests {
             )
             .expect("reserved station should spawn");
         assert_eq!(handle, EntityHandle::new(0, 0));
+    }
+
+    #[test]
+    fn reclaim_retained_capacity_preserves_live_handles() {
+        let mut station = Station::with_capacity(config(), 64);
+        let handle = station
+            .spawn_owned(
+                EntityId::new(1),
+                Position3::new(1.0, 2.0, 3.0),
+                Bounds::Point,
+                PolicyId::new(1),
+            )
+            .expect("spawn");
+
+        station.reclaim_retained_capacity();
+
+        assert_eq!(
+            station.get(handle).expect("live handle").id,
+            EntityId::new(1)
+        );
+        assert!(station.entity_capacity() >= 1);
+        assert!(station.id_index_capacity() >= 1);
     }
 
     #[test]

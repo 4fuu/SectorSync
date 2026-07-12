@@ -736,6 +736,17 @@ impl ComponentStore {
             .reserve(additional_entities);
     }
 
+    /// Releases unused retained column and entity-map storage.
+    pub fn reclaim_retained_capacity(&mut self) {
+        for column in self.dense_columns.iter_mut().filter_map(Option::as_mut) {
+            column.values.shrink_to_fit();
+        }
+        for column in self.sparse_columns.values_mut() {
+            column.values.shrink_to_fit();
+        }
+        self.dense_columns.shrink_to_fit();
+    }
+
     /// Component column slots currently retained without another allocation.
     pub fn column_slots_capacity(&self) -> usize {
         self.dense_columns
@@ -1372,6 +1383,31 @@ mod tests {
         assert!(!store.has_dirty_selected(entity, &[selected.id]));
         assert!(store.has_dirty_selected(entity, &[ignored.id]));
         assert!(!store.has_dirty_selected(entity, &[]));
+    }
+
+    #[test]
+    fn reclaim_retained_capacity_preserves_component_blobs() {
+        let descriptor = ComponentDescriptor::sparse_blob(
+            ComponentId::new(1),
+            "health",
+            ComponentSyncMode::Delta,
+            ComponentMigrationMode::Copy,
+            4,
+        );
+        let handle = EntityHandle::new(1, 0);
+        let mut store = ComponentStore::default();
+        store.reserve_component(descriptor.id, 64);
+        store
+            .set_blob_from_slice(&descriptor, handle, 1, &[1, 2, 3, 4])
+            .expect("component write");
+
+        store.reclaim_retained_capacity();
+
+        assert_eq!(
+            store.get_blob(descriptor.id, handle).expect("blob").bytes,
+            [1, 2, 3, 4]
+        );
+        assert!(store.component_capacity(descriptor.id) >= 1);
     }
 
     #[test]
