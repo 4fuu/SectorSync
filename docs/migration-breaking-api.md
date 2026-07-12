@@ -10,7 +10,7 @@ Replace multiple normal-path dependencies with the facade:
 
 ```toml
 [dependencies]
-sectorsync = "=2026.711.0"
+sectorsync = "=2026.712.0"
 ```
 
 Use `StationRuntime` for coherent Station, spatial-index, component, and

@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync"
-version = "2026.711.0"
+version = "2026.712.0"
 dependencies = [
  "sectorsync-core",
  "sectorsync-runtime",
