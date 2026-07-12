@@ -256,12 +256,13 @@ fn run(config: Config) -> RunStats {
             }
             let report = match config.mode {
                 ScanMode::Reuse => sender
-                    .retry_due_with_scratch(&mut sink, now_tick, &mut scratch)
+                    .retry_due_into(&mut sink, now_tick, &mut scratch)
                     .expect("reusable retry should send"),
                 ScanMode::Fresh => {
                     stats.fresh_scan_collections = stats.fresh_scan_collections.saturating_add(1);
+                    let mut fresh_scratch = ReliableStationRetryScratch::new();
                     sender
-                        .retry_due(&mut sink, now_tick)
+                        .retry_due_into(&mut sink, now_tick, &mut fresh_scratch)
                         .expect("fresh retry should send")
                 }
             };

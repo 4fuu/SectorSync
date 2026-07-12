@@ -43,7 +43,7 @@ fn main() {
     let mut non_due_examined = 0_usize;
     for tick in 1..=NON_DUE_POLLS {
         let report = sender
-            .retry_due_with_scratch(&mut transport, tick, &mut scratch)
+            .retry_due_into(&mut transport, tick, &mut scratch)
             .expect("non-due retry poll should succeed");
         non_due_examined = non_due_examined.saturating_add(report.examined);
     }
@@ -51,7 +51,7 @@ fn main() {
 
     let due_started = Instant::now();
     let due = sender
-        .retry_due_with_scratch(&mut transport, RETRY_AFTER_TICKS, &mut scratch)
+        .retry_due_into(&mut transport, RETRY_AFTER_TICKS, &mut scratch)
         .expect("due retry poll should succeed");
     let due_elapsed = due_started.elapsed();
     let benchmark_ok = non_due_examined == 0

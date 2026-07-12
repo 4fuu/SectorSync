@@ -7,8 +7,7 @@ use sectorsync_core::prelude::{
 use sectorsync_runtime::{EventRouter, StationScheduler, StationSet};
 use sectorsync_transport::{
     InMemoryStationTransport, ReliableStationConfig, ReliableStationEndpoint,
-    ReliableStationRetryScratch, StationOutboundPacket, StationTransportLimits,
-    StationTransportReceiver,
+    StationOutboundPacket, StationTransportLimits, StationTransportReceiver,
 };
 use sectorsync_wire::{
     BinaryFrameDecoder, BinaryFrameEncoder, FrameDecoder, FrameEncoder, RuntimeFrame,
@@ -43,7 +42,6 @@ fn main() {
     };
     let mut source_endpoint = ReliableStationEndpoint::new(reliable_config);
     let mut target_endpoint = ReliableStationEndpoint::new(reliable_config);
-    let mut retry_scratch = ReliableStationRetryScratch::new();
 
     let event = StationEvent {
         id: EventId::new(300),
@@ -71,7 +69,7 @@ fn main() {
         )
         .expect("reliable station event should send");
     let retry = source_endpoint
-        .retry_due_with_scratch(&mut transport, 2, &mut retry_scratch)
+        .retry_due(&mut transport, 2)
         .expect("due reliable packet should retry");
     assert_eq!(retry.retried, 1);
     assert_eq!(transport.queued_len(target_station), Some(2));

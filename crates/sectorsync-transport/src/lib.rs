@@ -2491,21 +2491,8 @@ impl ReliableClientSender {
         }
     }
 
-    /// Retries due in-flight packets.
-    pub fn retry_due<T: TransportSink>(
-        &mut self,
-        transport: &mut T,
-        now_tick: u64,
-    ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
-        self.retry_due_with_scratch(
-            transport,
-            now_tick,
-            &mut ReliableClientRetryScratch::default(),
-        )
-    }
-
     /// Retries due packets using caller-owned scan storage.
-    pub fn retry_due_with_scratch<T: TransportSink>(
+    pub fn retry_due_into<T: TransportSink>(
         &mut self,
         transport: &mut T,
         now_tick: u64,
@@ -2753,6 +2740,7 @@ pub struct ReliableClientEndpoint {
     pub sender: ReliableClientSender,
     /// Receiver state.
     pub receiver: ReliableClientReceiver,
+    retry_scratch: ReliableClientRetryScratch,
 }
 
 impl ReliableClientEndpoint {
@@ -2761,6 +2749,7 @@ impl ReliableClientEndpoint {
         Self {
             sender: ReliableClientSender::new(config),
             receiver: ReliableClientReceiver::new(config),
+            retry_scratch: ReliableClientRetryScratch::default(),
         }
     }
 
@@ -2780,18 +2769,8 @@ impl ReliableClientEndpoint {
         transport: &mut T,
         now_tick: u64,
     ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
-        self.sender.retry_due(transport, now_tick)
-    }
-
-    /// Retries due reliable client packets using caller-owned scan storage.
-    pub fn retry_due_with_scratch<T: TransportSink>(
-        &mut self,
-        transport: &mut T,
-        now_tick: u64,
-        scratch: &mut ReliableClientRetryScratch,
-    ) -> Result<ReliableRetryReport, ReliableClientError<T::Error>> {
         self.sender
-            .retry_due_with_scratch(transport, now_tick, scratch)
+            .retry_due_into(transport, now_tick, &mut self.retry_scratch)
     }
 
     /// Handles one inbound reliable client packet.
@@ -3324,21 +3303,8 @@ impl ReliableStationSender {
         }
     }
 
-    /// Retries due in-flight packets.
-    pub fn retry_due<T: StationTransportSink>(
-        &mut self,
-        transport: &mut T,
-        now_tick: u64,
-    ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
-        self.retry_due_with_scratch(
-            transport,
-            now_tick,
-            &mut ReliableStationRetryScratch::default(),
-        )
-    }
-
     /// Retries due packets using caller-owned scan storage.
-    pub fn retry_due_with_scratch<T: StationTransportSink>(
+    pub fn retry_due_into<T: StationTransportSink>(
         &mut self,
         transport: &mut T,
         now_tick: u64,
@@ -3594,6 +3560,7 @@ pub struct ReliableStationEndpoint {
     pub sender: ReliableStationSender,
     /// Receiver state.
     pub receiver: ReliableStationReceiver,
+    retry_scratch: ReliableStationRetryScratch,
 }
 
 impl ReliableStationEndpoint {
@@ -3602,6 +3569,7 @@ impl ReliableStationEndpoint {
         Self {
             sender: ReliableStationSender::new(config),
             receiver: ReliableStationReceiver::new(config),
+            retry_scratch: ReliableStationRetryScratch::default(),
         }
     }
 
@@ -3621,18 +3589,8 @@ impl ReliableStationEndpoint {
         transport: &mut T,
         now_tick: u64,
     ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
-        self.sender.retry_due(transport, now_tick)
-    }
-
-    /// Retries due reliable station packets using caller-owned scan storage.
-    pub fn retry_due_with_scratch<T: StationTransportSink>(
-        &mut self,
-        transport: &mut T,
-        now_tick: u64,
-        scratch: &mut ReliableStationRetryScratch,
-    ) -> Result<ReliableRetryReport, ReliableStationError<T::Error>> {
         self.sender
-            .retry_due_with_scratch(transport, now_tick, scratch)
+            .retry_due_into(transport, now_tick, &mut self.retry_scratch)
     }
 
     /// Handles one inbound reliable station packet.
@@ -5619,23 +5577,22 @@ mod tests {
                 0,
             )
             .expect("reliable command should send");
-        let mut retry_scratch = ReliableClientRetryScratch::new();
         let retry = client
-            .retry_due_with_scratch(&mut client_transport, 2, &mut retry_scratch)
+            .retry_due(&mut client_transport, 2)
             .expect("retry should send");
         assert_eq!(retry.examined, 1);
         assert_eq!(retry.retried, 1);
         assert_eq!(retry.timed_out, 0);
         assert_eq!(client.sender.stats().retries_sent, 1);
-        let retained_keys = retry_scratch.retained_key_capacity();
+        let retained_keys = client.retry_scratch.retained_key_capacity();
         assert!(retained_keys >= 1);
         assert_eq!(
             client
-                .retry_due_with_scratch(&mut client_transport, 2, &mut retry_scratch)
+                .retry_due(&mut client_transport, 2)
                 .expect("non-due scan should succeed"),
             ReliableRetryReport::default()
         );
-        assert_eq!(retry_scratch.retained_key_capacity(), retained_keys);
+        assert_eq!(client.retry_scratch.retained_key_capacity(), retained_keys);
         assert_eq!(
             hub.queued_len(server_id).expect("queue should exist"),
             Some(2)
@@ -5700,7 +5657,7 @@ mod tests {
             .expect("initial packet should fill queue");
 
         assert!(matches!(
-            sender.retry_due_with_scratch(&mut client_transport, 1, &mut scratch),
+            sender.retry_due_into(&mut client_transport, 1, &mut scratch),
             Err(ReliableClientError::Transport(
                 InMemoryTransportError::QueueFull { .. }
             ))
@@ -5711,13 +5668,13 @@ mod tests {
             .expect("initial packet should remain");
         assert_eq!(
             sender
-                .retry_due_with_scratch(&mut client_transport, 1, &mut scratch)
+                .retry_due_into(&mut client_transport, 1, &mut scratch)
                 .expect("failed attempt must remain retryable")
                 .retried,
             1
         );
         let timeout = sender
-            .retry_due_with_scratch(&mut client_transport, 2, &mut scratch)
+            .retry_due_into(&mut client_transport, 2, &mut scratch)
             .expect("exhausted packet should time out");
         assert_eq!(timeout.retried, 0);
         assert_eq!(timeout.timed_out, 1);
@@ -6141,23 +6098,22 @@ mod tests {
                 0,
             )
             .expect("reliable packet should send");
-        let mut retry_scratch = ReliableStationRetryScratch::new();
         let retry = first
-            .retry_due_with_scratch(&mut transport, 2, &mut retry_scratch)
+            .retry_due(&mut transport, 2)
             .expect("retry should send");
         assert_eq!(retry.examined, 1);
         assert_eq!(retry.retried, 1);
         assert_eq!(retry.timed_out, 0);
         assert_eq!(first.sender.stats().retries_sent, 1);
-        let retained_keys = retry_scratch.retained_key_capacity();
+        let retained_keys = first.retry_scratch.retained_key_capacity();
         assert!(retained_keys >= 1);
         assert_eq!(
             first
-                .retry_due_with_scratch(&mut transport, 2, &mut retry_scratch)
+                .retry_due(&mut transport, 2)
                 .expect("non-due scan should succeed"),
             ReliableRetryReport::default()
         );
-        assert_eq!(retry_scratch.retained_key_capacity(), retained_keys);
+        assert_eq!(first.retry_scratch.retained_key_capacity(), retained_keys);
         assert_eq!(transport.queued_len(station_two), Some(2));
 
         let first_raw = transport
@@ -6215,7 +6171,7 @@ mod tests {
             .expect("initial packet should fill queue");
 
         assert!(matches!(
-            sender.retry_due_with_scratch(&mut transport, 1, &mut scratch),
+            sender.retry_due_into(&mut transport, 1, &mut scratch),
             Err(ReliableStationError::Transport(
                 StationTransportError::QueueFull { .. }
             ))
@@ -6226,13 +6182,13 @@ mod tests {
             .expect("initial packet should remain");
         assert_eq!(
             sender
-                .retry_due_with_scratch(&mut transport, 1, &mut scratch)
+                .retry_due_into(&mut transport, 1, &mut scratch)
                 .expect("failed attempt must remain retryable")
                 .retried,
             1
         );
         let timeout = sender
-            .retry_due_with_scratch(&mut transport, 2, &mut scratch)
+            .retry_due_into(&mut transport, 2, &mut scratch)
             .expect("exhausted packet should time out");
         assert_eq!(timeout.retried, 0);
         assert_eq!(timeout.timed_out, 1);
