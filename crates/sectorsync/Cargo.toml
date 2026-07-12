@@ -1,0 +1,29 @@
+[package]
+name = "sectorsync"
+version.workspace = true
+description = "Fast-by-default facade for the SectorSync spatial replication middleware"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/sectorsync"
+keywords = ["gamedev", "networking", "replication", "spatial", "middleware"]
+categories = ["game-development", "network-programming"]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+simd = ["sectorsync-core/simd"]
+parallel = ["sectorsync-runtime/parallel"]
+
+[dependencies]
+sectorsync-core.workspace = true
+sectorsync-runtime.workspace = true
+sectorsync-transport.workspace = true
+sectorsync-wire.workspace = true
+
+[lints]
+workspace = true

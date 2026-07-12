@@ -69,6 +69,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sectorsync"
+version = "2026.711.0"
+dependencies = [
+ "sectorsync-core",
+ "sectorsync-runtime",
+ "sectorsync-transport",
+ "sectorsync-wire",
+]
+
+[[package]]
 name = "sectorsync-bench"
 version = "2026.712.0"
 dependencies = [

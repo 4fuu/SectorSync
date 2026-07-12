@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/sectorsync",
     "crates/sectorsync-core",
     "crates/sectorsync-wire",
     "crates/sectorsync-transport",
@@ -16,6 +17,7 @@ repository = "https://github.com/4fuu/SectorSync"
 rust-version = "1.88"
 
 [workspace.dependencies]
+sectorsync = { version = "=2026.712.0", path = "crates/sectorsync" }
 sectorsync-core = { version = "=2026.712.0", path = "crates/sectorsync-core" }
 sectorsync-wire = { version = "=2026.712.0", path = "crates/sectorsync-wire" }
 sectorsync-transport = { version = "=2026.712.0", path = "crates/sectorsync-transport" }

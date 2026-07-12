@@ -39,19 +39,17 @@ embedding application. See [Production adapter boundaries](docs/production-adapt
 
 ## Installation
 
-Use only the layers needed by the application:
+Use the fast-by-default product facade:
 
 ```toml
 [dependencies]
-sectorsync-core = "=2026.712.0"
-sectorsync-wire = "=2026.712.0"
-sectorsync-transport = "=2026.712.0"
-sectorsync-runtime = "=2026.712.0"
+sectorsync = "=2026.712.0"
 ```
 
-`sectorsync-core` works independently. Higher layers add wire, transport, and
-runtime integration without introducing a mandatory ECS, async runtime, or
-network service.
+The facade delegates to the low-level crates and does not introduce a mandatory
+ECS, async runtime, or network service. Advanced integrations may depend on
+`sectorsync-core`, `sectorsync-wire`, `sectorsync-transport`, or
+`sectorsync-runtime` directly.
 
 Optional performance features are explicit:
 
@@ -67,31 +65,33 @@ feature creates hidden threads in the default build.
 ## Quick Start
 
 ```rust
-use sectorsync_core::prelude::{
-    Bounds, CellIndex, EntityId, GridSpec, InstanceId, NodeId, PolicyId,
-    Position3, Station, StationConfig, StationId,
+use sectorsync::prelude::{
+    Bounds, EntityId, GridSpec, InstanceId, NodeId, PolicyId, Position3,
+    SpawnEntity, StationConfig, StationId, StationRuntime, StationRuntimeConfig,
 };
 
-let mut station = Station::new(StationConfig {
-    station_id: StationId::new(1),
-    node_id: NodeId::new(1),
-    instance_id: InstanceId::new(1),
-    tick_rate_hz: 20,
-});
-let mut index = CellIndex::new(GridSpec::new(32.0).expect("valid grid"));
+let config = StationRuntimeConfig::new(
+    StationConfig {
+        station_id: StationId::new(1),
+        node_id: NodeId::new(1),
+        instance_id: InstanceId::new(1),
+        tick_rate_hz: 20,
+    },
+    GridSpec::new(32.0).expect("valid grid"),
+);
+let mut station = StationRuntime::new(config);
 let position = Position3::new(64.0, 0.0, 64.0);
 
 let handle = station
-    .spawn_owned(
+    .spawn_owned(SpawnEntity::new(
         EntityId::new(42),
         position,
         Bounds::Point,
         PolicyId::new(1),
-    )
+    ))
     .expect("entity should spawn");
-index.upsert(handle, position, Bounds::Point);
 
-assert_eq!(index.query_sphere(position, 128.0), vec![handle]);
+assert_eq!(station.index().query_sphere(position, 128.0), vec![handle]);
 ```
 
 Run the complete validated command-to-replication flow:
@@ -107,14 +107,15 @@ ordering, ownership, bounded failures, barriers, migration, and observability.
 
 | Crate | Purpose |
 | --- | --- |
+| `sectorsync` | Fast-by-default facade and coherent Station-local product path |
 | `sectorsync-core` | Spatial index, authority, components, policy, replication, snapshots |
 | `sectorsync-wire` | Bounded binary frame encoding and decoding |
 | `sectorsync-transport` | In-memory, reliable-packet, security-hook, and UDP adapters |
 | `sectorsync-runtime` | Bridges, gateway routing, barriers, load sampling, scheduling, migration |
 | `sectorsync-bench` | Executable examples and guarded performance acceptance runner |
 
-The four library crates share one exact workspace version and publish in
-dependency order: core, wire, transport, then runtime.
+The five library crates share one exact workspace version and publish in
+dependency order: core, wire, transport, runtime, then the facade.
 
 ## Performance
 
