@@ -9,6 +9,7 @@ belong in rustdoc; release history belongs in `CHANGELOG.md`.
 | Goal | Document |
 | --- | --- |
 | Embed SectorSync in a game or simulation server | [SDK integration](sdk-integration.md) |
+| Track the breaking product API redesign | [API redesign contract](api-redesign.md) |
 | Configure and interpret benchmarks | [Performance acceptance](performance-acceptance.md) |
 | Connect security, transport, routing, storage, or infrastructure | [Production adapters](production-adapters.md) |
 | Check delivered scope and explicit non-goals | [Delivery status](gaps.md) |
