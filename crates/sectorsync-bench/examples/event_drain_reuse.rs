@@ -211,10 +211,11 @@ fn run(config: Config) -> RunStats {
                 }
                 OutputMode::Fresh => {
                     stats.fresh_outputs = stats.fresh_outputs.saturating_add(1);
+                    let mut fresh = Vec::new();
                     scheduler
-                        .drain_ready_events(&stations, &mut router)
-                        .expect("registered Station drain succeeds")
-                        .len()
+                        .drain_ready_events_into(&stations, &mut router, &mut fresh)
+                        .expect("registered Station drain succeeds");
+                    fresh.len()
                 }
             };
             stats.drained_events = stats.drained_events.saturating_add(drained);

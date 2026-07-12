@@ -6,7 +6,7 @@ use sectorsync_core::prelude::{
 };
 use sectorsync_runtime::{
     EventRouter, StationIndexSet, StationLoadSampler, StationLoadSamplerScratch,
-    StationScheduleConfig, StationScheduler, StationSet,
+    StationScheduleConfig, StationScheduleScratch, StationScheduler, StationSet,
 };
 
 fn main() {
@@ -59,12 +59,14 @@ fn main() {
     assert_eq!(busy_sample.cells.len(), 6);
 
     let mut scheduler = StationScheduler::default();
-    let plan = scheduler.advance_loaded(
+    let mut schedule_scratch = StationScheduleScratch::new();
+    let plan = scheduler.advance_loaded_into(
         &mut stations,
         samples,
         StationScheduleConfig {
             max_station_advances_per_step: 1,
         },
+        &mut schedule_scratch,
     );
     let selected = plan
         .selected

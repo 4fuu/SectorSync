@@ -31,6 +31,7 @@ product operation.
 | Endpoint retry with external scratch | Endpoint `retry_due` (scratch retained internally) |
 | Owned load sampling | Facade `LoadSampler::sample`, or low-level `sample_all_into` plus explicit copy |
 | Split scheduler method matrix | Facade `SplitExecutor::{plan,execute_planned}` |
+| Owned Station scheduling and event drain | Facade `StationExecutor`, or low-level `*_into` kernels |
 
 ## Low-Level Planner Mapping
 
@@ -83,6 +84,11 @@ tick, and scratch are explicit. The facade `SplitExecutor` retains those inputs
 and provides the normal caller-driven maintenance flow. `StationLoadSampler`
 similarly exposes only `sample_all_into`, while facade `LoadSampler::sample`
 owns the reusable storage.
+
+Facade `StationExecutor` owns schedule and event output storage. Low-level
+`StationScheduler` retains only `plan_loaded_into`, `advance_loaded_into`, and
+`drain_ready_events_into`; explicitly copy a returned view or event slice only
+at a real lifetime boundary.
 
 Reliable endpoint `retry_due_with_scratch` is replaced by endpoint `retry_due`.
 Direct sender users rename the low-level call to `retry_due_into` and continue

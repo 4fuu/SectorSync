@@ -223,8 +223,9 @@ fn run(stations: &StationSet, samples: &[StationLoadSample], config: Config) -> 
                     .sum::<u64>(),
                 OutputMode::Fresh => {
                     stats.fresh_outputs = stats.fresh_outputs.saturating_add(1);
+                    let mut fresh_scratch = StationScheduleScratch::new();
                     scheduler
-                        .plan_loaded(stations, samples, schedule_config)
+                        .plan_loaded_into(stations, samples, schedule_config, &mut fresh_scratch)
                         .selected
                         .iter()
                         .map(|candidate| u64::from(candidate.station_id.get()))

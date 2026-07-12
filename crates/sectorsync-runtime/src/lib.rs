@@ -4558,18 +4558,6 @@ pub struct StationScheduleCandidate {
 }
 
 /// Result of one load-aware station scheduling pass.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StationSchedulePlan {
-    /// Stations considered by this pass.
-    pub candidates_considered: usize,
-    /// Stations selected by this pass.
-    pub stations_selected: usize,
-    /// Station tick advances requested by this pass.
-    pub total_advances: usize,
-    /// Selected stations in deterministic execution order.
-    pub selected: Vec<StationScheduleCandidate>,
-}
-
 /// Borrowed deterministic result from reusable Station scheduling storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StationScheduleView<'a> {
@@ -4626,23 +4614,6 @@ impl StationScheduler {
         }
     }
 
-    /// Plans a bounded station advancement pass from load samples.
-    pub fn plan_loaded(
-        &self,
-        stations: &StationSet,
-        samples: &[StationLoadSample],
-        config: StationScheduleConfig,
-    ) -> StationSchedulePlan {
-        let mut scratch = StationScheduleScratch::default();
-        let view = self.plan_loaded_into(stations, samples, config, &mut scratch);
-        StationSchedulePlan {
-            candidates_considered: view.candidates_considered,
-            stations_selected: view.stations_selected,
-            total_advances: view.total_advances,
-            selected: view.selected.to_vec(),
-        }
-    }
-
     /// Plans into caller-owned storage and returns a borrowed deterministic top-k view.
     pub fn plan_loaded_into<'a>(
         &self,
@@ -4688,23 +4659,6 @@ impl StationScheduler {
         }
     }
 
-    /// Advances a bounded set of high-load stations by one tick each.
-    pub fn advance_loaded(
-        &mut self,
-        stations: &mut StationSet,
-        samples: &[StationLoadSample],
-        config: StationScheduleConfig,
-    ) -> StationSchedulePlan {
-        let plan = self.plan_loaded(stations, samples, config);
-        for candidate in &plan.selected {
-            if let Some(station) = stations.get_mut(candidate.station_id) {
-                station.advance_tick();
-                self.advanced_ticks = self.advanced_ticks.saturating_add(1);
-            }
-        }
-        plan
-    }
-
     /// Advances a bounded top-k set using reusable caller-owned scheduling storage.
     pub fn advance_loaded_into<'a>(
         &mut self,
@@ -4721,17 +4675,6 @@ impl StationScheduler {
             }
         }
         plan
-    }
-
-    /// Drains router events ready for each station's current tick.
-    pub fn drain_ready_events(
-        &mut self,
-        stations: &StationSet,
-        router: &mut EventRouter,
-    ) -> Result<Vec<StationEvent>, EventRouterError> {
-        let mut events = Vec::new();
-        self.drain_ready_events_into(stations, router, &mut events)?;
-        Ok(events)
     }
 
     /// Drains all Station-ready events into reusable caller-owned output.
@@ -6640,12 +6583,14 @@ mod tests {
         ];
 
         let mut scheduler = StationScheduler::default();
-        let plan = scheduler.advance_loaded(
+        let mut schedule_scratch = StationScheduleScratch::new();
+        let plan = scheduler.advance_loaded_into(
             &mut stations,
             &samples,
             StationScheduleConfig {
                 max_station_advances_per_step: 2,
             },
+            &mut schedule_scratch,
         );
 
         assert_eq!(plan.candidates_considered, 3);
@@ -6924,8 +6869,9 @@ mod tests {
 
         let mut scheduler = StationScheduler::default();
         scheduler.advance_all(&mut stations);
-        let drained = scheduler
-            .drain_ready_events(&stations, &mut router)
+        let mut drained = Vec::new();
+        scheduler
+            .drain_ready_events_into(&stations, &mut router, &mut drained)
             .expect("drain should work");
         assert_eq!(drained, vec![event]);
         assert_eq!(bridge.stats().events_sent, 1);

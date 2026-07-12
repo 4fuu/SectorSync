@@ -1,11 +1,12 @@
 //! Caller-driven load sampling and conservative split maintenance.
 
-use sectorsync_core::{hotspot::StationLoadSample, ids::Tick};
+use sectorsync_core::{event::StationEvent, hotspot::StationLoadSample, ids::Tick};
 use sectorsync_runtime::{
-    CellOwnershipTable, EventRouter, SplitScheduleExecutionError, SplitScheduleExecutionScratch,
-    SplitScheduleExecutionView, SplitScheduleView, SplitScheduler, SplitSchedulerConfig,
-    SplitSchedulerScratch, SplitSchedulerState, StationIndexSet, StationLoadSampler,
-    StationLoadSamplerConfig, StationLoadSamplerScratch, StationSet,
+    CellOwnershipTable, EventRouter, EventRouterError, SplitScheduleExecutionError,
+    SplitScheduleExecutionScratch, SplitScheduleExecutionView, SplitScheduleView, SplitScheduler,
+    SplitSchedulerConfig, SplitSchedulerScratch, SplitSchedulerState, StationIndexSet,
+    StationLoadSampler, StationLoadSamplerConfig, StationLoadSamplerScratch, StationScheduleConfig,
+    StationScheduleScratch, StationScheduleView, StationScheduler, StationSet,
 };
 
 /// Retained storage owned by [`LoadSampler`].
@@ -68,6 +69,74 @@ impl LoadSampler {
 impl Default for LoadSampler {
     fn default() -> Self {
         Self::new(StationLoadSamplerConfig::default())
+    }
+}
+
+/// Retained storage owned by [`StationExecutor`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StationExecutorCapacities {
+    /// Sample score entries retained for scheduling.
+    pub scores: usize,
+    /// Candidate slots retained for scheduling.
+    pub candidates: usize,
+    /// Event slots retained for ordered draining.
+    pub events: usize,
+}
+
+/// Caller-driven Station scheduling and event maintenance.
+#[derive(Clone, Debug)]
+pub struct StationExecutor {
+    scheduler: StationScheduler,
+    config: StationScheduleConfig,
+    schedule: StationScheduleScratch,
+    events: Vec<StationEvent>,
+}
+
+impl StationExecutor {
+    /// Creates an executor without allocating schedule or event storage.
+    pub fn new(config: StationScheduleConfig) -> Self {
+        Self {
+            scheduler: StationScheduler::default(),
+            config,
+            schedule: StationScheduleScratch::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Advances the deterministic bounded set selected from current load.
+    pub fn advance_loaded<'a>(
+        &'a mut self,
+        stations: &mut StationSet,
+        samples: &[StationLoadSample],
+    ) -> StationScheduleView<'a> {
+        self.scheduler
+            .advance_loaded_into(stations, samples, self.config, &mut self.schedule)
+    }
+
+    /// Drains ready events in Station order into retained output.
+    pub fn drain_ready_events<'a>(
+        &'a mut self,
+        stations: &StationSet,
+        router: &mut EventRouter,
+    ) -> Result<&'a [StationEvent], EventRouterError> {
+        self.scheduler
+            .drain_ready_events_into(stations, router, &mut self.events)?;
+        Ok(&self.events)
+    }
+
+    /// Returns retained scheduling and event capacities.
+    pub fn retained_capacities(&self) -> StationExecutorCapacities {
+        StationExecutorCapacities {
+            scores: self.schedule.score_capacity(),
+            candidates: self.schedule.candidate_capacity(),
+            events: self.events.capacity(),
+        }
+    }
+}
+
+impl Default for StationExecutor {
+    fn default() -> Self {
+        Self::new(StationScheduleConfig::default())
     }
 }
 
@@ -179,5 +248,19 @@ mod tests {
         assert!(executor.planned().actions.is_empty());
         assert_eq!(sampler.retained_capacities().samples, 0);
         assert_eq!(executor.retained_capacities().actions, 0);
+
+        let mut station_executor = StationExecutor::default();
+        assert!(
+            station_executor
+                .advance_loaded(&mut StationSet::default(), &[])
+                .selected
+                .is_empty()
+        );
+        assert!(
+            station_executor
+                .drain_ready_events(&stations, &mut EventRouter::default())
+                .expect("empty event drain should work")
+                .is_empty()
+        );
     }
 }

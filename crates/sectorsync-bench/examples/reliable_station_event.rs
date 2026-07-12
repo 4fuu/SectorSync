@@ -122,16 +122,15 @@ fn main() {
     assert_eq!(source_endpoint.sender.in_flight_len(), 0);
 
     let mut scheduler = StationScheduler::default();
+    let mut drained = Vec::new();
     scheduler.advance_all(&mut stations);
-    assert!(
-        scheduler
-            .drain_ready_events(&stations, &mut router)
-            .expect("early drain should work")
-            .is_empty()
-    );
+    scheduler
+        .drain_ready_events_into(&stations, &mut router, &mut drained)
+        .expect("early drain should work");
+    assert!(drained.is_empty());
     scheduler.advance_all(&mut stations);
-    let drained = scheduler
-        .drain_ready_events(&stations, &mut router)
+    scheduler
+        .drain_ready_events_into(&stations, &mut router, &mut drained)
         .expect("target tick drain should work");
     assert_eq!(drained, vec![event]);
 

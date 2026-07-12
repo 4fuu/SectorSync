@@ -18,7 +18,7 @@ use sectorsync_core::prelude::{
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
     DeploymentRouteTable, EventRouter, GatewayClientTransportBridge, GatewayCommandPipeline,
-    StationScheduleConfig, StationScheduler, StationSet,
+    StationScheduleConfig, StationScheduleScratch, StationScheduler, StationSet,
 };
 #[cfg(feature = "parallel")]
 use sectorsync_runtime::{ReplicationThreadPool, ReplicationThreadPoolConfig};
@@ -2087,12 +2087,14 @@ fn apply_scheduler_report(
     for station in create_stations(config.stations, config.tick_rate_hz) {
         stations.push(station);
     }
-    let plan = StationScheduler::default().plan_loaded(
+    let mut schedule_scratch = StationScheduleScratch::new();
+    let plan = StationScheduler::default().plan_loaded_into(
         &stations,
         samples,
         StationScheduleConfig {
             max_station_advances_per_step: config.stations.min(2),
         },
+        &mut schedule_scratch,
     );
     stats.scheduler_candidates_considered = plan.candidates_considered;
     stats.scheduler_stations_selected = plan.stations_selected;
