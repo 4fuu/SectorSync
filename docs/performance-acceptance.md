@@ -483,7 +483,31 @@ For 20,000 bounded entities across ten ticks, all 200,000 updates retained their
 membership. Three alternating release runs reported median update p99 of
 3.194 ms without materialization versus 7.914 ms when materializing 5,400,000
 temporary cell coordinates. This isolates the removed list-construction work;
-real boundary crossings still rebuild persistent membership as required.
+the cross-cell comparison below isolates membership mutation work separately.
+
+Cross-cell mode exercises the incremental membership path against the previous
+full remove-and-insert behavior:
+
+```powershell
+cargo run --release -q -p sectorsync-bench --example multi_cell_bounds -- `
+  --cross-cell --entities=5000 --ticks=10
+cargo run --release -q -p sectorsync-bench --example multi_cell_bounds -- `
+  --cross-cell --entities=5000 --ticks=10 --force-full-rebuild
+```
+
+The 27-cell sphere moves one cell along X on every update. Sorted merge-diff
+retains 18 overlapping cells, removes nine exited cells, and inserts nine new
+cells; the full path removes and inserts all 27. `CellIndexUpdateScratch`
+retains capacity for 27 coordinates and `CellIndexUpdateReport` exposes the
+actual retained/removed/inserted counts. Final membership is independently
+checked for every entity and included in a deterministic checksum.
+
+Five alternating release A/B runs of 50,000 crossings retained the identical
+`8307051827676118908` membership checksum. Median update p99 was 9.298 ms for
+incremental diff versus 17.109 ms for full rebuild, about a 45.7% reduction on
+this development host; one noisy pair reversed, so timing remains directional.
+Exact 18/9/9 work counts, 27-cell scratch capacity, final membership equality,
+stable checksum, and `benchmark_ok=true` are the portable acceptance signals.
 
 ### Single-Viewer Plan Output Measurement
 

@@ -27,6 +27,40 @@ pub enum CellIndexUpdate {
     Relocated,
 }
 
+/// Work performed while changing one entity's spatial membership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellIndexUpdateReport {
+    /// High-level membership outcome.
+    pub update: CellIndexUpdate,
+    /// Existing cells retained without bucket mutation.
+    pub retained_cells: usize,
+    /// Cells whose bucket membership was removed.
+    pub removed_cells: usize,
+    /// Cells whose bucket membership was inserted.
+    pub inserted_cells: usize,
+    /// Whether sorted multi-cell membership was updated by merge-diff.
+    pub incremental_diff: bool,
+}
+
+/// Caller-owned storage for allocation-light multi-cell membership changes.
+#[derive(Clone, Debug, Default)]
+pub struct CellIndexUpdateScratch {
+    cells: Vec<CellCoord3>,
+}
+
+impl CellIndexUpdateScratch {
+    /// Cell-coordinate capacity retained for the next membership change.
+    pub fn retained_cell_capacity(&self) -> usize {
+        self.cells.capacity()
+    }
+
+    /// Releases unused retained cell-coordinate storage.
+    pub fn reclaim_retained_capacity(&mut self) {
+        self.cells.clear();
+        self.cells.shrink_to_fit();
+    }
+}
+
 /// Strategy used by the last scratch-backed cell query.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CellQueryStrategy {
@@ -247,52 +281,156 @@ impl CellIndex {
         position: Position3,
         bounds: Bounds,
     ) -> CellIndexUpdate {
-        let cells = if bounds == Bounds::Point {
-            let cell = self.grid.cell_at(position);
-            if let Some(old_cell) = self
-                .entity_cells
-                .get(&handle)
-                .and_then(|current| match current {
-                    CellMembership::Point(cell) => Some(*cell),
-                    CellMembership::Multiple(_) => None,
-                })
-            {
-                if old_cell == cell {
-                    return CellIndexUpdate::Unchanged;
-                }
-                self.remove_handle_from_cell(old_cell, handle);
-                self.cells.entry(cell).or_default().push(handle);
-                *self
-                    .entity_cells
-                    .get_mut(&handle)
-                    .expect("indexed point entity retains its cell membership") =
-                    CellMembership::Point(cell);
-                return CellIndexUpdate::Relocated;
+        let mut scratch = CellIndexUpdateScratch::default();
+        self.upsert_with_scratch(handle, position, bounds, &mut scratch)
+            .update
+    }
+
+    /// Inserts or updates membership with reusable storage and detailed work counters.
+    pub fn upsert_with_scratch(
+        &mut self,
+        handle: EntityHandle,
+        position: Position3,
+        bounds: Bounds,
+        scratch: &mut CellIndexUpdateScratch,
+    ) -> CellIndexUpdateReport {
+        if bounds == Bounds::Point {
+            return self.upsert_point(handle, self.grid.cell_at(position), scratch);
+        }
+
+        let aabb = bounds.to_aabb(position);
+        let min = self.grid.cell_at(aabb.min);
+        let max = self.grid.cell_at(aabb.max);
+        if let Some(current) = self.entity_cells.get(&handle)
+            && current.matches_range(min, max)
+        {
+            return CellIndexUpdateReport {
+                update: CellIndexUpdate::Unchanged,
+                retained_cells: current.as_slice().len(),
+                removed_cells: 0,
+                inserted_cells: 0,
+                incremental_diff: false,
+            };
+        }
+
+        scratch.cells.clear();
+        extend_cell_range(&mut scratch.cells, min, max);
+        let Some(previous) = self.entity_cells.remove(&handle) else {
+            for cell in &scratch.cells {
+                self.cells.entry(*cell).or_default().push(handle);
             }
-            CellMembership::Point(cell)
-        } else {
-            let aabb = bounds.to_aabb(position);
-            let min = self.grid.cell_at(aabb.min);
-            let max = self.grid.cell_at(aabb.max);
-            if self
-                .entity_cells
-                .get(&handle)
-                .is_some_and(|current| current.matches_range(min, max))
-            {
-                return CellIndexUpdate::Unchanged;
-            }
-            CellMembership::Multiple(collect_cell_range(min, max))
+            let inserted_cells = scratch.cells.len();
+            self.entity_cells.insert(
+                handle,
+                CellMembership::Multiple(std::mem::take(&mut scratch.cells)),
+            );
+            return CellIndexUpdateReport {
+                update: CellIndexUpdate::Inserted,
+                retained_cells: 0,
+                removed_cells: 0,
+                inserted_cells,
+                incremental_diff: false,
+            };
         };
-        let existed = self.remove(handle);
-        for cell in cells.as_slice() {
-            self.cells.entry(*cell).or_default().push(handle);
+
+        let incremental_diff = matches!(&previous, CellMembership::Multiple(_));
+        let (retained_cells, removed_cells, inserted_cells) =
+            self.apply_membership_diff(handle, previous.as_slice(), &scratch.cells);
+        let new_cells = std::mem::take(&mut scratch.cells);
+        if let CellMembership::Multiple(previous_cells) = previous {
+            scratch.cells = previous_cells;
         }
-        self.entity_cells.insert(handle, cells);
-        if existed {
-            CellIndexUpdate::Relocated
-        } else {
-            CellIndexUpdate::Inserted
+        self.entity_cells
+            .insert(handle, CellMembership::Multiple(new_cells));
+        CellIndexUpdateReport {
+            update: CellIndexUpdate::Relocated,
+            retained_cells,
+            removed_cells,
+            inserted_cells,
+            incremental_diff,
         }
+    }
+
+    fn upsert_point(
+        &mut self,
+        handle: EntityHandle,
+        cell: CellCoord3,
+        scratch: &mut CellIndexUpdateScratch,
+    ) -> CellIndexUpdateReport {
+        let Some(previous) = self.entity_cells.remove(&handle) else {
+            self.cells.entry(cell).or_default().push(handle);
+            self.entity_cells
+                .insert(handle, CellMembership::Point(cell));
+            return CellIndexUpdateReport {
+                update: CellIndexUpdate::Inserted,
+                retained_cells: 0,
+                removed_cells: 0,
+                inserted_cells: 1,
+                incremental_diff: false,
+            };
+        };
+        if matches!(&previous, CellMembership::Point(current) if *current == cell) {
+            self.entity_cells.insert(handle, previous);
+            return CellIndexUpdateReport {
+                update: CellIndexUpdate::Unchanged,
+                retained_cells: 1,
+                removed_cells: 0,
+                inserted_cells: 0,
+                incremental_diff: false,
+            };
+        }
+
+        let target = [cell];
+        let (retained_cells, removed_cells, inserted_cells) =
+            self.apply_membership_diff(handle, previous.as_slice(), &target);
+        if let CellMembership::Multiple(previous_cells) = previous {
+            scratch.cells = previous_cells;
+        }
+        self.entity_cells
+            .insert(handle, CellMembership::Point(cell));
+        CellIndexUpdateReport {
+            update: CellIndexUpdate::Relocated,
+            retained_cells,
+            removed_cells,
+            inserted_cells,
+            incremental_diff: false,
+        }
+    }
+
+    fn apply_membership_diff(
+        &mut self,
+        handle: EntityHandle,
+        previous: &[CellCoord3],
+        next: &[CellCoord3],
+    ) -> (usize, usize, usize) {
+        let (mut old_index, mut new_index) = (0, 0);
+        let (mut retained, mut removed, mut inserted) = (0, 0, 0);
+        while old_index < previous.len() || new_index < next.len() {
+            match (previous.get(old_index), next.get(new_index)) {
+                (Some(old), Some(new)) if old == new => {
+                    retained += 1;
+                    old_index += 1;
+                    new_index += 1;
+                }
+                (Some(old), Some(new)) if old < new => {
+                    self.remove_handle_from_cell(*old, handle);
+                    removed += 1;
+                    old_index += 1;
+                }
+                (_, Some(new)) => {
+                    self.cells.entry(*new).or_default().push(handle);
+                    inserted += 1;
+                    new_index += 1;
+                }
+                (Some(old), None) => {
+                    self.remove_handle_from_cell(*old, handle);
+                    removed += 1;
+                    old_index += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        (retained, removed, inserted)
     }
 
     /// Removes an entity from the index.
@@ -464,8 +602,8 @@ fn cells_match_range(cells: &[CellCoord3], min: CellCoord3, max: CellCoord3) -> 
     cells.next().is_none()
 }
 
-fn collect_cell_range(min: CellCoord3, max: CellCoord3) -> Vec<CellCoord3> {
-    let mut cells = Vec::with_capacity(query_cell_volume(min, max));
+fn extend_cell_range(cells: &mut Vec<CellCoord3>, min: CellCoord3, max: CellCoord3) {
+    cells.reserve(query_cell_volume(min, max));
     for x in min.x..=max.x {
         for y in min.y..=max.y {
             for z in min.z..=max.z {
@@ -473,7 +611,6 @@ fn collect_cell_range(min: CellCoord3, max: CellCoord3) -> Vec<CellCoord3> {
             }
         }
     }
-    cells
 }
 
 fn query_cell_volume(min: CellCoord3, max: CellCoord3) -> usize {
@@ -619,6 +756,51 @@ mod tests {
         assert_eq!(
             index.cells_for_handle(handle),
             Some(grid.cells_for_bounds(relocated_position, bounds).as_slice())
+        );
+    }
+
+    #[test]
+    fn multi_cell_crossing_updates_only_membership_difference() {
+        let grid = GridSpec::new(32.0).expect("valid grid");
+        let bounds = Bounds::Sphere { radius: 20.0 };
+        let handle = EntityHandle::new(1, 0);
+        let start = Position3::new(16.0, 16.0, 16.0);
+        let moved = Position3::new(48.0, 16.0, 16.0);
+        let mut index = CellIndex::new(grid);
+        let mut scratch = CellIndexUpdateScratch::default();
+
+        let inserted = index.upsert_with_scratch(handle, start, bounds, &mut scratch);
+        assert_eq!(inserted.update, CellIndexUpdate::Inserted);
+        assert_eq!(inserted.inserted_cells, 27);
+
+        let relocated = index.upsert_with_scratch(handle, moved, bounds, &mut scratch);
+        assert_eq!(
+            relocated,
+            CellIndexUpdateReport {
+                update: CellIndexUpdate::Relocated,
+                retained_cells: 18,
+                removed_cells: 9,
+                inserted_cells: 9,
+                incremental_diff: true,
+            }
+        );
+        assert!(scratch.retained_cell_capacity() >= 27);
+
+        let returned = index.upsert_with_scratch(handle, start, bounds, &mut scratch);
+        assert_eq!(returned.retained_cells, 18);
+        assert_eq!(returned.removed_cells, 9);
+        assert_eq!(returned.inserted_cells, 9);
+        assert!(returned.incremental_diff);
+
+        let mut rebuilt = CellIndex::new(grid);
+        rebuilt.upsert(handle, start, bounds);
+        assert_eq!(
+            index.cells_for_handle(handle),
+            rebuilt.cells_for_handle(handle)
+        );
+        assert_eq!(
+            index.query_sphere(start, 64.0),
+            rebuilt.query_sphere(start, 64.0)
         );
     }
 

@@ -7,7 +7,7 @@ use sectorsync_core::{
     handoff::HandoffTransfer,
     ids::{EntityHandle, EntityId, OwnerEpoch, PolicyId, StationId, Tick},
     spatial::{Bounds, GridSpec, Position3},
-    spatial_index::{CellIndex, CellIndexUpdate},
+    spatial_index::{CellIndex, CellIndexUpdate, CellIndexUpdateScratch},
     station::{Station, StationConfig, StationError},
 };
 
@@ -157,6 +157,8 @@ pub struct StationRuntimeCapacities {
     pub indexed_entities: usize,
     /// Spatial occupied-cell entries.
     pub occupied_cells: usize,
+    /// Reusable multi-cell update coordinates.
+    pub index_update_cells: usize,
     /// Dense plus sparse component column slots.
     pub component_columns: usize,
     /// Ready command queue slots, or zero when queues are disabled.
@@ -220,6 +222,7 @@ pub struct StationRuntime {
     index: CellIndex,
     components: ComponentStore,
     commands: Option<CommandQueues>,
+    index_update_scratch: CellIndexUpdateScratch,
 }
 
 impl StationRuntime {
@@ -236,6 +239,7 @@ impl StationRuntime {
             ),
             components: ComponentStore::default(),
             commands: config.command_queue_limits.map(CommandQueues::new),
+            index_update_scratch: CellIndexUpdateScratch::default(),
         }
     }
 
@@ -272,6 +276,7 @@ impl StationRuntime {
             station_free_handles: self.station.free_list_capacity(),
             indexed_entities: self.index.entity_capacity(),
             occupied_cells: self.index.occupied_cell_capacity(),
+            index_update_cells: self.index_update_scratch.retained_cell_capacity(),
             component_columns: self.components.column_slots_capacity(),
             command_ready: self
                 .commands
@@ -289,6 +294,7 @@ impl StationRuntime {
         let before = self.retained_capacities();
         self.station.reclaim_retained_capacity();
         self.index.reclaim_retained_capacity();
+        self.index_update_scratch.reclaim_retained_capacity();
         self.components.reclaim_retained_capacity();
         if let Some(commands) = &mut self.commands {
             commands.reclaim_retained_capacity();
@@ -309,9 +315,7 @@ impl StationRuntime {
         let handle =
             self.station
                 .spawn_owned(spawn.id, spawn.position, spawn.bounds, spawn.policy_id)?;
-        let update = self
-            .index
-            .upsert_tracked(handle, spawn.position, spawn.bounds);
+        let update = self.upsert_index(handle, spawn.position, spawn.bounds);
         debug_assert_eq!(update, CellIndexUpdate::Inserted);
         Ok(handle)
     }
@@ -327,9 +331,7 @@ impl StationRuntime {
             ghost.owner_epoch,
             ghost.expires_at,
         );
-        let index_update = self
-            .index
-            .upsert_tracked(handle, ghost.position, ghost.bounds);
+        let index_update = self.upsert_index(handle, ghost.position, ghost.bounds);
         StationEntityUpdateReport {
             handle,
             index_update,
@@ -347,9 +349,8 @@ impl StationRuntime {
             .station
             .get(handle)
             .expect("successful move retains the authoritative entity");
-        let index_update = self
-            .index
-            .upsert_tracked(handle, record.position, record.bounds);
+        let (position, bounds) = (record.position, record.bounds);
+        let index_update = self.upsert_index(handle, position, bounds);
         Ok(StationMoveReport { index_update })
     }
 
@@ -410,9 +411,8 @@ impl StationRuntime {
             .station
             .get(handle)
             .expect("successful handoff prewarm retains the ghost");
-        let index_update = self
-            .index
-            .upsert_tracked(handle, record.position, record.bounds);
+        let (position, bounds) = (record.position, record.bounds);
+        let index_update = self.upsert_index(handle, position, bounds);
         Ok(StationEntityUpdateReport {
             handle,
             index_update,
@@ -427,7 +427,7 @@ impl StationRuntime {
         let position = transfer.entity.position;
         let bounds = transfer.entity.bounds;
         let handle = self.station.commit_incoming_handoff(transfer)?;
-        let index_update = self.index.upsert_tracked(handle, position, bounds);
+        let index_update = self.upsert_index(handle, position, bounds);
         Ok(StationEntityUpdateReport {
             handle,
             index_update,
@@ -460,6 +460,17 @@ impl StationRuntime {
             &mut self.components,
             self.commands.as_mut(),
         )
+    }
+
+    fn upsert_index(
+        &mut self,
+        handle: EntityHandle,
+        position: Position3,
+        bounds: Bounds,
+    ) -> CellIndexUpdate {
+        self.index
+            .upsert_with_scratch(handle, position, bounds, &mut self.index_update_scratch)
+            .update
     }
 
     fn ensure_owned(&self, handle: EntityHandle) -> Result<(), StationError> {
