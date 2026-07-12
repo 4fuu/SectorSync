@@ -43,10 +43,10 @@ Use only the layers needed by the application:
 
 ```toml
 [dependencies]
-sectorsync-core = "=2026.711.0"
-sectorsync-wire = "=2026.711.0"
-sectorsync-transport = "=2026.711.0"
-sectorsync-runtime = "=2026.711.0"
+sectorsync-core = "=2026.712.0"
+sectorsync-wire = "=2026.712.0"
+sectorsync-transport = "=2026.712.0"
+sectorsync-runtime = "=2026.712.0"
 ```
 
 `sectorsync-core` works independently. Higher layers add wire, transport, and
@@ -56,8 +56,8 @@ network service.
 Optional performance features are explicit:
 
 ```toml
-sectorsync-core = { version = "=2026.711.0", features = ["simd"] }
-sectorsync-runtime = { version = "=2026.711.0", features = ["parallel"] }
+sectorsync-core = { version = "=2026.712.0", features = ["simd"] }
+sectorsync-runtime = { version = "=2026.712.0", features = ["parallel"] }
 ```
 
 `simd` enables the safe range-only SIMD candidate path. `parallel` exposes a
