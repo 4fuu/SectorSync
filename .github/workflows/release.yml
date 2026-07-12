@@ -50,7 +50,8 @@ jobs:
               | select(.name == "sectorsync-core"
                     or .name == "sectorsync-wire"
                     or .name == "sectorsync-transport"
-                    or .name == "sectorsync-runtime")
+                    or .name == "sectorsync-runtime"
+                    or .name == "sectorsync")
               | .version]
             | unique
             | if length == 1 then .[0] else error("published crate versions differ") end')"
@@ -70,7 +71,7 @@ jobs:
               if ! gh release view "$current_tag" >/dev/null 2>&1; then
                 complete=false
               else
-                for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
+                for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime sectorsync; do
                   if ! curl --fail --silent --show-error \
                     --user-agent "SectorSync release workflow (https://github.com/4fuu/SectorSync)" \
                     "https://crates.io/api/v1/crates/$crate/$current_version" >/dev/null; then
@@ -227,7 +228,7 @@ jobs:
             return 1
           }
 
-          for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
+          for crate in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime sectorsync; do
             if curl --fail --silent --show-error \
               --user-agent "SectorSync release workflow (https://github.com/4fuu/SectorSync)" \
               "https://crates.io/api/v1/crates/$crate/$RELEASE_VERSION" >/dev/null; then

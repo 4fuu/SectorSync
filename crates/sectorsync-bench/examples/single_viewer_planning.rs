@@ -227,7 +227,7 @@ fn run(
         for _ in 0..config.calls_per_tick {
             match config.output_mode {
                 OutputMode::Reuse => {
-                    ReplicationPlanner::plan_for_viewer_with_scratch_into(
+                    ReplicationPlanner::plan_for_viewer_into(
                         station,
                         index,
                         policies,
@@ -243,7 +243,8 @@ fn run(
                     black_box(&reusable.entities);
                 }
                 OutputMode::Fresh => {
-                    let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
+                    let mut plan = ReplicationPlan::default();
+                    ReplicationPlanner::plan_for_viewer_into(
                         station,
                         index,
                         policies,
@@ -251,6 +252,7 @@ fn run(
                         &RangeOnlyVisibility,
                         budget,
                         &mut scratch,
+                        &mut plan,
                     );
                     stats.selected_entities =
                         stats.selected_entities.saturating_add(plan.stats.selected);

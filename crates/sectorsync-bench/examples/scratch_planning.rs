@@ -55,7 +55,8 @@ fn main() {
     let mut grid_queries = 0_usize;
     let mut occupied_queries = 0_usize;
     for viewer in &viewers {
-        let plan = ReplicationPlanner::plan_for_viewer_with_scratch(
+        let mut plan = sectorsync_core::prelude::ReplicationPlan::default();
+        ReplicationPlanner::plan_for_viewer_into(
             &station,
             &index,
             &policies,
@@ -63,6 +64,7 @@ fn main() {
             &RangeOnlyVisibility,
             ReplicationBudget::default(),
             &mut scratch,
+            &mut plan,
         );
         selected += plan.stats.selected;
         last_candidates = scratch.candidate_count();

@@ -3,8 +3,9 @@
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CompiledSyncPolicy, ComponentDescriptor, ComponentId,
     ComponentMigrationMode, ComponentStore, ComponentSyncMode, EntityId, GridSpec, InstanceId,
-    NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, Station, StationConfig,
-    StationId, U32LeCodec, ViewerQuery,
+    NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
+    ReplicationPlan, ReplicationPlanner, ReplicationScratch, Station, StationConfig, StationId,
+    U32LeCodec, ViewerQuery,
 };
 use sectorsync_runtime::{
     ReplicationReceiveBridge, ReplicationReceiveConfig, ReplicationTransportBridge,
@@ -12,6 +13,7 @@ use sectorsync_runtime::{
 use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub};
 use sectorsync_wire::ComponentSelection;
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let client_id = ClientId::new(7);
     let server_id = ClientId::new(0);
@@ -69,16 +71,27 @@ fn main() {
         .expect("server endpoint should register");
 
     let mut bridge = ReplicationTransportBridge::default();
+    let mut scratch = ReplicationScratch::default();
+    let mut plan = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_into(
+        &station,
+        &index,
+        &policies,
+        &viewer,
+        &RangeOnlyVisibility,
+        ReplicationBudget::default(),
+        &mut scratch,
+        &mut plan,
+    );
     let report = bridge
-        .send_viewer(
+        .send_plan(
             &mut server_transport,
+            viewer.client_id,
+            station.tick(),
             &station,
-            &index,
-            &policies,
             &components,
             &selection,
-            &viewer,
-            &RangeOnlyVisibility,
+            &plan,
         )
         .expect("replication should send");
     assert!(report.sent);
@@ -89,7 +102,7 @@ fn main() {
     let mut entities = 0_usize;
     let mut received_components = 0_usize;
     let visit = receive_bridge
-        .pump_visit(&mut client_transport, 4, |frame| {
+        .pump(&mut client_transport, 4, |frame| {
             assert_eq!(frame.client_id, client_id);
             for entity in frame.entities() {
                 entities = entities.saturating_add(1);

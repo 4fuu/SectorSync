@@ -1,13 +1,13 @@
 //! Explicit, bounded parallel replication planning.
 
 use core::fmt;
+#[cfg(test)]
 use core::ops::Range;
 
 use rayon::prelude::*;
 use sectorsync_core::prelude::{
-    CellIndex, PolicyTable, ReplicationBatchResult, ReplicationBatchScratch, ReplicationBatchStats,
-    ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station, ViewerQuery,
-    VisibilityFilter,
+    CellIndex, PolicyTable, ReplicationBatchScratch, ReplicationBatchStats, ReplicationBudget,
+    ReplicationPlanner, ReplicationScratch, Station, ViewerQuery, VisibilityFilter,
 };
 use sectorsync_core::{
     entity::EntityRecord,
@@ -176,6 +176,7 @@ impl ParallelReplicationScratch {
     }
 }
 
+#[cfg(test)]
 fn partition_bounds(items: usize, partitions: usize, partition: usize) -> Range<usize> {
     let base = items / partitions;
     let remainder = items % partitions;
@@ -192,15 +193,6 @@ fn chunked_logical_lanes(items: usize, retained_lanes: usize) -> usize {
     }
 }
 
-/// Ordered station results and merged aggregate statistics.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ParallelReplicationResult {
-    /// One result per input station batch, retaining input order.
-    pub batches: Vec<ReplicationBatchResult>,
-    /// Aggregate statistics merged in station input order.
-    pub stats: ReplicationBatchStats,
-}
-
 /// Borrowed ordered Station results produced from reusable parallel storage.
 #[derive(Clone, Copy, Debug)]
 pub struct ParallelReplicationView<'a> {
@@ -208,16 +200,6 @@ pub struct ParallelReplicationView<'a> {
     pub batches: &'a [ReplicationBatchScratch],
     /// Aggregate statistics merged in Station input order.
     pub stats: ReplicationBatchStats,
-}
-
-impl ParallelReplicationResult {
-    fn from_batches(batches: Vec<ReplicationBatchResult>) -> Self {
-        let mut stats = ReplicationBatchStats::default();
-        for batch in &batches {
-            stats.merge(batch.stats);
-        }
-        Self { batches, stats }
-    }
 }
 
 /// Explicit Rayon pool used only when the embedding application constructs it.
@@ -334,87 +316,6 @@ impl ReplicationThreadPool {
     {
         self.pool
             .install(|| inputs.into_par_iter().map(operation).collect())
-    }
-
-    /// Plans generic visibility batches in deterministic worker partitions.
-    pub fn plan_station_batches<F>(
-        &self,
-        batches: &[StationReplicationBatch<'_>],
-        policies: &PolicyTable,
-        filter: &F,
-        budget: ReplicationBudget,
-        scratch: &mut ParallelReplicationScratch,
-    ) -> ParallelReplicationResult
-    where
-        F: VisibilityFilter + Sync,
-    {
-        let lanes = self.threads.min(batches.len());
-        scratch.prepare_lanes(lanes);
-        scratch.active_lanes = lanes;
-        let partitioned = self.pool.install(|| {
-            scratch
-                .lanes
-                .par_iter_mut()
-                .enumerate()
-                .map(|(lane_index, lane)| {
-                    batches[partition_bounds(batches.len(), lanes, lane_index)]
-                        .iter()
-                        .map(|batch| {
-                            ReplicationPlanner::plan_for_viewers_with_scratch(
-                                batch.station,
-                                batch.index,
-                                policies,
-                                batch.viewers,
-                                filter,
-                                budget,
-                                lane,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        });
-        let results = partitioned.into_iter().flatten().collect();
-        ParallelReplicationResult::from_batches(results)
-    }
-
-    /// Plans range-only batches in deterministic worker partitions.
-    ///
-    /// SIMD candidate filtering is used when the core `simd` feature is enabled.
-    pub fn plan_station_range_batches(
-        &self,
-        batches: &[StationReplicationBatch<'_>],
-        policies: &PolicyTable,
-        budget: ReplicationBudget,
-        scratch: &mut ParallelReplicationScratch,
-    ) -> ParallelReplicationResult {
-        let lanes = self.threads.min(batches.len());
-        scratch.prepare_lanes(lanes);
-        scratch.active_lanes = lanes;
-        let partitioned = self.pool.install(|| {
-            scratch
-                .lanes
-                .par_iter_mut()
-                .enumerate()
-                .map(|(lane_index, lane)| {
-                    batches[partition_bounds(batches.len(), lanes, lane_index)]
-                        .iter()
-                        .map(|batch| {
-                            ReplicationPlanner::plan_for_viewers_range_with_scratch(
-                                batch.station,
-                                batch.index,
-                                policies,
-                                batch.viewers,
-                                budget,
-                                lane,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        });
-        let results = partitioned.into_iter().flatten().collect();
-        ParallelReplicationResult::from_batches(results)
     }
 
     /// Plans generic visibility batches into caller-owned reusable Station outputs.
@@ -575,7 +476,7 @@ mod tests {
         let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
             .expect("pool builds");
         let mut parallel_scratch = ParallelReplicationScratch::new();
-        let parallel = pool.plan_station_range_batches(
+        let parallel = pool.plan_station_range_batches_into(
             &batches,
             &policies,
             ReplicationBudget::default(),
@@ -584,7 +485,8 @@ mod tests {
 
         for (batch_index, batch) in batches.iter().enumerate() {
             let mut serial_scratch = ReplicationScratch::default();
-            let serial = ReplicationPlanner::plan_for_viewers_with_scratch(
+            let mut serial_output = ReplicationBatchScratch::default();
+            let serial = ReplicationPlanner::plan_for_viewers_into(
                 batch.station,
                 batch.index,
                 &policies,
@@ -592,15 +494,16 @@ mod tests {
                 &RangeOnlyVisibility,
                 ReplicationBudget::default(),
                 &mut serial_scratch,
+                &mut serial_output,
             );
-            assert_eq!(parallel.batches[batch_index].plans, serial.plans);
+            assert_eq!(parallel.batches[batch_index].view().plans, serial.plans);
         }
         assert_eq!(parallel.stats.viewers, 6);
         assert_eq!(parallel_scratch.lanes(), 2);
     }
 
     #[test]
-    fn reusable_parallel_output_matches_owned_results_and_retains_capacity() {
+    fn reusable_parallel_output_matches_repeated_results_and_retains_capacity() {
         let mut stations = Vec::new();
         let mut indexes = Vec::new();
         let mut viewers = Vec::new();
@@ -655,14 +558,19 @@ mod tests {
             .collect::<Vec<_>>();
         let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
             .expect("pool builds");
-        let mut owned_scratch = ParallelReplicationScratch::new();
-        let owned = pool.plan_station_range_batches(
+        let mut reusable_scratch = ParallelReplicationScratch::new();
+        let first = pool.plan_station_range_batches_into(
             &batches,
             &policies,
             ReplicationBudget::default(),
-            &mut owned_scratch,
+            &mut reusable_scratch,
         );
-        let mut reusable_scratch = ParallelReplicationScratch::new();
+        let expected_stats = first.stats;
+        let expected = first
+            .batches
+            .iter()
+            .map(|batch| (batch.view().plans.to_vec(), batch.view().stats))
+            .collect::<Vec<_>>();
 
         {
             let reusable = pool.plan_station_range_batches_into(
@@ -671,11 +579,11 @@ mod tests {
                 ReplicationBudget::default(),
                 &mut reusable_scratch,
             );
-            assert_eq!(reusable.stats, owned.stats);
-            for (actual, expected) in reusable.batches.iter().zip(&owned.batches) {
+            assert_eq!(reusable.stats, expected_stats);
+            for (actual, expected) in reusable.batches.iter().zip(&expected) {
                 let actual = actual.view();
-                assert_eq!(actual.plans, expected.plans);
-                assert_eq!(actual.stats, expected.stats);
+                assert_eq!(actual.plans, expected.0);
+                assert_eq!(actual.stats, expected.1);
             }
         }
         let retained_capacity = reusable_scratch.retained_entity_capacity();
@@ -713,17 +621,6 @@ mod tests {
         let pool = ReplicationThreadPool::new(ReplicationThreadPoolConfig::new(2, 2))
             .expect("pool builds");
         let mut scratch = ParallelReplicationScratch::new();
-        let result = pool.plan_station_range_batches(
-            &[],
-            &PolicyTable::default(),
-            ReplicationBudget::default(),
-            &mut scratch,
-        );
-
-        assert!(result.batches.is_empty());
-        assert_eq!(result.stats, ReplicationBatchStats::default());
-        assert_eq!(scratch.lanes(), 0);
-
         let reusable = pool.plan_station_range_batches_into(
             &[],
             &PolicyTable::default(),

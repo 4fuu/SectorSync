@@ -14,10 +14,9 @@ use sectorsync_core::prelude::{
     CommandQueues, ComponentStore, EntityHandle, EntityId, EventQueueError, EventQueueLimits,
     EventQueues, GatewayError, GatewaySessionTable, HandoffTransfer, HotspotDecision,
     HotspotPlanner, HotspotSeverity, HotspotSplitScratch, HotspotThresholds, NodeId, OwnerEpoch,
-    PolicyTable, PushOutcome, ReplicationBudget, ReplicationPlan, ReplicationPlanner,
-    ReplicationScratch, RuntimeBarrier, RuntimeUpgradeHook, SnapshotVersion, SplitProposal,
-    Station, StationError, StationEvent, StationId, StationLoadSample, StationSnapshot, Tick,
-    ViewerQuery, VisibilityFilter,
+    PushOutcome, ReplicationBudget, ReplicationPlan, RuntimeBarrier, RuntimeUpgradeHook,
+    SnapshotVersion, SplitProposal, Station, StationError, StationEvent, StationId,
+    StationLoadSample, StationSnapshot, Tick,
 };
 use sectorsync_transport::{
     InboundPacket, OutboundPacket, StationOutboundPacket, StationTransportReceiver,
@@ -37,9 +36,9 @@ pub use deployment::{
 };
 #[cfg(feature = "parallel")]
 pub use parallel::{
-    ParallelReplicationResult, ParallelReplicationScratch, ParallelReplicationView,
-    ReplicationThreadPool, ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig,
-    StationReplicationBatch, StationReplicationBatchSource,
+    ParallelReplicationScratch, ParallelReplicationView, ReplicationThreadPool,
+    ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig, StationReplicationBatch,
+    StationReplicationBatchSource,
 };
 
 /// Client replication transport bridge configuration.
@@ -64,8 +63,6 @@ pub struct ReplicationTransportStats {
     pub bytes_sent: usize,
     /// Initial packet byte capacity requested from bounded wire hints.
     pub packet_capacity_hint_bytes: usize,
-    /// Largest entity capacity retained by the reusable single-viewer plan.
-    pub planning_entity_capacity_max: usize,
     /// Entities selected by AOI planning.
     pub entities_selected: usize,
     /// Entities skipped by replication planner budget.
@@ -146,8 +143,6 @@ impl<E> From<BinaryEncodeError> for ReplicationTransportError<E> {
 pub struct ReplicationTransportBridge {
     config: ReplicationTransportConfig,
     builder: ReplicationFrameBuilder,
-    planning_scratch: Option<ReplicationScratch>,
-    planning_output: ReplicationPlan,
     stats: ReplicationTransportStats,
 }
 
@@ -157,26 +152,12 @@ impl ReplicationTransportBridge {
         Self {
             config,
             builder,
-            planning_scratch: None,
-            planning_output: ReplicationPlan {
-                entities: Vec::new(),
-                stats: sectorsync_core::prelude::ReplicationStats {
-                    candidates: 0,
-                    considered: 0,
-                    selected: 0,
-                    skipped_by_budget: 0,
-                    unexamined_after_budget: 0,
-                    skipped_by_cadence: 0,
-                    estimated_bytes: 0,
-                },
-            },
             stats: ReplicationTransportStats {
                 viewers_planned: 0,
                 frames_skipped_empty: 0,
                 frames_sent: 0,
                 bytes_sent: 0,
                 packet_capacity_hint_bytes: 0,
-                planning_entity_capacity_max: 0,
                 entities_selected: 0,
                 entities_skipped_by_budget: 0,
                 entities_skipped_by_cadence: 0,
@@ -200,187 +181,6 @@ impl ReplicationTransportBridge {
     /// Returns accumulated statistics.
     pub const fn stats(&self) -> ReplicationTransportStats {
         self.stats
-    }
-
-    /// Plans, builds, encodes, and sends one viewer replication frame.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_viewer<T, F>(
-        &mut self,
-        transport: &mut T,
-        station: &Station,
-        index: &CellIndex,
-        policies: &PolicyTable,
-        components: &ComponentStore,
-        selection: &ComponentSelection,
-        viewer: &ViewerQuery,
-        filter: &F,
-    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
-    where
-        T: TransportSink,
-        F: VisibilityFilter,
-    {
-        let mut plan = core::mem::take(&mut self.planning_output);
-        ReplicationPlanner::plan_for_viewer_with_scratch_into(
-            station,
-            index,
-            policies,
-            viewer,
-            filter,
-            self.config.budget,
-            self.planning_scratch.get_or_insert_default(),
-            &mut plan,
-        );
-        self.record_planning_capacity(&plan);
-        let result = self.send_plan(
-            transport,
-            viewer.client_id,
-            station.tick(),
-            station,
-            components,
-            selection,
-            &plan,
-        );
-        self.planning_output = plan;
-        result
-    }
-
-    /// Plans with cadence, builds, encodes, and sends one viewer replication frame.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_viewer_with_cadence<T, F, L>(
-        &mut self,
-        transport: &mut T,
-        station: &Station,
-        index: &CellIndex,
-        policies: &PolicyTable,
-        components: &ComponentStore,
-        selection: &ComponentSelection,
-        viewer: &ViewerQuery,
-        filter: &F,
-        last_sent: L,
-    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
-    where
-        T: TransportSink,
-        F: VisibilityFilter,
-        L: Fn(EntityHandle) -> Option<Tick>,
-    {
-        let mut plan = core::mem::take(&mut self.planning_output);
-        ReplicationPlanner::plan_for_viewer_with_cadence_and_scratch_into(
-            station,
-            index,
-            policies,
-            viewer,
-            filter,
-            self.config.budget,
-            last_sent,
-            self.planning_scratch.get_or_insert_default(),
-            &mut plan,
-        );
-        self.record_planning_capacity(&plan);
-        let result = self.send_plan(
-            transport,
-            viewer.client_id,
-            station.tick(),
-            station,
-            components,
-            selection,
-            &plan,
-        );
-        self.planning_output = plan;
-        result
-    }
-
-    /// Plans by priority, builds, encodes, and sends one viewer replication frame.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_viewer_prioritized<T, F>(
-        &mut self,
-        transport: &mut T,
-        station: &Station,
-        index: &CellIndex,
-        policies: &PolicyTable,
-        components: &ComponentStore,
-        selection: &ComponentSelection,
-        viewer: &ViewerQuery,
-        filter: &F,
-    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
-    where
-        T: TransportSink,
-        F: VisibilityFilter,
-    {
-        let mut plan = core::mem::take(&mut self.planning_output);
-        ReplicationPlanner::plan_for_viewer_prioritized_with_scratch_into(
-            station,
-            index,
-            policies,
-            viewer,
-            filter,
-            self.config.budget,
-            self.planning_scratch.get_or_insert_default(),
-            &mut plan,
-        );
-        self.record_planning_capacity(&plan);
-        let result = self.send_plan(
-            transport,
-            viewer.client_id,
-            station.tick(),
-            station,
-            components,
-            selection,
-            &plan,
-        );
-        self.planning_output = plan;
-        result
-    }
-
-    /// Plans by priority and cadence, builds, encodes, and sends one viewer replication frame.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_viewer_prioritized_with_cadence<T, F, L>(
-        &mut self,
-        transport: &mut T,
-        station: &Station,
-        index: &CellIndex,
-        policies: &PolicyTable,
-        components: &ComponentStore,
-        selection: &ComponentSelection,
-        viewer: &ViewerQuery,
-        filter: &F,
-        last_sent: L,
-    ) -> Result<ReplicationTransportReport, ReplicationTransportError<T::Error>>
-    where
-        T: TransportSink,
-        F: VisibilityFilter,
-        L: Fn(EntityHandle) -> Option<Tick>,
-    {
-        let mut plan = core::mem::take(&mut self.planning_output);
-        ReplicationPlanner::plan_for_viewer_prioritized_with_cadence_and_scratch_into(
-            station,
-            index,
-            policies,
-            viewer,
-            filter,
-            self.config.budget,
-            last_sent,
-            self.planning_scratch.get_or_insert_default(),
-            &mut plan,
-        );
-        self.record_planning_capacity(&plan);
-        let result = self.send_plan(
-            transport,
-            viewer.client_id,
-            station.tick(),
-            station,
-            components,
-            selection,
-            &plan,
-        );
-        self.planning_output = plan;
-        result
-    }
-
-    fn record_planning_capacity(&mut self, plan: &ReplicationPlan) {
-        self.stats.planning_entity_capacity_max = self
-            .stats
-            .planning_entity_capacity_max
-            .max(plan.entities.capacity());
     }
 
     /// Builds, encodes, and sends a caller-provided replication plan.
@@ -730,7 +530,7 @@ impl ReplicationReceiveBridge {
     }
 
     /// Receives and decodes up to `max_packets` replication frames.
-    pub fn pump<T>(
+    pub fn pump_owned<T>(
         &mut self,
         transport: &mut T,
         max_packets: usize,
@@ -810,7 +610,7 @@ impl ReplicationReceiveBridge {
     /// A frame is counted as accepted after source/wire/target validation and
     /// before visitor invocation; accumulated bridge statistics are not rolled
     /// back when the visitor returns an error.
-    pub fn pump_visit<T, F, V>(
+    pub fn pump<T, F, V>(
         &mut self,
         transport: &mut T,
         max_packets: usize,
@@ -847,7 +647,7 @@ impl ReplicationReceiveBridge {
                 ));
             }
 
-            let frame = match BinaryFrameDecoder.decode_replication_ref(&packet.bytes) {
+            let frame = match BinaryFrameDecoder.decode_replication(&packet.bytes) {
                 Ok(frame) => frame,
                 Err(ReplicationFrameRefDecodeError::Binary(error)) => {
                     self.stats.frames_rejected_decode =
@@ -1259,7 +1059,7 @@ impl ClientTransportBridge {
     }
 
     /// Receives and decodes up to `max_packets` client-bound frames.
-    pub fn pump<T>(
+    pub fn pump_owned<T>(
         &mut self,
         transport: &mut T,
         max_packets: usize,
@@ -1356,7 +1156,7 @@ impl ClientTransportBridge {
     /// before the visitor returns. Accepted statistics are recorded before
     /// visitor invocation and are not rolled back if the visitor fails.
     #[allow(clippy::too_many_lines)]
-    pub fn pump_visit<T, F, V>(
+    pub fn pump<T, F, V>(
         &mut self,
         transport: &mut T,
         max_packets: usize,
@@ -1393,7 +1193,7 @@ impl ClientTransportBridge {
                 ));
             }
 
-            match BinaryFrameDecoder.decode_replication_ref(&packet.bytes) {
+            match BinaryFrameDecoder.decode_replication(&packet.bytes) {
                 Ok(frame) => {
                     self.validate_client_target::<T::Error>(
                         ClientInboundFrameKind::Replication,
@@ -5584,15 +5384,12 @@ mod tests {
     use super::*;
     use sectorsync_core::prelude::{
         Bounds, CellCoord3, CellLoadSample, CommandEnvelope, CommandPriority, CommandQueueLimits,
-        CompiledSyncPolicy, ComponentDescriptor, ComponentId, ComponentMigrationMode,
-        ComponentSyncMode, EventId, EventKind, EventPriority, GatewayConfig, GridSpec,
-        HotspotThresholds, InstanceId, NodeId, PolicyId, Position3, RangeOnlyVisibility,
-        SnapshotMeta, StationConfig, StationLoadSample, U32LeCodec,
+        ComponentId, EventId, EventKind, EventPriority, GatewayConfig, GridSpec, HotspotThresholds,
+        InstanceId, NodeId, PolicyId, Position3, SnapshotMeta, StationConfig, StationLoadSample,
     };
     use sectorsync_transport::{
-        BudgetedTransport, ClientTransportLimits, FakeTransport, InMemoryStationTransport,
-        InMemoryTransportHub, OutboundPacket, StationOutboundPacket, StationTransportSink,
-        TransportReceiver, TransportSink,
+        ClientTransportLimits, InMemoryStationTransport, InMemoryTransportHub, OutboundPacket,
+        StationOutboundPacket, StationTransportSink, TransportReceiver, TransportSink,
     };
     use sectorsync_wire::{
         BarrierFrame, BinaryFrameDecoder, BinaryFrameEncoder, CommandAckFrame,
@@ -5997,7 +5794,7 @@ mod tests {
                 ClientTransportConfig::new(client_id, server_id).with_expected_source(server_id),
             );
             let pump = client_bridge
-                .pump(&mut client_transports[index], 2)
+                .pump_owned(&mut client_transports[index], 2)
                 .expect("client should receive barrier");
             assert_eq!(pump.barrier_frames_received(), 1);
             assert_eq!(
@@ -6010,248 +5807,6 @@ mod tests {
                 }
             );
         }
-    }
-
-    #[test]
-    fn replication_transport_bridge_sends_planned_frame() {
-        let mut station = station(1, 10);
-        let mut index = CellIndex::new(GridSpec::new(64.0).expect("grid is valid"));
-        let mut policies = PolicyTable::default();
-        policies.set(CompiledSyncPolicy::new(PolicyId::new(0), 1, 20, 256.0));
-        let handle = station
-            .spawn_owned(
-                EntityId::new(100),
-                Position3::new(0.0, 0.0, 0.0),
-                Bounds::Point,
-                PolicyId::new(0),
-            )
-            .expect("spawn should work");
-        index.upsert(handle, Position3::new(0.0, 0.0, 0.0), Bounds::Point);
-        let descriptor = ComponentDescriptor::sparse_blob(
-            ComponentId::new(1),
-            "health",
-            ComponentSyncMode::Delta,
-            ComponentMigrationMode::Copy,
-            4,
-        );
-        let mut components = ComponentStore::default();
-        components
-            .set_typed(&descriptor, handle, 1, &U32LeCodec, &100)
-            .expect("component should write");
-        let selection = ComponentSelection {
-            component_ids: vec![ComponentId::new(1)],
-        };
-        let viewer = ViewerQuery {
-            client_id: ClientId::new(7),
-            position: Position3::new(0.0, 0.0, 0.0),
-            radius: 256.0,
-            max_entities: 32,
-        };
-        let mut bridge = ReplicationTransportBridge::default();
-        let mut transport = FakeTransport::default();
-
-        let report = bridge
-            .send_viewer(
-                &mut transport,
-                &station,
-                &index,
-                &policies,
-                &components,
-                &selection,
-                &viewer,
-                &RangeOnlyVisibility,
-            )
-            .expect("replication should send");
-
-        assert!(report.sent);
-        assert_eq!(report.client_id, viewer.client_id);
-        assert_eq!(report.selected_entities, 1);
-        assert_eq!(report.encoded_entities, 1);
-        assert_eq!(report.encoded_components, 1);
-        assert_eq!(transport.packets_sent(), 1);
-        assert_eq!(transport.bytes_sent(), report.bytes_sent);
-        assert_eq!(bridge.stats().frames_sent, 1);
-        assert_eq!(bridge.stats().entities_selected, 1);
-        assert_eq!(bridge.stats().components_encoded, 1);
-        assert!(bridge.stats().packet_capacity_hint_bytes >= report.bytes_sent);
-        assert!(bridge.stats().planning_entity_capacity_max >= 1);
-        assert!(bridge.planning_scratch.is_some());
-
-        let retained_entities = bridge.planning_output.entities.as_ptr();
-        let mut rejecting = BudgetedTransport::new(FakeTransport::default(), 0, 0);
-        bridge
-            .send_viewer(
-                &mut rejecting,
-                &station,
-                &index,
-                &policies,
-                &components,
-                &selection,
-                &viewer,
-                &RangeOnlyVisibility,
-            )
-            .expect_err("transport budget should reject the packet");
-        assert_eq!(bridge.planning_output.entities.as_ptr(), retained_entities);
-    }
-
-    #[test]
-    fn replication_transport_bridge_skips_empty_frames_by_default() {
-        let mut station = station(1, 10);
-        let mut index = CellIndex::new(GridSpec::new(64.0).expect("grid is valid"));
-        let mut policies = PolicyTable::default();
-        policies.set(CompiledSyncPolicy::new(PolicyId::new(0), 1, 20, 256.0));
-        let handle = station
-            .spawn_owned(
-                EntityId::new(100),
-                Position3::new(0.0, 0.0, 0.0),
-                Bounds::Point,
-                PolicyId::new(0),
-            )
-            .expect("spawn should work");
-        index.upsert(handle, Position3::new(0.0, 0.0, 0.0), Bounds::Point);
-        let components = ComponentStore::default();
-        let selection = ComponentSelection {
-            component_ids: vec![ComponentId::new(1)],
-        };
-        let viewer = ViewerQuery {
-            client_id: ClientId::new(7),
-            position: Position3::new(0.0, 0.0, 0.0),
-            radius: 256.0,
-            max_entities: 32,
-        };
-        let mut bridge = ReplicationTransportBridge::default();
-        let mut transport = FakeTransport::default();
-
-        let report = bridge
-            .send_viewer(
-                &mut transport,
-                &station,
-                &index,
-                &policies,
-                &components,
-                &selection,
-                &viewer,
-                &RangeOnlyVisibility,
-            )
-            .expect("empty replication should skip");
-
-        assert!(!report.sent);
-        assert_eq!(report.selected_entities, 1);
-        assert_eq!(report.encoded_entities, 0);
-        assert_eq!(transport.packets_sent(), 0);
-        assert_eq!(bridge.stats().frames_skipped_empty, 1);
-        assert_eq!(bridge.stats().entities_selected, 1);
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn replication_transport_bridge_prioritized_reports_budget_skips() {
-        let client_id = ClientId::new(7);
-        let server_id = ClientId::new(0);
-        let mut station = station(1, 10);
-        let mut index = CellIndex::new(GridSpec::new(64.0).expect("grid is valid"));
-        let mut policies = PolicyTable::default();
-        let mut low = CompiledSyncPolicy::new(PolicyId::new(1), 1, 20, 256.0);
-        low.priority_weight = 1;
-        let mut high = CompiledSyncPolicy::new(PolicyId::new(2), 1, 20, 256.0);
-        high.priority_weight = 10;
-        policies.set(low);
-        policies.set(high);
-
-        let low_handle = station
-            .spawn_owned(
-                EntityId::new(100),
-                Position3::new(0.0, 0.0, 0.0),
-                Bounds::Point,
-                PolicyId::new(1),
-            )
-            .expect("spawn low should work");
-        let high_handle = station
-            .spawn_owned(
-                EntityId::new(200),
-                Position3::new(128.0, 0.0, 0.0),
-                Bounds::Point,
-                PolicyId::new(2),
-            )
-            .expect("spawn high should work");
-        index.upsert(low_handle, Position3::new(0.0, 0.0, 0.0), Bounds::Point);
-        index.upsert(high_handle, Position3::new(128.0, 0.0, 0.0), Bounds::Point);
-
-        let descriptor = ComponentDescriptor::sparse_blob(
-            ComponentId::new(1),
-            "health",
-            ComponentSyncMode::Delta,
-            ComponentMigrationMode::Copy,
-            4,
-        );
-        let mut components = ComponentStore::default();
-        components
-            .set_typed(&descriptor, low_handle, 1, &U32LeCodec, &100)
-            .expect("low component should write");
-        components
-            .set_typed(&descriptor, high_handle, 1, &U32LeCodec, &200)
-            .expect("high component should write");
-        let selection = ComponentSelection {
-            component_ids: vec![ComponentId::new(1)],
-        };
-        let viewer = ViewerQuery {
-            client_id,
-            position: Position3::new(0.0, 0.0, 0.0),
-            radius: 256.0,
-            max_entities: 1,
-        };
-        let hub = InMemoryTransportHub::new(ClientTransportLimits {
-            max_queued_packets_per_client: 4,
-            max_packet_bytes: 512,
-        });
-        let mut client_transport = hub
-            .endpoint(client_id, "127.0.0.1:23107".parse().expect("client addr"))
-            .expect("client endpoint should register");
-        let mut server_transport = hub
-            .endpoint(server_id, "127.0.0.1:23100".parse().expect("server addr"))
-            .expect("server endpoint should register");
-        let mut bridge = ReplicationTransportBridge::new(
-            ReplicationTransportConfig {
-                budget: ReplicationBudget {
-                    max_entities: 1,
-                    max_bytes: 128,
-                    estimated_entity_bytes: 32,
-                },
-                send_empty_frames: false,
-            },
-            ReplicationFrameBuilder::default(),
-        );
-
-        let report = bridge
-            .send_viewer_prioritized(
-                &mut server_transport,
-                &station,
-                &index,
-                &policies,
-                &components,
-                &selection,
-                &viewer,
-                &RangeOnlyVisibility,
-            )
-            .expect("prioritized replication should send");
-
-        assert!(report.sent);
-        assert_eq!(report.selected_entities, 1);
-        assert_eq!(report.skipped_by_budget, 1);
-        assert_eq!(bridge.stats().entities_skipped_by_budget, 1);
-
-        let packet = client_transport
-            .try_recv()
-            .expect("receive should work")
-            .expect("packet should exist");
-        let RuntimeFrame::Replication(frame) = BinaryFrameDecoder
-            .decode(&packet.bytes)
-            .expect("frame decodes")
-        else {
-            panic!("expected replication frame");
-        };
-        assert_eq!(frame.entities.len(), 1);
-        assert_eq!(frame.entities[0].entity_id, EntityId::new(200));
     }
 
     #[test]
@@ -6299,7 +5854,7 @@ mod tests {
             ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
         );
         let pump = receive
-            .pump(&mut client_transport, 4)
+            .pump_owned(&mut client_transport, 4)
             .expect("replication packet should receive");
 
         assert_eq!(pump.frames_received(), 1);
@@ -6320,7 +5875,7 @@ mod tests {
             .expect("visitor packet should send");
         let mut visited_payload = 0_u32;
         let visit = receive
-            .pump_visit(&mut client_transport, 4, |borrowed| {
+            .pump(&mut client_transport, 4, |borrowed| {
                 assert_eq!(borrowed.client_id, client_id);
                 for entity in borrowed.entities() {
                     assert_eq!(entity.entity_id, EntityId::new(100));
@@ -6346,7 +5901,7 @@ mod tests {
             .send(OutboundPacket { client_id, bytes })
             .expect("visitor failure packet should send");
         let error = receive
-            .pump_visit(&mut client_transport, 4, |_| Err("apply failed"))
+            .pump(&mut client_transport, 4, |_| Err("apply failed"))
             .expect_err("visitor failure should surface separately");
         assert!(matches!(
             error,
@@ -6401,7 +5956,7 @@ mod tests {
             ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
         );
         let error = receive
-            .pump(&mut client_transport, 4)
+            .pump_owned(&mut client_transport, 4)
             .expect_err("wrong target should be rejected");
 
         assert!(matches!(
@@ -6527,7 +6082,7 @@ mod tests {
             .expect("barrier should send");
 
         let pump = bridge
-            .pump(&mut client_transport, 8)
+            .pump_owned(&mut client_transport, 8)
             .expect("client frames should receive");
 
         assert_eq!(pump.packets_received, 3);
@@ -6556,7 +6111,7 @@ mod tests {
         let mut visited_barrier = 0_usize;
         let mut payload_checksum = 0_u64;
         let visit = bridge
-            .pump_visit(&mut client_transport, 8, |frame| {
+            .pump(&mut client_transport, 8, |frame| {
                 match frame {
                     ClientInboundFrameRef::CommandAck(frame) => {
                         assert_eq!(frame, ack);
@@ -6602,7 +6157,7 @@ mod tests {
             })
             .expect("failing visitor packet should send");
         let visitor_error = bridge
-            .pump_visit(&mut client_transport, 1, |_| Err("apply failed"))
+            .pump(&mut client_transport, 1, |_| Err("apply failed"))
             .expect_err("visitor failure should propagate");
         assert_eq!(
             visitor_error,
@@ -6649,7 +6204,7 @@ mod tests {
             .expect("ACK should send");
 
         let error = bridge
-            .pump(&mut client_transport, 4)
+            .pump_owned(&mut client_transport, 4)
             .expect_err("wrong target should be rejected");
 
         assert!(matches!(
@@ -6733,7 +6288,7 @@ mod tests {
         assert_eq!(queued.id, command.command_id);
 
         let ack_pump = client_bridge
-            .pump(&mut client_transport, 4)
+            .pump_owned(&mut client_transport, 4)
             .expect("client should receive ACK");
         assert_eq!(ack_pump.command_acks_received(), 1);
         assert!(ack_pump.command_acks[0].accepted);
@@ -6770,7 +6325,7 @@ mod tests {
             .expect("compact command should queue");
         assert_eq!(compact_queued.id, compact_command.command_id);
         let compact_ack = client_bridge
-            .pump(&mut client_transport, 4)
+            .pump_owned(&mut client_transport, 4)
             .expect("client should receive compact ACK");
         assert_eq!(compact_ack.command_acks_received(), 1);
         assert_eq!(

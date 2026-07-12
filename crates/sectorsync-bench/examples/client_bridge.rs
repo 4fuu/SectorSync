@@ -6,8 +6,9 @@ use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CommandId, CommandIngress, CommandPriority, CommandQueueLimits,
     CommandQueues, CompiledSyncPolicy, ComponentDescriptor, ComponentId, ComponentMigrationMode,
     ComponentStore, ComponentSyncMode, EntityId, GatewayConfig, GatewaySessionTable, GridSpec,
-    InstanceId, NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, Station,
-    StationConfig, StationId, U32LeCodec, ViewerQuery,
+    InstanceId, NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
+    ReplicationPlan, ReplicationPlanner, ReplicationScratch, Station, StationConfig, StationId,
+    U32LeCodec, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, GatewayClientTransportBridge,
@@ -130,22 +131,33 @@ fn main() {
         max_entities: 32,
     };
     let mut replication_bridge = ReplicationTransportBridge::default();
+    let mut replication_scratch = ReplicationScratch::default();
+    let mut plan = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_into(
+        &station,
+        &index,
+        &policies,
+        &viewer,
+        &RangeOnlyVisibility,
+        ReplicationBudget::default(),
+        &mut replication_scratch,
+        &mut plan,
+    );
     let replication = replication_bridge
-        .send_viewer(
+        .send_plan(
             &mut server_transport,
+            viewer.client_id,
+            station.tick(),
             &station,
-            &index,
-            &policies,
             &components,
             &selection,
-            &viewer,
-            &RangeOnlyVisibility,
+            &plan,
         )
         .expect("replication should send");
     assert!(replication.sent);
 
     let pump = client_bridge
-        .pump(&mut client_transport, 8)
+        .pump_owned(&mut client_transport, 8)
         .expect("client frames should receive");
     assert_eq!(pump.command_acks_received(), 1);
     assert_eq!(pump.replication_frames_received(), 1);

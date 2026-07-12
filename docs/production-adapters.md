@@ -72,14 +72,14 @@ demonstrates active/retiring/revoked key-id metadata. Neither example is a
 cryptographic recommendation.
 
 Client adapters that consume replication packets synchronously may use
-`BinaryFrameDecoder::decode_replication_ref` to avoid nested frame allocations.
+`BinaryFrameDecoder::decode_replication` to avoid nested frame allocations.
 Borrowed component bytes are valid only while the immutable input packet is
 alive; queueing, cross-thread ownership transfer, or deferred application
 requires an owned frame or application-owned copy. The specialized decoder
 validates the complete frame before exposing iterators but does not interpret
 game component schemas or update the client world.
 
-`ReplicationReceiveBridge::pump_visit` is the higher-level immediate-apply
+`ReplicationReceiveBridge::pump` is the low-level immediate-apply
 path when adapters still use `TransportReceiver`. It preserves bridge
 source/target checks and reports caller application failures separately.
 Visitor code must finish consuming borrowed bytes before returning and must not

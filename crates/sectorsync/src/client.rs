@@ -38,7 +38,7 @@ impl ReceiveExecutor {
         T: TransportReceiver,
         F: for<'frame> FnMut(ReplicationFrameRef<'frame>) -> Result<(), V>,
     {
-        self.bridge.pump_visit(transport, max_packets, visitor)
+        self.bridge.pump(transport, max_packets, visitor)
     }
 
     /// Receives replication frames into owned nested storage for retention.
@@ -50,7 +50,7 @@ impl ReceiveExecutor {
     where
         T: TransportReceiver,
     {
-        self.bridge.pump(transport, max_packets)
+        self.bridge.pump_owned(transport, max_packets)
     }
 }
 

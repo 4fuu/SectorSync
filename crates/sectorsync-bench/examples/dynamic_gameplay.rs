@@ -786,18 +786,21 @@ fn replicate_room(
     let viewers = room_viewers(room);
     prepare_dirty_generations(room);
     let dirty_generations = &room.dirty_generations;
-    let plans = ReplicationPlanner::plan_for_viewers_work_bounded_into(
+    let plans = ReplicationPlanner::plan_for_viewers_configured_into(
         &room.station,
         &room.index,
         policies,
         &viewers,
         &RangeOnlyVisibility,
         budget,
+        sectorsync_core::prelude::ReplicationSelectionMode::Throughput,
+        0,
         |_, handle, _| {
             dirty_generations
                 .get(usize::try_from(handle.index()).expect("handle index fits usize"))
                 .is_some_and(|generation| *generation == handle.generation())
         },
+        |_, _| None,
         &mut room.planning,
         &mut room.plans,
     );
@@ -905,7 +908,7 @@ fn receive_replication_packets(room: &mut Room, stats: &mut Stats) {
         {
             let mut decoder = BinaryFrameDecoder;
             let frame = decoder
-                .decode_replication_ref(&packet.bytes)
+                .decode_replication(&packet.bytes)
                 .expect("replication packet should validate");
             stats.client_checksum = checksum_word(stats.client_checksum, frame.client_id.get());
             for entity in frame.entities() {

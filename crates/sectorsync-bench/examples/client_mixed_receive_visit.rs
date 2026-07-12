@@ -144,7 +144,7 @@ fn run(config: Config) -> (Stats, ClientTransportStats) {
         match config.mode {
             Mode::Visit => {
                 let report = bridge
-                    .pump_visit(&mut transport, packets_per_tick, |frame| {
+                    .pump(&mut transport, packets_per_tick, |frame| {
                         match frame {
                             ClientInboundFrameRef::CommandAck(frame) => {
                                 stats.acks = stats.acks.saturating_add(1);
@@ -178,7 +178,7 @@ fn run(config: Config) -> (Stats, ClientTransportStats) {
             }
             Mode::Owned => {
                 let pump = bridge
-                    .pump(&mut transport, packets_per_tick)
+                    .pump_owned(&mut transport, packets_per_tick)
                     .expect("guarded mixed frames should receive");
                 stats.packets = stats.packets.saturating_add(pump.packets_received);
                 stats.acks = stats.acks.saturating_add(pump.command_acks.len());

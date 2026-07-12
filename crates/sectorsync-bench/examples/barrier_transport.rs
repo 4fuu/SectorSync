@@ -74,7 +74,7 @@ fn main() {
     let mut frozen_notices = 0;
     for (bridge, transport) in client_bridges.iter_mut().zip(&mut client_transports) {
         let pump = bridge
-            .pump(transport, 2)
+            .pump_owned(transport, 2)
             .expect("client should receive frozen barrier");
         assert_eq!(pump.barriers[0].state, BarrierState::Frozen);
         frozen_notices += pump.barrier_frames_received();
@@ -100,7 +100,7 @@ fn main() {
     let mut running_notices = 0;
     for (bridge, transport) in client_bridges.iter_mut().zip(&mut client_transports) {
         let pump = bridge
-            .pump(transport, 2)
+            .pump_owned(transport, 2)
             .expect("client should receive running barrier");
         assert_eq!(pump.barriers[0].state, BarrierState::Running);
         running_notices += pump.barrier_frames_received();

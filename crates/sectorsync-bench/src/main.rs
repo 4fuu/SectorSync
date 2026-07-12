@@ -4,14 +4,16 @@ use std::collections::BTreeMap;
 use std::env;
 use std::time::{Duration, Instant};
 
+use sectorsync_bench::{plan_viewers_owned_with_scratch, plan_viewers_range_owned_with_scratch};
+
 use sectorsync_core::prelude::{
     Bounds, CellIndex, CellLoadSample, ClientId, CommandEnvelope, CommandId, CommandIngress,
     CommandPriority, CommandQueueLimits, CommandQueues, CompiledSyncPolicy, ComponentId,
     EntityHandle, EntityId, EventId, EventKind, EventPriority, EventQueueLimits, GatewayConfig,
     GatewaySessionTable, GridSpec, HotspotPlanner, HotspotSeverity, HotspotThresholds, InstanceId,
     NodeId, OwnerEpoch, PolicyId, PolicyTable, Position3, RangeOnlyVisibility,
-    ReplicationBatchStats, ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station,
-    StationConfig, StationEvent, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
+    ReplicationBatchStats, ReplicationBudget, ReplicationScratch, Station, StationConfig,
+    StationEvent, StationId, StationLoadSample, Tick, Vec3, ViewerQuery,
 };
 use sectorsync_runtime::{
     ClientTransportBridge, ClientTransportConfig, CommandDispatchTransportBridge, DeploymentConfig,
@@ -1051,7 +1053,7 @@ fn run(config: BenchConfig) -> BenchStats {
                             .zip(&indexes)
                             .zip(viewer_batches)
                             .map(|((station, index), viewers)| {
-                                ReplicationPlanner::plan_for_viewers_with_scratch(
+                                plan_viewers_owned_with_scratch(
                                     station,
                                     index,
                                     &policies,
@@ -1068,7 +1070,7 @@ fn run(config: BenchConfig) -> BenchStats {
                             .zip(viewer_batches)
                             .zip(&mut batch_scratch)
                             .map(|(((station, index), viewers), scratch)| {
-                                ReplicationPlanner::plan_for_viewers_range_with_scratch(
+                                plan_viewers_range_owned_with_scratch(
                                     station,
                                     index,
                                     &policies,
@@ -1375,7 +1377,7 @@ fn run_parallel_station_pipeline(
         .collect();
     pool.map_ordered(work, |work| {
         let planning_start = Instant::now();
-        let batch = ReplicationPlanner::plan_for_viewers_range_with_scratch(
+        let batch = plan_viewers_range_owned_with_scratch(
             work.station,
             work.index,
             policies,
@@ -1801,7 +1803,7 @@ fn exercise_client_bridge(
 
     for client_index in 0..command_count {
         let pump = bench.client_bridges[client_index]
-            .pump(&mut bench.client_endpoints[client_index], 4)
+            .pump_owned(&mut bench.client_endpoints[client_index], 4)
             .expect("benchmark client bridge should pump");
         stats.client_bridge_packets_received = stats
             .client_bridge_packets_received

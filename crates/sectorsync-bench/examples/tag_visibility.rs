@@ -1,9 +1,10 @@
 //! Tag-aware visibility SDK example.
 
+use sectorsync_bench::plan_viewer_owned;
 use sectorsync_core::prelude::{
     AndVisibility, Bounds, CellIndex, ClientId, CompiledSyncPolicy, EntityId, EntityTags, GridSpec,
     InstanceId, NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
-    ReplicationPlanner, Station, StationConfig, StationId, TagVisibility, ViewerQuery,
+    Station, StationConfig, StationId, TagVisibility, ViewerQuery,
 };
 
 const TAG_STATIC: EntityTags = EntityTags::from_bits(1 << 0);
@@ -50,7 +51,7 @@ fn main() {
         RangeOnlyVisibility,
         TagVisibility::new(TAG_STATIC, TAG_FAST_MOVER),
     );
-    let plan = ReplicationPlanner::plan_for_viewer(
+    let plan = plan_viewer_owned(
         &station,
         &index,
         &policies,

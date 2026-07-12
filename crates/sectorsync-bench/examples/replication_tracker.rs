@@ -3,9 +3,9 @@
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, ComponentDescriptor, ComponentId, ComponentMigrationMode,
     ComponentStore, ComponentSyncMode, DirtyMask, EntityId, GridSpec, InstanceId, NodeId, PolicyId,
-    PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
-    ReplicationTracker, ReplicationTrackerConfig, Station, StationConfig, StationId, U32LeCodec,
-    ViewerQuery,
+    PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlan,
+    ReplicationPlanner, ReplicationScratch, ReplicationSelectionMode, ReplicationTracker,
+    ReplicationTrackerConfig, Station, StationConfig, StationId, U32LeCodec, ViewerQuery,
 };
 
 fn main() {
@@ -56,14 +56,20 @@ fn main() {
     };
     let mut tracker = ReplicationTracker::new(ReplicationTrackerConfig { max_entries: 16 });
 
-    let first = ReplicationPlanner::plan_for_viewer_with_cadence(
+    let mut scratch = ReplicationScratch::default();
+    let mut first = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_configured_into(
         &station,
         &index,
         &policies,
         &viewer,
         &RangeOnlyVisibility,
         ReplicationBudget::default(),
-        |entity| tracker.last_sent(client_id, entity),
+        ReplicationSelectionMode::Throughput,
+        |_, _, _| true,
+        |_, entity| tracker.last_sent(client_id, entity),
+        &mut scratch,
+        &mut first,
     );
     tracker
         .record_plan_sent(client_id, &first, station.tick())
@@ -74,14 +80,19 @@ fn main() {
         .expect("clear entity dirty");
     let cleared_components = components.clear_dirty_for_entity(handle);
 
-    let second = ReplicationPlanner::plan_for_viewer_with_cadence(
+    let mut second = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_configured_into(
         &station,
         &index,
         &policies,
         &viewer,
         &RangeOnlyVisibility,
         ReplicationBudget::default(),
-        |entity| tracker.last_sent(client_id, entity),
+        ReplicationSelectionMode::Throughput,
+        |_, _, _| true,
+        |_, entity| tracker.last_sent(client_id, entity),
+        &mut scratch,
+        &mut second,
     );
     let component_dirty = components
         .get_blob(ComponentId::new(1), handle)

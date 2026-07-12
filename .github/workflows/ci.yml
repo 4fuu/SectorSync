@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for package in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime; do
+          for package in sectorsync-core sectorsync-wire sectorsync-transport sectorsync-runtime sectorsync; do
             files="$(cargo package -p "$package" --list --locked)"
             grep -qx 'LICENSE' <<<"$files"
             grep -qx 'README.md' <<<"$files"

@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CompiledSyncPolicy, EntityHandle, EntityId, GridSpec, InstanceId,
     NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
-    ReplicationCadence, ReplicationPlanner, Station, StationConfig, StationId, Tick, ViewerQuery,
+    ReplicationCadence, ReplicationPlan, ReplicationPlanner, ReplicationScratch,
+    ReplicationSelectionMode, Station, StationConfig, StationId, Tick, ViewerQuery,
 };
 
 fn main() {
@@ -47,14 +48,20 @@ fn main() {
         radius: 128.0,
         max_entities: 16,
     };
-    let plan = ReplicationPlanner::plan_for_viewer_with_cadence(
+    let mut scratch = ReplicationScratch::default();
+    let mut plan = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_configured_into(
         &station,
         &index,
         &policies,
         &viewer,
         &RangeOnlyVisibility,
         ReplicationBudget::default(),
-        |handle| last_sent.get(&handle).copied(),
+        ReplicationSelectionMode::Throughput,
+        |_, _, _| true,
+        |_, handle| last_sent.get(&handle).copied(),
+        &mut scratch,
+        &mut plan,
     );
 
     let policy = policies.get(PolicyId::new(1)).expect("policy exists");

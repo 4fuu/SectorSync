@@ -511,10 +511,11 @@ stable checksum, and `benchmark_ok=true` are the portable acceptance signals.
 
 ### Single-Viewer Plan Output Measurement
 
-`ReplicationTransportBridge` retains one `ReplicationPlan` output across
-normal, cadence, priority, and priority/cadence sends. The guarded
-`single_viewer_planning` benchmark isolates that output from the already reused
-spatial scratch. `--fresh-plan-output` recreates the previous owned-plan path:
+`ReplicationExecutor` retains one `ReplicationPlan` output across configured
+single-viewer calls. The guarded `single_viewer_planning` low-level benchmark
+isolates reusable output from already reused spatial scratch.
+`--fresh-plan-output` explicitly materializes a new plan at the benchmark
+boundary:
 
 ```powershell
 cargo run --release -q -p sectorsync-bench --example single_viewer_planning -- `
@@ -1128,7 +1129,7 @@ failure behavior.
 
 ### Borrowed Replication Decode Measurement
 
-`BinaryFrameDecoder::decode_replication_ref` validates the complete wire frame
+`BinaryFrameDecoder::decode_replication` validates the complete wire frame
 and exposes exact-size borrowed entity and component iterators. Component bytes
 remain slices of the immutable input packet. The compatible `FrameDecoder`
 path materializes the same data as owned nested Vecs for retention or transfer.
@@ -1321,10 +1322,10 @@ the comparison and one million for the optimized shape.
 
 ### Replication Receive Visitor Measurement
 
-`ReplicationReceiveBridge::pump_visit` consumes transport packets, validates
+`ReplicationReceiveBridge::pump` consumes transport packets, validates
 expected source and frame target, performs complete borrowed wire validation,
 updates bridge statistics, and invokes a fallible caller visitor without
-materializing nested owned replication frames. The compatible `pump` path
+materializing nested owned replication frames. The explicit `pump_owned` path
 returns owned frames for retention and transfer.
 
 Compare immediate visitor application with owned pumping using:
@@ -1350,10 +1351,10 @@ and complete source/wire/target validation are the portable acceptance signals.
 
 ### Mixed Client Receive Visitor Measurement
 
-`ClientTransportBridge::pump_visit` accepts command ACKs, borrowed replication
+`ClientTransportBridge::pump` accepts command ACKs, borrowed replication
 frames, and barrier notifications in one fallible visitor loop. It shares
 expected-source, target, complete wire validation, and cumulative statistics
-with compatible owned mixed pumping while avoiding nested replication frame
+with explicit `pump_owned` mixed pumping while avoiding nested replication frame
 materialization.
 
 Compare visitor and owned mixed client receive using:

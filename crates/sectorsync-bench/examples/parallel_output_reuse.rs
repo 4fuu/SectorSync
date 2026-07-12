@@ -292,9 +292,20 @@ fn run(world: &World, config: Config) -> RunStats {
                 }
                 OutputMode::Fresh => {
                     stats.fresh_outputs = stats.fresh_outputs.saturating_add(1);
-                    pool.plan_station_range_batches(&batches, &world.policies, budget, &mut scratch)
-                        .stats
-                        .selected
+                    let view = pool.plan_station_range_batches_into(
+                        &batches,
+                        &world.policies,
+                        budget,
+                        &mut scratch,
+                    );
+                    let selected = view.stats.selected;
+                    let owned = view
+                        .batches
+                        .iter()
+                        .map(|batch| batch.view().plans.to_vec())
+                        .collect::<Vec<_>>();
+                    black_box(owned);
+                    selected
                 }
             };
             stats.selected_checksum = stats.selected_checksum.saturating_add(selected);

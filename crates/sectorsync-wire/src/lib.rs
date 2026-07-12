@@ -1045,7 +1045,7 @@ pub struct BinaryFrameDecoder;
 impl BinaryFrameDecoder {
     /// Decodes and fully validates one replication frame while borrowing all
     /// entity/component storage and component payload bytes from `input`.
-    pub fn decode_replication_ref<'a>(
+    pub fn decode_replication<'a>(
         &mut self,
         input: &'a [u8],
     ) -> Result<ReplicationFrameRef<'a>, ReplicationFrameRefDecodeError> {
@@ -1591,7 +1591,7 @@ mod tests {
             .expect("encoder is infallible");
 
         let borrowed = BinaryFrameDecoder
-            .decode_replication_ref(&bytes)
+            .decode_replication(&bytes)
             .expect("borrowed decode should work");
         assert_eq!(borrowed.client_id, frame.client_id);
         assert_eq!(borrowed.server_tick, frame.server_tick);
@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn borrowed_replication_decode_rejects_wrong_kind_truncation_and_trailing_bytes() {
         assert_eq!(
-            BinaryFrameDecoder.decode_replication_ref(&[FrameKind::CommandAck as u8]),
+            BinaryFrameDecoder.decode_replication(&[FrameKind::CommandAck as u8]),
             Err(ReplicationFrameRefDecodeError::UnexpectedFrameKind(
                 FrameKind::CommandAck
             ))
@@ -1649,14 +1649,14 @@ mod tests {
             .expect("frame should encode");
         let truncated = &bytes[..bytes.len() - 1];
         assert!(matches!(
-            BinaryFrameDecoder.decode_replication_ref(truncated),
+            BinaryFrameDecoder.decode_replication(truncated),
             Err(ReplicationFrameRefDecodeError::Binary(
                 BinaryDecodeError::Truncated { .. }
             ))
         ));
         bytes.push(0xff);
         assert_eq!(
-            BinaryFrameDecoder.decode_replication_ref(&bytes),
+            BinaryFrameDecoder.decode_replication(&bytes),
             Err(ReplicationFrameRefDecodeError::Binary(
                 BinaryDecodeError::TrailingBytes(1)
             ))

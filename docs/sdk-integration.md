@@ -224,76 +224,47 @@ Ghost records are read-only and must never finalize business state.
 ### 4. Plan And Send Replication
 
 Build viewer input from caller-owned client state, then use
-`ReplicationTransportBridge` with explicit policy, component selection,
-visibility, and budget input. The caller-owned bridge lazily retains its planning
-scratch and directly encodes selected dirty components into the outbound packet,
-avoiding intermediate entity/component delta allocations. Integrations that call
-`ReplicationPlanner` directly should retain their own `ReplicationScratch` and
-use `ReplicationBatchScratch` with the `*_into` batch APIs when viewer groups are
-planned repeatedly. Explicit parallel integrations retain at most one planning
-scratch lane per configured worker. Steady-state multi-room loops should use
-`plan_station_batches_into` or `plan_station_range_batches_into`; their borrowed
-`ParallelReplicationView` exposes active per-Station outputs backed by retained
-plan/entity capacity. Consume or encode that view before the next planning call.
-Cadence, priority, per-client tracking, and send state must remain explicit.
+`ReplicationExecutor`. Select Throughput or Prioritized once in
+`ReplicationExecutorConfig`; provide visibility, optional eligibility, and
+optional last-sent state through `ReplicationRequest` or
+`ReplicationBatchRequest`. The executor owns reusable scratch and output,
+uses bounded direct encoding, and surfaces partial transport progress.
 
-Parallel planning partitions by Station/room so a scratch lane never carries
-implicit cross-room state. Active lanes are `min(pool threads, room batches)`;
-submit independent rooms together to fill the pool. A single room remains one
-deterministic batch unless the embedding application explicitly partitions its
-caller-owned viewer set.
+The sequential batch path reuses candidates only for repeated quantized AOI
+cell ranges within the current call. The cache is bounded by
+`max_cached_query_ranges` and stores no cross-client state. Explicit parallel
+integrations construct `ParallelReplicationExecutor` with a supplied bounded
+pool; no default constructor creates threads.
 
-Sparse-update integrations can use
-`plan_for_viewer_eligible_with_scratch_into` or
-`plan_for_viewers_eligible_into` to reject entities before they consume the
-replication budget. `ComponentStore::has_dirty_selected` is suitable for a
-global-dirty policy; per-client delivery state can instead live in the
-predicate's caller-owned state. The predicate does not clear dirty flags or
-invent ACK semantics.
+Applications that need custom stage ordering can call
+`plan_for_viewer_into`, `plan_for_viewers_into`, or the configured variants
+and retain their own `ReplicationScratch` and output. Range-only SIMD kernels
+remain available as `plan_for_viewer_range_into` and
+`plan_for_viewers_range_into`. Parallel low-level callers use the corresponding
+`plan_station_*_into` methods and consume the borrowed
+`ParallelReplicationView` before reusing its scratch.
 
-`ReplicationBudget::max_bytes` is also the concrete frame limit used by
-`ReplicationTransportBridge`. Direct wire integrations can call
-`encode_binary_bounded_into`; the first entity that would exceed the frame
-budget is rolled back and reported through `skipped_entities_by_frame_bytes`.
-This is a wire guarantee, unlike planner estimates and capacity hints.
+Sparse-update integrations pass an eligibility callback to the configured
+kernel or facade request. `ComponentStore::has_dirty_selected` is suitable for
+global dirty state; per-client delivery state remains caller-owned. Throughput
+uses deterministic work-bounded first-fit selection and reports
+`unexamined_after_budget`. Prioritized mode inspects the eligible set to choose
+a deterministic global top-k.
 
-For high-frequency sparse updates, compile the application's dirty-handle list
-into a caller-owned dense generation marker (indexed by `EntityHandle::index`)
-and query it from the eligibility predicate. This keeps per-client delivery and
-dirty semantics external while avoiding repeated component-column probes for
-every spatial candidate.
-
-When deterministic first-fit selection is acceptable, the explicit
-`*_work_bounded_*` APIs stop scanning as soon as the entity or estimated-byte
-budget fills. `unexamined_after_budget` reports the untouched spatial suffix;
-`skipped_by_budget` remains reserved for candidates actually evaluated and
-rejected by the complete-scan planners. Priority planners still inspect the
-eligible set because they must choose a deterministic global top-k.
-
-The bridge retains one `ReplicationPlan` output slot across its normal, cadence,
-priority, and priority/cadence send paths. Transport or encoding failures return
-the slot to the bridge before the error is surfaced. Direct single-viewer loops
-can use the corresponding `*_into` planner methods. Output reservation is capped
-by both the budget hard limit and actual candidate count.
-
-Priority planning uses deterministic top-k partitioning when the budget selects
-less than half of eligible candidates, then sorts only that prefix by score,
-distance, and handle. At or above half, it conservatively uses the existing full
-sort. Output ordering and skipped-by-budget statistics are unchanged.
-
-`ReplicationTransportBridge` also requests a bounded initial packet capacity
-when up to four uniformly sampled entities all contain encodable dirty data.
-Sparse or empty samples return a zero hint and retain normal `Vec` growth. Direct
-wire integrations can use `ReplicationFrameBuilder::sampled_binary_capacity_hint`
-before `encode_binary_into`; the planner-only `binary_capacity_hint` is available
-when component storage is not accessible.
+`ReplicationBudget::max_bytes` is the concrete frame limit used by the facade
+executor. The first entity that would exceed the frame budget is rolled back and
+reported through `skipped_by_frame_bytes`. Direct wire integrations can use
+`ReplicationFrameBuilder::sampled_binary_capacity_hint` followed by
+`encode_binary_bounded_into`, then submit the owned packet through their sink.
+The low-level `ReplicationTransportBridge::send_plan` remains available for
+this caller-planned boundary; it no longer plans viewers.
 
 On the receive side, `ReplicationReceiveBridge` validates expected packet
 source and frame target before returning decoded frames. Applying those frames
 to a client world remains an external client responsibility.
 
 High-throughput adapters that apply a frame immediately can instead call
-`BinaryFrameDecoder::decode_replication_ref`. The validated
+`BinaryFrameDecoder::decode_replication`. The validated
 `ReplicationFrameRef`, `EntityDeltaRef`, and `ComponentDeltaRef` iterators
 borrow all nested storage and component bytes from the input packet, avoiding
 decoder-owned collections and payload copies. The views cannot outlive or be
@@ -302,20 +273,20 @@ mutated independently of that packet. Use `FrameDecoder::decode` or
 across that lifetime boundary. Source/target validation and application of
 component semantics remain caller responsibilities on this low-level path.
 
-`ReplicationReceiveBridge::pump_visit` combines that borrowed decoding with the
+`ReplicationReceiveBridge::pump` combines that borrowed decoding with the
 bridge's expected-source, frame-target, and accumulated-statistics checks. The
 fallible visitor can apply components directly to caller-owned client state;
 `ReplicationReceiveVisitError` keeps visitor failures distinct from transport
 and validation failures. Accepted-frame statistics are recorded before visitor
-invocation and are not rolled back on an application error. Use the compatible
-owned `pump` when frames must be queued, replayed, or transferred.
+invocation and are not rolled back on an application error. Use `pump_owned`
+when frames must be queued, replayed, or transferred.
 
 When one client receive loop must also handle command ACKs and barrier state,
-use `ClientTransportBridge::pump_visit`. Its `ClientInboundFrameRef` carries ACK
+use `ClientTransportBridge::pump`. Its `ClientInboundFrameRef` carries ACK
 and barrier values plus borrowed replication frames through one expected-source,
 target-validation, statistics, and visitor-error path. Consume replication
-payload slices before returning from the visitor. Use the compatible mixed
-`pump` when any decoded frame must be retained or transferred.
+payload slices before returning from the visitor. Use the mixed
+`pump_owned` when any decoded frame must be retained or transferred.
 
 For synchronous UDP receive loops, `UdpTransport::try_recv_ref` and
 `UdpStationTransport::try_recv_station_ref` expose bytes from each adapter's

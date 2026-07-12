@@ -210,7 +210,7 @@ fn run(config: Config) -> Stats {
 
 fn consume_borrowed(decoder: &mut BinaryFrameDecoder, wire: &[u8], stats: &mut Stats) {
     let frame = decoder
-        .decode_replication_ref(wire)
+        .decode_replication(wire)
         .expect("guarded borrowed frame should decode");
     for entity in frame.entities() {
         stats.entities = stats.entities.saturating_add(1);

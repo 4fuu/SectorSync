@@ -3,7 +3,8 @@
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CompiledSyncPolicy, ComponentDescriptor, ComponentId,
     ComponentMigrationMode, ComponentStore, ComponentSyncMode, EntityId, GridSpec, InstanceId,
-    NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, Station,
+    NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget,
+    ReplicationPlan, ReplicationPlanner, ReplicationScratch, ReplicationSelectionMode, Station,
     StationConfig, StationId, U32LeCodec, ViewerQuery,
 };
 use sectorsync_runtime::{ReplicationReceiveBridge, ReplicationReceiveConfig};
@@ -91,16 +92,30 @@ fn main() {
         ReplicationFrameBuilder::default(),
     );
 
+    let mut scratch = ReplicationScratch::default();
+    let mut plan = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_configured_into(
+        &station,
+        &index,
+        &policies,
+        &viewer,
+        &RangeOnlyVisibility,
+        bridge.config().budget,
+        ReplicationSelectionMode::Prioritized,
+        |_, _, _| true,
+        |_, _| None,
+        &mut scratch,
+        &mut plan,
+    );
     let report = bridge
-        .send_viewer_prioritized(
+        .send_plan(
             &mut server_transport,
+            viewer.client_id,
+            station.tick(),
             &station,
-            &index,
-            &policies,
             &components,
             &selection,
-            &viewer,
-            &RangeOnlyVisibility,
+            &plan,
         )
         .expect("replication should send");
     assert!(report.sent);
@@ -109,7 +124,7 @@ fn main() {
         ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
     );
     let pump = receive_bridge
-        .pump(&mut client_transport, 4)
+        .pump_owned(&mut client_transport, 4)
         .expect("replication should receive");
     assert_eq!(pump.frames_received(), 1);
     assert_eq!(pump.frames[0].entities[0].entity_id, EntityId::new(200));

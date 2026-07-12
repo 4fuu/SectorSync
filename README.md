@@ -102,6 +102,8 @@ cargo run -p sectorsync-bench --example sdk_flow
 
 The [SDK integration guide](docs/sdk-integration.md) covers bootstrap, per-tick
 ordering, ownership, bounded failures, barriers, migration, and observability.
+Existing low-level users should follow the
+[breaking API migration guide](docs/migration-breaking-api.md).
 
 ## Workspace
 

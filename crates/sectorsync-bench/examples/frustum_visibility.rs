@@ -1,10 +1,10 @@
 //! 3D frustum visibility SDK example.
 
+use sectorsync_bench::plan_viewer_owned;
 use sectorsync_core::prelude::{
     Aabb3, AndVisibility, Bounds, CellIndex, ClientId, CompiledSyncPolicy, EntityId, Frustum3,
     FrustumVisibility, GridSpec, InstanceId, NodeId, PolicyId, PolicyTable, Position3,
-    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig, StationId,
-    ViewerQuery,
+    RangeOnlyVisibility, ReplicationBudget, Station, StationConfig, StationId, ViewerQuery,
 };
 
 fn main() {
@@ -49,7 +49,7 @@ fn main() {
         Position3::new(160.0, 64.0, 64.0),
     ));
     let visibility = AndVisibility::new(RangeOnlyVisibility, FrustumVisibility::new(frustum));
-    let plan = ReplicationPlanner::plan_for_viewer(
+    let plan = plan_viewer_owned(
         &station,
         &index,
         &policies,

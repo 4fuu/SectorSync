@@ -2,8 +2,9 @@
 
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CompiledSyncPolicy, EntityId, GridSpec, InstanceId, NodeId,
-    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner,
-    Station, StationConfig, StationId, ViewerQuery,
+    PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReplicationBudget, ReplicationPlan,
+    ReplicationPlanner, ReplicationScratch, ReplicationSelectionMode, Station, StationConfig,
+    StationId, ViewerQuery,
 };
 
 fn main() {
@@ -44,7 +45,9 @@ fn main() {
         radius: 128.0,
         max_entities: 1,
     };
-    let plan = ReplicationPlanner::plan_for_viewer_prioritized(
+    let mut scratch = ReplicationScratch::default();
+    let mut plan = ReplicationPlan::default();
+    ReplicationPlanner::plan_for_viewer_configured_into(
         &station,
         &index,
         &policies,
@@ -55,6 +58,11 @@ fn main() {
             max_bytes: 32,
             estimated_entity_bytes: 32,
         },
+        ReplicationSelectionMode::Prioritized,
+        |_, _, _| true,
+        |_, _| None,
+        &mut scratch,
+        &mut plan,
     );
     assert_eq!(plan.entities, vec![farther_critical]);
 

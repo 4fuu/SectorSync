@@ -1,12 +1,13 @@
 //! Generated component schema SDK example.
 
+use sectorsync_bench::plan_viewer_owned;
 use sectorsync_core::prelude::{
     Bounds, CellIndex, ClientId, CompiledSyncPolicy, ComponentEncodeScratch,
     ComponentFieldDescriptor, ComponentFieldType, ComponentId, ComponentMigrationMode,
     ComponentRegistry, ComponentStorageKind, ComponentStore, ComponentSyncMode, EntityId,
     GeneratedComponentSchema, GridSpec, InstanceId, NodeId, PolicyId, PolicyTable, Position3,
-    RangeOnlyVisibility, ReplicationBudget, ReplicationPlanner, Station, StationConfig, StationId,
-    Vec3, Vec3LeCodec, ViewerQuery,
+    RangeOnlyVisibility, ReplicationBudget, Station, StationConfig, StationId, Vec3, Vec3LeCodec,
+    ViewerQuery,
 };
 use sectorsync_wire::{
     BinaryFrameEncoder, ComponentSelection, FrameEncoder, ReplicationFrameBuilder,
@@ -96,7 +97,7 @@ fn main() {
         radius: 128.0,
         max_entities: 16,
     };
-    let plan = ReplicationPlanner::plan_for_viewer(
+    let plan = plan_viewer_owned(
         &station,
         &index,
         &policies,

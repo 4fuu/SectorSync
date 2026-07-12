@@ -240,7 +240,7 @@ fn run(config: Config) -> (Stats, sectorsync_runtime::ReplicationReceiveStats) {
         match config.mode {
             ReceiveMode::Visit => {
                 let report = bridge
-                    .pump_visit(&mut transport, config.frames_per_tick, |frame| {
+                    .pump(&mut transport, config.frames_per_tick, |frame| {
                         for entity in frame.entities() {
                             stats.entities = stats.entities.saturating_add(1);
                             for component in entity.components() {
@@ -254,7 +254,7 @@ fn run(config: Config) -> (Stats, sectorsync_runtime::ReplicationReceiveStats) {
             }
             ReceiveMode::Owned => {
                 let pump = bridge
-                    .pump(&mut transport, config.frames_per_tick)
+                    .pump_owned(&mut transport, config.frames_per_tick)
                     .expect("guarded frames should receive");
                 stats.owned_frame_materializations = stats
                     .owned_frame_materializations
