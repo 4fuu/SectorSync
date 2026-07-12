@@ -3519,7 +3519,8 @@ impl SplitSchedulerScratch {
         self.skipped_insufficient_improvement = 0;
     }
 
-    fn view(&self) -> SplitScheduleView<'_> {
+    /// Returns the active schedule from the most recent planning call.
+    pub fn view(&self) -> SplitScheduleView<'_> {
         SplitScheduleView {
             decisions: &self.decisions[..self.active_decisions],
             actions: &self.actions[..self.active_actions],

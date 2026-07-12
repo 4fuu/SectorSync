@@ -21,6 +21,7 @@ pub use crate::station::{
 };
 pub use crate::{
     client::{ReceiveExecutor, ReceiveExecutorConfig},
+    maintenance::{LoadSampler, SplitExecutor},
     replication::{
         AllEligible, CandidateEligibility, LastSentLookup, NoLastSent, ReplicationBatchReport,
         ReplicationBatchRequest, ReplicationExecutionError, ReplicationExecutionFailure,
@@ -33,6 +34,7 @@ pub use sectorsync_core::{
     policy::{CompiledSyncPolicy, PolicyTable},
     replication::{ReplicationBudget, ReplicationSelectionMode},
 };
+pub use sectorsync_runtime::{SplitSchedulerConfig, StationLoadSamplerConfig};
 pub use sectorsync_wire::{ComponentSelection, ReplicationFrameLimits};
 
 #[cfg(feature = "parallel")]

@@ -5,9 +5,13 @@
 //! crates directly or access them through [`low_level`].
 
 pub mod client;
+pub mod gateway;
+pub mod maintenance;
+pub mod metrics;
 pub mod prelude;
 pub mod replication;
 pub mod station;
+pub mod transport;
 
 /// Explicit access to the low-level `SectorSync` crates.
 pub mod low_level {
