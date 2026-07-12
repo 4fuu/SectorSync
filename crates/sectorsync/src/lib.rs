@@ -4,7 +4,9 @@
 //! to assemble individual middleware stages can use the published low-level
 //! crates directly or access them through [`low_level`].
 
+pub mod client;
 pub mod prelude;
+pub mod replication;
 pub mod station;
 
 /// Explicit access to the low-level `SectorSync` crates.

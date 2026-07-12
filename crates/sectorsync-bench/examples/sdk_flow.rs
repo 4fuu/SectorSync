@@ -2,17 +2,19 @@
 
 use std::collections::BTreeMap;
 
+use sectorsync::prelude::{
+    Bounds, ClientId, CompiledSyncPolicy, ComponentDescriptor, ComponentId, EntityId, GridSpec,
+    InstanceId, NodeId, PolicyId, PolicyTable, Position3, RangeOnlyVisibility, ReceiveExecutor,
+    ReceiveExecutorConfig, ReplicationExecutor, ReplicationRequest, SpawnEntity, StationConfig,
+    StationId, StationRuntime, StationRuntimeConfig, Tick, ViewerQuery,
+};
 use sectorsync_core::prelude::{
-    BarrierState, Bounds, CellIndex, ClientId, CommandEnvelope, CommandId, CommandIngress,
-    CommandPriority, CommandQueueLimits, CommandQueueMode, CommandQueues, CompiledSyncPolicy,
-    ComponentDescriptor, ComponentId, ComponentMigrationMode, ComponentStore, ComponentSyncMode,
-    EntityId, GatewayConfig, GatewaySessionTable, GridSpec, InstanceId, NodeId, PolicyId,
-    PolicyTable, Position3, RangeOnlyVisibility, Station, StationConfig, StationId, Tick,
-    U32LeCodec, ViewerQuery,
+    BarrierState, CommandEnvelope, CommandId, CommandIngress, CommandPriority, CommandQueueLimits,
+    CommandQueueMode, CommandQueues, ComponentMigrationMode, ComponentSyncMode, GatewayConfig,
+    GatewaySessionTable,
 };
 use sectorsync_runtime::{
     GATEWAY_COMMAND_ACK_ACCEPTED, GATEWAY_COMMAND_ACK_BARRIER_REJECTED, GatewayCommandPipeline,
-    ReplicationReceiveBridge, ReplicationReceiveConfig, ReplicationTransportBridge,
 };
 use sectorsync_transport::{ClientTransportLimits, InMemoryTransportHub};
 use sectorsync_wire::{BinaryFrameEncoder, CommandFrame, ComponentSelection, FrameEncoder};
@@ -70,16 +72,22 @@ pub fn run() -> SdkFlowReport {
     let server_id = ClientId::new(0);
     let station_id = StationId::new(1);
     let entity_id = EntityId::new(100);
-    let mut station = station(station_id);
-    let mut index = CellIndex::new(GridSpec::new(64.0).expect("grid is valid"));
+    let mut station = StationRuntime::new(StationRuntimeConfig::new(
+        station_config(station_id),
+        GridSpec::new(64.0).expect("grid is valid"),
+    ));
     let mut policies = PolicyTable::default();
     policies.set(CompiledSyncPolicy::new(PolicyId::new(0), 1, 20, 256.0));
 
     let position = Position3::new(0.0, 0.0, 0.0);
     let handle = station
-        .spawn_owned(entity_id, position, Bounds::Point, PolicyId::new(0))
+        .spawn_owned(SpawnEntity::new(
+            entity_id,
+            position,
+            Bounds::Point,
+            PolicyId::new(0),
+        ))
         .expect("authoritative entity should spawn");
-    index.upsert(handle, position, Bounds::Point);
 
     let health = ComponentDescriptor::sparse_blob(
         HEALTH_COMPONENT_ID,
@@ -88,9 +96,8 @@ pub fn run() -> SdkFlowReport {
         ComponentMigrationMode::Copy,
         4,
     );
-    let mut components = ComponentStore::default();
-    components
-        .set_typed(&health, handle, 1, &U32LeCodec, &100)
+    station
+        .set_component_blob(&health, handle, 1, &100_u32.to_le_bytes())
         .expect("initial health should encode");
 
     // Authentication, anti-cheat, and game-rule validation happen before this frame exists.
@@ -133,7 +140,7 @@ pub fn run() -> SdkFlowReport {
         .expect("station queue should be registered")
         .pop_next()
         .expect("accepted command should be queued");
-    let final_health = apply_external_business_command(&station, &mut components, &health, &queued)
+    let final_health = apply_external_business_command(&mut station, &health, &queued)
         .expect("external station-local system should apply command");
 
     let frozen_command = validate_health_request(client_id, CommandId::new(2), 2, entity_id, 98)
@@ -173,29 +180,38 @@ pub fn run() -> SdkFlowReport {
     let selection = ComponentSelection {
         component_ids: vec![HEALTH_COMPONENT_ID],
     };
-    let mut replication = ReplicationTransportBridge::default();
+    let mut replication = ReplicationExecutor::default();
     let send = replication
-        .send_viewer(
+        .replicate(
+            ReplicationRequest::new(
+                &station,
+                &policies,
+                &selection,
+                &viewer,
+                &RangeOnlyVisibility,
+            ),
             &mut server_transport,
-            &station,
-            &index,
-            &policies,
-            &components,
-            &selection,
-            &viewer,
-            &RangeOnlyVisibility,
         )
         .expect("bounded replication transport should accept frame");
     assert!(send.sent);
 
-    let mut receive = ReplicationReceiveBridge::new(
-        ReplicationReceiveConfig::new(client_id).with_expected_source(server_id),
-    );
+    let mut receive =
+        ReceiveExecutor::new(ReceiveExecutorConfig::new(client_id).with_expected_source(server_id));
+    let mut received_health = None;
     let pump = receive
-        .pump(&mut client_transport, 4)
+        .pump(&mut client_transport, 4, |frame| {
+            let component = frame
+                .entities()
+                .next()
+                .and_then(|entity| entity.components().next())
+                .expect("health component");
+            received_health = Some(u32::from_le_bytes(
+                component.bytes.try_into().expect("four-byte health"),
+            ));
+            Ok::<_, core::convert::Infallible>(())
+        })
         .expect("client should receive validated replication frame");
-    let component_bytes = &pump.frames[0].entities[0].components[0].bytes;
-    assert_eq!(component_bytes.as_slice(), final_health.to_le_bytes());
+    assert_eq!(received_health, Some(final_health));
 
     let pipeline_stats = pipeline.stats();
     SdkFlowReport {
@@ -206,8 +222,8 @@ pub fn run() -> SdkFlowReport {
         acks_encoded: pipeline_stats.acks_encoded,
         replication_frames_sent: replication.stats().frames_sent,
         replication_frames_received: receive.stats().frames_received,
-        entities_received: pump.entities_received(),
-        components_received: pump.components_received(),
+        entities_received: pump.entities_received,
+        components_received: pump.components_received,
         final_health,
     }
 }
@@ -234,8 +250,7 @@ fn validate_health_request(
 }
 
 fn apply_external_business_command(
-    station: &Station,
-    components: &mut ComponentStore,
+    station: &mut StationRuntime,
     health: &ComponentDescriptor,
     command: &CommandEnvelope,
 ) -> Result<u32, &'static str> {
@@ -243,6 +258,7 @@ fn apply_external_business_command(
         return Err("unsupported external command kind");
     }
     let record = station
+        .station()
         .get_by_id(command.entity_id)
         .ok_or("command entity is missing")?;
     if !record.is_owned() {
@@ -255,8 +271,9 @@ fn apply_external_business_command(
             .try_into()
             .map_err(|_| "invalid external command payload")?,
     );
-    components
-        .set_typed(health, record.handle, 2, &U32LeCodec, &value)
+    let handle = record.handle;
+    station
+        .set_component_blob(health, handle, 2, &value.to_le_bytes())
         .map_err(|_| "component write was rejected")?;
     Ok(value)
 }
@@ -269,11 +286,11 @@ fn encode_command(command: &CommandFrame) -> Vec<u8> {
     bytes
 }
 
-fn station(station_id: StationId) -> Station {
-    Station::new(StationConfig {
+fn station_config(station_id: StationId) -> StationConfig {
+    StationConfig {
         station_id,
         node_id: NodeId::new(1),
         instance_id: InstanceId::new(1),
         tick_rate_hz: 20,
-    })
+    }
 }

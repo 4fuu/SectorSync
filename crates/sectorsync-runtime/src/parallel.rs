@@ -9,6 +9,21 @@ use sectorsync_core::prelude::{
     ReplicationBudget, ReplicationPlanner, ReplicationScratch, Station, ViewerQuery,
     VisibilityFilter,
 };
+use sectorsync_core::{
+    entity::EntityRecord,
+    ids::{EntityHandle, StationId, Tick},
+    replication::ReplicationSelectionMode,
+};
+
+/// Borrowed Station/viewer input accepted by parallel configured planning.
+pub trait StationReplicationBatchSource: Sync {
+    /// Station containing authoritative and ghost records.
+    fn station(&self) -> &Station;
+    /// Spatial index paired with [`Self::station`].
+    fn index(&self) -> &CellIndex;
+    /// Viewer queries retained in deterministic result order.
+    fn viewers(&self) -> &[ViewerQuery];
+}
 
 /// Configuration for an explicitly created replication planning thread pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +100,20 @@ impl<'a> StationReplicationBatch<'a> {
             index,
             viewers,
         }
+    }
+}
+
+impl StationReplicationBatchSource for StationReplicationBatch<'_> {
+    fn station(&self) -> &Station {
+        self.station
+    }
+
+    fn index(&self) -> &CellIndex {
+        self.index
+    }
+
+    fn viewers(&self) -> &[ViewerQuery] {
+        self.viewers
     }
 }
 
@@ -231,6 +260,64 @@ impl ReplicationThreadPool {
     /// Number of worker threads created in this pool.
     pub const fn threads(&self) -> usize {
         self.threads
+    }
+
+    /// Plans configured Station batches in deterministic worker partitions.
+    ///
+    /// Eligibility and cadence callbacks receive the Station id so identical
+    /// Station-local handles cannot alias caller-owned state across batches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_station_configured_batches_into<'a, B, F, E, L>(
+        &self,
+        batches: &[B],
+        policies: &PolicyTable,
+        filter: &F,
+        budget: ReplicationBudget,
+        mode: ReplicationSelectionMode,
+        eligible: E,
+        last_sent: L,
+        scratch: &'a mut ParallelReplicationScratch,
+    ) -> ParallelReplicationView<'a>
+    where
+        B: StationReplicationBatchSource,
+        F: VisibilityFilter + Sync,
+        E: Fn(StationId, &ViewerQuery, EntityHandle, &EntityRecord) -> bool + Sync,
+        L: Fn(StationId, &ViewerQuery, EntityHandle) -> Option<Tick> + Sync,
+    {
+        let lanes = self.threads.min(batches.len());
+        scratch.prepare_lanes(lanes);
+        scratch.prepare_output(batches.len());
+        scratch.active_lanes = chunked_logical_lanes(batches.len(), lanes);
+        if lanes != 0 {
+            let chunk_size = batches.len().div_ceil(lanes);
+            self.pool.install(|| {
+                batches
+                    .par_chunks(chunk_size)
+                    .zip(scratch.batches[..batches.len()].par_chunks_mut(chunk_size))
+                    .zip(scratch.lanes[..lanes].par_iter_mut())
+                    .for_each(|((input, output), lane)| {
+                        for (batch, batch_output) in input.iter().zip(output) {
+                            let station_id = batch.station().config().station_id;
+                            ReplicationPlanner::plan_for_viewers_configured_into(
+                                batch.station(),
+                                batch.index(),
+                                policies,
+                                batch.viewers(),
+                                filter,
+                                budget,
+                                mode,
+                                |viewer, handle, entity| {
+                                    eligible(station_id, viewer, handle, entity)
+                                },
+                                |viewer, handle| last_sent(station_id, viewer, handle),
+                                lane,
+                                batch_output,
+                            );
+                        }
+                    });
+            });
+        }
+        reusable_view(scratch)
     }
 
     /// Maps an owned batch synchronously and retains input order.

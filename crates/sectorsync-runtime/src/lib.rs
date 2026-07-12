@@ -39,7 +39,7 @@ pub use deployment::{
 pub use parallel::{
     ParallelReplicationResult, ParallelReplicationScratch, ParallelReplicationView,
     ReplicationThreadPool, ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig,
-    StationReplicationBatch,
+    StationReplicationBatch, StationReplicationBatchSource,
 };
 
 /// Client replication transport bridge configuration.

@@ -82,6 +82,7 @@ dependencies = [
 name = "sectorsync-bench"
 version = "2026.712.0"
 dependencies = [
+ "sectorsync",
  "sectorsync-core",
  "sectorsync-runtime",
  "sectorsync-transport",

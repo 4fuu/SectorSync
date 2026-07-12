@@ -29,6 +29,7 @@ parallel = ["sectorsync-runtime/parallel"]
 optimized = ["simd", "parallel"]
 
 [dependencies]
+sectorsync.workspace = true
 sectorsync-core.workspace = true
 sectorsync-runtime.workspace = true
 sectorsync-transport.workspace = true

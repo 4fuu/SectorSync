@@ -19,3 +19,25 @@ pub use crate::station::{
     StationRuntime, StationRuntimeCapacities, StationRuntimeConfig, StationRuntimeError,
     StationRuntimeReclaimReport,
 };
+pub use crate::{
+    client::{ReceiveExecutor, ReceiveExecutorConfig},
+    replication::{
+        AllEligible, CandidateEligibility, LastSentLookup, NoLastSent, ReplicationBatchReport,
+        ReplicationBatchRequest, ReplicationExecutionError, ReplicationExecutionFailure,
+        ReplicationExecutor, ReplicationExecutorConfig, ReplicationExecutorStats,
+        ReplicationReport, ReplicationRequest,
+    },
+};
+pub use sectorsync_core::{
+    interest::{RangeOnlyVisibility, ViewerQuery, VisibilityFilter},
+    policy::{CompiledSyncPolicy, PolicyTable},
+    replication::{ReplicationBudget, ReplicationSelectionMode},
+};
+pub use sectorsync_wire::{ComponentSelection, ReplicationFrameLimits};
+
+#[cfg(feature = "parallel")]
+pub use crate::replication::{
+    ParallelReplicationExecutor, ParallelReplicationRequest, ParallelStationBatch,
+};
+#[cfg(feature = "parallel")]
+pub use sectorsync_runtime::{ReplicationThreadPoolBuildError, ReplicationThreadPoolConfig};
