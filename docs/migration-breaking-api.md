@@ -28,6 +28,9 @@ product operation.
 | Implicit parallel helpers | Explicit `ParallelReplicationExecutor` with a supplied bounded pool |
 | Owned receive default | `ReceiveExecutor::pump` visitor |
 | Retained receive frames | `ReceiveExecutor::pump_owned` |
+| Endpoint retry with external scratch | Endpoint `retry_due` (scratch retained internally) |
+| Owned load sampling | Facade `LoadSampler::sample`, or low-level `sample_all_into` plus explicit copy |
+| Split scheduler method matrix | Facade `SplitExecutor::{plan,execute_planned}` |
 
 ## Low-Level Planner Mapping
 
@@ -72,6 +75,18 @@ ReplicationPlanner::plan_for_viewer_configured_into(
 Owned output is now an explicit boundary operation: clone `plan`, call
 `view.plans.to_vec()`, or build an application-owned transfer object only when
 the data must outlive reusable storage.
+
+## Maintenance Mapping
+
+Low-level `SplitScheduler` exposes only `plan_into` and `execute_into`; state,
+tick, and scratch are explicit. The facade `SplitExecutor` retains those inputs
+and provides the normal caller-driven maintenance flow. `StationLoadSampler`
+similarly exposes only `sample_all_into`, while facade `LoadSampler::sample`
+owns the reusable storage.
+
+Reliable endpoint `retry_due_with_scratch` is replaced by endpoint `retry_due`.
+Direct sender users rename the low-level call to `retry_due_into` and continue
+supplying `ReliableClientRetryScratch` or `ReliableStationRetryScratch`.
 
 ## Parallel Mapping
 

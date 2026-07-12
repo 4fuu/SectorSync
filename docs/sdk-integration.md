@@ -126,13 +126,12 @@ Offline, advances their route epochs, and updates detection/offline counters
 without allocating an intermediate ID list. Use `stale_nodes` separately only
 when the embedding control plane actually needs ordered stale IDs.
 
-For reliable Client or Station links, retain `ReliableClientRetryScratch` or
-`ReliableStationRetryScratch` and call `retry_due_with_scratch` on the endpoint.
-The sender indexes retry deadlines; non-due polls inspect only the earliest
-deadline. Scratch retains entries due in the current pass and may be shared
-across non-overlapping endpoint calls. Reliable senders encode stored payload slices
+For reliable Client or Station links, call `retry_due` on the endpoint from the
+application's maintenance loop. The endpoint owns and reuses its retry scratch.
+Custom low-level integrations use the sender's `retry_due_into` kernel with
+caller-owned scratch. The sender indexes retry deadlines; non-due polls inspect
+only the earliest deadline. Reliable senders encode stored payload slices
 directly into the owned transport packet and do not clone the in-flight payload.
-The compatibility `retry_due` API remains appropriate for occasional retries.
 Transport failure leaves attempts unchanged; timeout and retry order remain
 bounded by the configured window, interval, and attempt limits.
 `in_flight_for` and send-window admission use an active-peer count index instead
@@ -351,13 +350,13 @@ runtime structures plus caller subscriber counts. Feed samples into
 `SplitScheduler` or `StationScheduler`. Keep target capacity, cooldown, action,
 and moved-cell limits explicit.
 
-For periodic sampling, retain `StationLoadSamplerScratch` and call
-`sample_all_into`. It reuses subscriber aggregation, deterministic occupancy,
-Station output slots, and each Station's cell output. Consume the borrowed
-sample slice before the next call with that scratch. Use `sample_all` when an
-owned result must outlive the sampling pass. Subscriber counts remain explicit
-caller input and duplicate Station ids are still combined with saturating
-arithmetic.
+For periodic product-path sampling, use facade `LoadSampler::sample`; it owns
+and reuses subscriber aggregation, deterministic occupancy, Station output
+slots, and each Station's cell output. Low-level callers retain
+`StationLoadSamplerScratch` and call `sample_all_into`. Consume the borrowed
+sample slice before the next call. Explicitly copy it only when it must outlive
+the sampler storage. Subscriber counts remain caller input and duplicate
+Station ids are combined with saturating arithmetic.
 
 When one process hosts many Stations, construct `StationSet` and
 `StationIndexSet` with `with_capacity`, or call `reserve` before registration.
@@ -374,23 +373,15 @@ last-value-wins behavior. When the advancement budget is less than half the
 Station count, the scheduler partitions and sorts only the deterministic top-k;
 larger budgets use full sorting.
 
-For repeated hotspot and split passes, retain `HotspotSplitScratch` and use
-`HotspotPlanner::propose_cell_split_into`, `SplitScheduler::plan_with_scratch`,
-or `plan_with_state_and_scratch`. Candidate and proposal buffers grow on demand;
-the planner partitions deterministic top-k cells only when the move budget is
-less than half the sample. Scratch does not retain cooldown or ownership state,
-and it does not bypass target-capacity, improvement, action, or migration guards.
-
-When the complete split pass repeats, prefer `SplitSchedulerScratch` with
-`plan_into` or `plan_with_state_into`. The returned `SplitScheduleView` exposes
-only active decision/action slots while retaining decision reason vectors,
-action proposal coordinates, and hotspot candidates across passes. Use
-`SplitScheduleExecutionScratch` with `execute_view_into` to retain ownership
-updates, per-action migration reports, and shared migration working storage;
-consume both borrowed views before the next call mutates their corresponding
-scratch. Call `SplitSchedulerState::record_schedule_view` before the next
-planning pass. Owned planning and execution APIs remain available when results
-must outlive scratch borrows or execution is occasional.
+For normal split maintenance, facade `SplitExecutor` owns planning, cooldown,
+and execution storage. Call `plan`, inspect the borrowed schedule, then call
+`execute_planned`; the application still decides when either action runs.
+Low-level callers use `SplitScheduler::plan_into` with explicit state, tick, and
+`SplitSchedulerScratch`, then `execute_into` with
+`SplitScheduleExecutionScratch`. Consume borrowed views before reusing their
+storage and explicitly materialize a `SplitSchedule` only when its lifetime
+requires ownership. All paths preserve target-capacity, improvement, cooldown,
+action, and migration guards.
 
 Execute ownership changes through `CellMigrationExecutor` or
 `EntityMigrationExecutor` so target ghosts are prewarmed, owner commit is

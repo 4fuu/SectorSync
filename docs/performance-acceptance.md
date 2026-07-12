@@ -858,9 +858,9 @@ verify guard enforcement and cross-path checksums.
 `ReliableClientFrame::encode_data` and `ReliableStationFrame::encode_data`
 append borrowed payloads directly to the final wire buffer. Reliable senders use
 these paths for initial sends and retries, avoiding the temporary owned-frame
-payload copy. `ReliableClientRetryScratch` and `ReliableStationRetryScratch`
-retain due-entry capacity; endpoint `retry_due_with_scratch` methods expose
-the reusable path while existing `retry_due` methods remain compatible.
+payload copy. `ReliableClientEndpoint` and `ReliableStationEndpoint` retain
+due-entry scratch behind their normal `retry_due` method. Low-level senders
+expose only `retry_due_into` with caller-owned scratch.
 
 Deadline indexing is covered separately by the fixed smoke-safe
 `reliable_retry` workload. It keeps 1,024 packets in flight, performs 32
@@ -1472,10 +1472,11 @@ are directional rather than a universal guarantee.
 
 ### Multi-Room Split Execution Storage Measurement
 
-`SplitScheduler::execute_into` and `execute_view_into` retain outer ownership
-and migration report slots, moved-cell and nested entity-migration capacity,
-and one shared `CellMigrationScratch` across actions and rooms. The compatible
-`execute` and `execute_view` APIs continue returning owned reports.
+`SplitScheduler::execute_into` retains outer ownership and migration report
+slots, moved-cell and nested entity-migration capacity, and one shared
+`CellMigrationScratch` across actions and rooms. The fresh benchmark branch
+constructs new scratch inside the unpublished benchmark crate; there is no
+owned compatibility execution method in the public runtime API.
 
 Compare retained and fresh execution storage using:
 
@@ -1493,7 +1494,8 @@ without `--allow-heavy`; execution has a 10-second budget.
 Five alternating release A/B runs each executed 40 actions, applied 40
 ownership updates, and migrated 5,120 entities with a `13,109,760` entity-id
 checksum and identical target-index totals. Reusable execution created zero
-fresh execution reports; compatible execution created ten. Median room p99 was
+fresh execution reports; the benchmark's fresh-storage branch created ten.
+Median room p99 was
 0.361 ms reusable versus 0.528 ms fresh, about a 31.6% reduction on this
 development host. Identical action/update/entity counts, checksums, target
 indexes, zero fresh reports, and retained nested capacities are the portable
