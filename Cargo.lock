@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync"
-version = "2026.712.0"
+version = "2026.713.0"
 dependencies = [
  "sectorsync-core",
  "sectorsync-runtime",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-bench"
-version = "2026.712.0"
+version = "2026.713.0"
 dependencies = [
  "sectorsync",
  "sectorsync-core",
@@ -91,14 +91,14 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-core"
-version = "2026.712.0"
+version = "2026.713.0"
 dependencies = [
  "wide",
 ]
 
 [[package]]
 name = "sectorsync-runtime"
-version = "2026.712.0"
+version = "2026.713.0"
 dependencies = [
  "rayon",
  "sectorsync-core",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-transport"
-version = "2026.712.0"
+version = "2026.713.0"
 dependencies = [
  "sectorsync-core",
  "sectorsync-wire",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "sectorsync-wire"
-version = "2026.712.0"
+version = "2026.713.0"
 dependencies = [
  "sectorsync-core",
 ]

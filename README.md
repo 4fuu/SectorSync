@@ -43,7 +43,7 @@ Use the fast-by-default product facade:
 
 ```toml
 [dependencies]
-sectorsync = "=2026.712.0"
+sectorsync = "=2026.713.0"
 ```
 
 The facade delegates to the low-level crates and does not introduce a mandatory
@@ -54,8 +54,8 @@ ECS, async runtime, or network service. Advanced integrations may depend on
 Optional performance features are explicit:
 
 ```toml
-sectorsync-core = { version = "=2026.712.0", features = ["simd"] }
-sectorsync-runtime = { version = "=2026.712.0", features = ["parallel"] }
+sectorsync-core = { version = "=2026.713.0", features = ["simd"] }
+sectorsync-runtime = { version = "=2026.713.0", features = ["parallel"] }
 ```
 
 `simd` enables the safe range-only SIMD candidate path. `parallel` exposes a
