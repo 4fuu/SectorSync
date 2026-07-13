@@ -154,8 +154,8 @@ jobs:
           readme = readme_path.read_text(encoding="utf-8")
           readme_dependency_current = f'"={current_version}"'
           readme_dependency_release = f'"={release_version}"'
-          if readme.count(readme_dependency_current) != 6:
-              raise SystemExit("expected six exact dependency versions in README.md")
+          if readme.count(readme_dependency_current) != 3:
+              raise SystemExit("expected three exact dependency versions in README.md")
           readme_path.write_text(
               readme.replace(readme_dependency_current, readme_dependency_release),
               encoding="utf-8",
