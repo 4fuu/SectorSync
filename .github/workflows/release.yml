@@ -144,8 +144,8 @@ jobs:
           dependency_current = f'version = "={current_version}"'
           dependency_release = f'version = "={release_version}"'
           text = path.read_text(encoding="utf-8")
-          if text.count(package_current) != 1 or text.count(dependency_current) != 4:
-              raise SystemExit("expected one package and four exact dependency version entries")
+          if text.count(package_current) != 1 or text.count(dependency_current) != 5:
+              raise SystemExit("expected one package and five exact dependency version entries")
           text = text.replace(package_current, package_release)
           text = text.replace(dependency_current, dependency_release)
           path.write_text(text, encoding="utf-8")
